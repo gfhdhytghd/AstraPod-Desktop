@@ -454,6 +454,9 @@ class Daemon:
         try:
             self.port = podlink.serial_port(device, 2)
             self.link = podlink.Link(self.port, 2)
+            self.link.keepalive_interval = 1.0
+            self.link.keepalive_timeout = 3.0
+            self.link.nonce_keepalive = True
             self.link.open()
         except (OSError, RuntimeError, TimeoutError, podlink.LinkClosed) as e:
             log.info("PodLink at %s not ready: %s", device, e)
@@ -756,6 +759,8 @@ class Daemon:
                     frame = self.link.frames.popleft()
                     if frame.type == podlink.TEXT:
                         self.command(frame.payload)
+                if self.cider is not None:
+                    self.cider.check_liveness()
                 self.adopt_foreground()
                 self.usage_keys.poll()
                 self.flush_replies()
@@ -763,7 +768,7 @@ class Daemon:
                 self.push()
                 if self.cider is not None:
                     self.cider.poll(self.link.send)
-            except podlink.LinkClosed as error:
+            except (podlink.LinkClosed, hrcider.SessionExpired) as error:
                 log.info("PodLink closed (%s): %s", error.code, error.reason)
                 self.link.opened = False
                 self.close_link()

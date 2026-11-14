@@ -29,6 +29,20 @@ DEFAULT_WINDOW = 24 * 1024
 RESIDENT_WINDOW = 128 * 1024
 
 
+class HTTPStatusError(OSError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__('Cider HTTP '+str(code))
+
+
+class SessionExpired(RuntimeError):
+    """The transport must be closed, rediscovered and opened again."""
+    code = 1001
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(reason)
+
+
 def clean(value, limit=120):
     text=' '.join(''.join(' ' if ord(c)<32 or ord(c)==127 else c for c in str(value)).split())
     return text.encode()[:limit].decode('utf-8','ignore')
@@ -119,6 +133,7 @@ class Client:
         url=urllib.parse.urlsplit(base)
         if url.scheme!='http' or url.hostname not in ('127.0.0.1','localhost','::1'):
             raise ValueError('Cider API must be loopback HTTP')
+        self.request_gate=threading.Lock();self.inflight=set();self.request_slots={}
         self.base,self.token,self.timeout=base.rstrip('/'),token,timeout
         # Rockbox's Repeat modes Shuffle/A-B have no Cider equivalent; the host keeps
         # them virtually and drops them when Cider's own repeat/shuffle moves.
@@ -127,6 +142,26 @@ class Client:
         # Environment HTTP proxies must not forward local credentials.
         self.opener=opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
     def request(self,path,body=None,timeout=None,method=None,allow_list=False):
+        # Serialize consumers without detached workers or queued RPCs. Existing
+        # callers may wait for at most their timeout; they never start another
+        # operation while an abandoned/slow call still owns this endpoint.
+        endpoint=urllib.parse.urlsplit(path).path
+        with self.request_gate:
+            slot=self.request_slots.setdefault(endpoint,[threading.Lock(),0])
+            slot[1]+=1
+        acquired=False
+        try:
+            acquired=slot[0].acquire(timeout=max(0.,self.timeout if timeout is None else timeout))
+            if not acquired:raise OSError('Cider request already in flight: '+endpoint)
+            with self.request_gate:self.inflight.add(endpoint)
+            return self._request(path,body,timeout,method,allow_list)
+        finally:
+            with self.request_gate:
+                if acquired:
+                    self.inflight.remove(endpoint);slot[0].release()
+                slot[1]-=1
+                if not slot[1]:del self.request_slots[endpoint]
+    def _request(self,path,body=None,timeout=None,method=None,allow_list=False):
         headers={'Accept':'application/json'}
         if self.token:headers['apptoken']=self.token
         data=None if body is None else json.dumps(body).encode()
@@ -142,44 +177,85 @@ class Client:
                 value=json.loads(raw)
         except urllib.error.HTTPError as e:
             code=e.code;e.close()
-            raise OSError('Cider HTTP '+str(code)) from None
+            raise HTTPStatusError(code) from None
         if observer and playback:observer('rpc-returned',path)
         if allow_list and isinstance(value,list):return value
-        if not isinstance(value,dict) or value.get('error'):raise OSError('Cider RPC failed')
+        if not isinstance(value,dict):raise ValueError('Malformed Cider reply')
+        if value.get('error'):raise OSError('Cider RPC failed')
         return value
     def snapshot(self):
         try:return self._snapshot()
         except (TypeError,AttributeError,KeyError,OverflowError):
             raise ValueError('Malformed Cider state') from None
-    def _snapshot(self):
+    @staticmethod
+    def _playback_valid(data, full=False):
+        if not isinstance(data,dict) or not isinstance(data.get('state'),str) or not data['state']:
+            raise ValueError('Malformed Cider playback state')
+        info=data.get('nowPlaying');timing=data.get('time')
+        if 'nowPlaying' not in data or (info is not None and not isinstance(info,dict)):
+            raise ValueError('Malformed Cider now-playing item')
+        if not isinstance(timing,dict) or not any(k in timing for k in ('currentTime','currentPlaybackTime')):
+            raise ValueError('Malformed Cider playback time')
+        info=info or {}
+        if not isinstance(info.get('artwork') or {},dict) or not isinstance(info.get('playParams') or {},dict):
+            raise ValueError('Malformed Cider artwork/playParams')
+        values=[timing.get('currentTime',timing.get('currentPlaybackTime')),info.get('durationInMillis') or 0]
+        if full:
+            if not all(k in data for k in ('volume','repeatMode','shuffleMode','rate')):
+                raise ValueError('Incomplete Cider playback state')
+            values.extend(data[k] for k in ('volume','repeatMode','shuffleMode','rate'))
+            if data['repeatMode'] not in (0,1,2) or data['shuffleMode'] not in (0,1):
+                raise ValueError('Malformed Cider playback modes')
+        try:
+            if not all(math.isfinite(float(v)) for v in values):raise ValueError('Nonfinite Cider state')
+        except (TypeError,OverflowError):raise ValueError('Malformed Cider playback numbers') from None
+        return data
+    def playback(self, full=False):
+        try:
+            reply=self.request('/api/v2/playback')
+            return self._playback_valid(reply.get('data'),full)
+        except HTTPStatusError as error:
+            if error.code not in (404,405,501):raise
+        except (ValueError,TypeError,AttributeError,KeyError,OverflowError):
+            pass
+        # Only an absent/malformed v2 API uses the legacy endpoints. Transport
+        # timeouts and server failures must not fan out into legacy RPCs.
         info=self.request('/api/v1/playback/now-playing').get('info') or {}
-        if not isinstance(info,dict):raise ValueError('Invalid Cider now-playing item')
         playing=self.request('/api/v1/playback/is-playing').get('is_playing',False)
         timing=self.request('/api/v2/playback/time').get('data',{})
-        volume=0
-        repeat=self.request('/api/v1/playback/repeat-mode').get('value',0)
-        shuffle=self.request('/api/v1/playback/shuffle-mode').get('value',0)
+        data=dict(nowPlaying=info,state='playing' if playing else 'paused',time=timing)
+        if full:
+            data.update(volume=0,rate=1,
+                repeatMode=self.request('/api/v1/playback/repeat-mode').get('value',0),
+                shuffleMode=self.request('/api/v1/playback/shuffle-mode').get('value',0))
+        return self._playback_valid(data,full)
+    def now_playing(self):
+        return self.playback().get('nowPlaying') or {}
+    def _snapshot(self):
+        data=self.playback(full=True)
+        info=data.get('nowPlaying') or {};timing=data['time']
         artwork=info.get('artwork') or {};params=info.get('playParams') or {}
+        repeat,shuffle=int(data['repeatMode']),int(data['shuffleMode'])
         duration=max(0,int(info.get('durationInMillis') or 0))
         position=min(duration,max(0,int(float(timing.get('currentTime',timing.get('currentPlaybackTime',0)))*1000)))
         track=str(params.get('id') or info.get('id') or '')
-        return dict(id=track,repeat5=self._mode5(int(repeat or 0),int(shuffle or 0),track),title=info.get('name',''),artist=info.get('artistName',''),
+        return dict(id=track,repeat5=self._mode5(repeat,shuffle,track),title=info.get('name',''),artist=info.get('artistName',''),
                     album=info.get('albumName',''),composer=info.get('composerName',''),duration=duration,
-                    position=position,rate=1000 if playing else 0,
-                    volume=max(0,min(100,round(float(volume)*100))),repeat=int(repeat or 0),shuffle=int(shuffle or 0),
+                    position=position,rate=max(0,round(float(data['rate'])*1000)) if data['state']=='playing' else 0,
+                    volume=max(0,min(100,round(float(data['volume'])*100))),repeat=repeat,shuffle=shuffle,
                     art=art_id(artwork.get('url','')),template=artwork.get('url',''),bg=str(artwork.get('bgColor','181818'))[:6])
     def transport_snapshot(self):
         try:return self._transport_snapshot()
-        except (TypeError,AttributeError,KeyError,OverflowError) as e:
+        except (TypeError,AttributeError,KeyError,OverflowError,ValueError):
             raise ValueError('Malformed Cider transport state') from None
     def _transport_snapshot(self):
-        data=self.request('/api/v2/playback').get('data') or {}
+        data=self.playback()
         info=data.get('nowPlaying') or {};params=info.get('playParams') or {}
         ids={str(v) for v in (info.get('id'),params.get('id'),params.get('catalogId'),params.get('libraryId')) if v}
-        timing=data.get('time') or {};duration=max(0,int(info.get('durationInMillis') or 0))
+        timing=data['time'];duration=max(0,int(info.get('durationInMillis') or 0))
         return dict(id=str(params.get('id') or info.get('id') or ''),ids=ids,
-                    duration=duration,position=min(duration,max(0,int(float(timing.get('currentTime',0))*1000))),
-                    rate=1000 if data.get('state')=='playing' else 0)
+                    duration=duration,position=min(duration,max(0,int(float(timing.get('currentTime',timing.get('currentPlaybackTime',0)))*1000))),
+                    rate=max(0,round(float(data.get('rate',1))*1000)) if data.get('state')=='playing' else 0)
     def same_song(self,route):
         parts=str(route).split('/')
         if len(parts)!=3 or parts[0]!='play' or parts[1] not in ('songs','library-songs'):return False
@@ -240,6 +316,20 @@ class Client:
     def control(self,command,value=0):
         if command in ('seek','volume') and not math.isfinite(float(value)):
             raise ValueError('Nonfinite Cider value')
+        if command in ('love', 'unlove', 'add-library', 'pause', 'rate', 'queue-jump'):
+            if command == 'rate':
+                rate = float(value) / 1000
+                if not math.isfinite(rate) or not .25 <= rate <= 4:raise ValueError('Invalid rate')
+                return self.request('/api/v2/playback/rate', {'rate':rate}, method='PATCH')
+            if command == 'queue-jump':
+                index = int(value)
+                if not 0 <= index < self.queue_state()[1]:raise ValueError('Invalid queue index')
+                return self.request('/api/v2/queue/jump', {'index':index})
+            path, method = {'love':('/library/now-playing/love','POST'),
+                            'unlove':('/library/now-playing/rating','DELETE'),
+                            'add-library':('/library/now-playing/add','POST'),
+                            'pause':('/playback/pause','POST')}[command]
+            return self.request('/api/v2'+path, {} if method == 'POST' else None, method=method)
         routes={'resume':('play',{}),'toggle':('playpause',{}),'next':('next',{}),'previous':('previous',{}),
                 'seek':('seek',{})}
         if command in ('repeat5','ab-mark'):
@@ -532,7 +622,8 @@ class Bridge:
         self.warm_window=set();self.warm_queue=set();self.warm_jobs={};self.neighbors=None
         self.capabilities=frozenset();self.loading=Loading()
         self.client.rpc_observer=self._rpc_event
-        self.ledger=Ledger(self.cache);self.planner=Planner(self.cache,self.ledger);self.offer_pairs=set()
+        self.ledger=Ledger(self.cache);self.planner=Planner(self.cache,self.ledger);self.offer_pairs=set();self.art_times={};self.progress_at=0;self.store_capacity=1<<30;self.inventory_pages=0
+        self.live_pending=None;self.live_next=0.;self.reopen_reason=None
     def start(self):
         for target,name in [(self._prefetch_worker,'cider-prefetch-'+str(i)) for i in range(4)]+[(self._poll,'cider-state'),(self._work,'cider-art'),(self._control,'cider-control'),(self._index,'cider-index'),(self._pages,'cider-pages'),(self._neighbors,'cider-neighbors')]:
             t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
@@ -548,27 +639,46 @@ class Bridge:
         with self.lock:
             self.warm_window.clear();self.warm_queue.clear();self.neighbors=None;self.capabilities=frozenset()
             self.warm_jobs.clear();self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
+            self.live_pending=None;self.live_next=0.;self.reopen_reason=None
             self.opened=False;self.generation=0;self.requests.clear();self._drop_jobs();self.scheduler.reset(0);self.volume_delta=0
     def command(self,payload):
         try:
             fields=payload.decode().split('\t');name=fields[0]
-            if name not in ('ci','cg','cr','cx','cc','cp','ct','cb','cq','cw','ls','la','lw','lv'):return False
+            if name not in ('ci','cg','cr','cx','cc','cp','ct','cb','cq','cw','ls','la','lw','lv','ld','lf','lr','ch'):return False
             if name=='lv':fields=payload.decode().split('\n',1)[0].split('\t')
             with self.lock:
                 if name=='ci':
                     if len(fields) not in (3,4) or fields[1]!='1':raise ValueError('Cider protocol')
                     advertised=fields[3].split(',') if len(fields)==4 else []
                     if len(advertised)>8 or any(not re.fullmatch('[a-z0-9-]{1,24}',c) for c in advertised):raise ValueError('Invalid Cider capabilities')
-                    self.capabilities=frozenset(advertised)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading'}
+                    if self.opened and 'live' in self.capabilities:
+                        self.reopen_reason='device requested a replacement Cider session'
+                        log.info('Cider session replaced gen=%d; reopening transport',self.generation)
+                        return True
+                    normalized=set(advertised)
+                    if 'localdiag-live' in normalized:normalized.update(('localdiag','live'))
+                    self.capabilities=frozenset(normalized)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading','localdiag','live'}
                     window=int(fields[2]);self.volume_delta=0;self.generation=secrets.randbelow(0xfffffffe)+1;self.scheduler.reset(self.generation,window)
                     self.warm_window.clear();self.warm_queue.clear();self.warm_jobs.clear();self.neighbors=None
                     self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
                     self.requests.clear();self._drop_jobs();self.opened=True;self.library_sent=0;self.last_state=0;self._state(True)
+                    self.art_times.clear();self.inventory_pages=0;self.progress_at=0
+                    self.live_pending=None;self.live_next=0.;self.reopen_reason=None
+                    log.info('capabilities gen=%d advertised=%s negotiated=%s localstore=%s',self.generation,','.join(advertised),','.join(sorted(self.capabilities)),'localstore' in self.capabilities)
                     # The store protocol is opt-in on both sides: no CF, no ls/lw/la/lv.
-                    if 'localstore' in self.capabilities:self.scheduler.push(1,2,f'CF\t{self.generation}\tlocalstore'.encode())
+                    if 'localstore' in self.capabilities:
+                        self.scheduler.push(1,2,f'CF\t{self.generation}\tlocalstore'.encode())
+                        log.info('localstore CF queued gen=%d',self.generation)
+                    if 'localdiag' in self.capabilities:self.scheduler.push(1,2,f'CF\t{self.generation}\tlocaldiag'.encode())
                     return True
                 if len(fields)<2 or int(fields[1])!=self.generation:return True
-                if name=='cg' and len(fields)==3:self.scheduler.grant(int(fields[2]))
+                if name=='ch' and len(fields)==3:
+                    if ('live' in self.capabilities and self.live_pending and
+                            fields[2]==self.live_pending[0]):
+                        log.debug('Cider liveness ACK gen=%d rtt_ms=%.1f',self.generation,
+                                  (time.monotonic()-self.live_pending[1])*1000)
+                        self.live_pending=None
+                elif name=='cg' and len(fields)==3:self.scheduler.grant(int(fields[2]))
                 elif name=='cx' and len(fields)==3:
                     req=int(fields[2])
                     if req==0:
@@ -581,15 +691,19 @@ class Bridge:
                         self.volume_delta=max(-100,min(100,self.volume_delta+int(fields[4])))
                     elif fields[3]=='volume':raise ValueError('Cider volume disabled')
                     else:self.controls.put_nowait((self.generation,req,fields[3],fields[4]))
-                elif name=='cr' and len(fields)==8:
-                    req=int(fields[2]);key,tier=fields[3:5];offset,priority,distance=map(int,fields[5:])
+                elif name=='cr' and len(fields) in (8,9):
+                    req=int(fields[2]);key,tier=fields[3:5];offset,priority,distance=map(int,fields[5:8])
+                    miss=fields[8] if len(fields)==9 else 'unknown'
+                    if miss not in ('0','1','unknown'):raise ValueError('Invalid store miss flag')
                     if not 0<req<=0xffffffff:raise ValueError('Invalid request id')
                     if not re.fullmatch('[0-9a-f]{64}',key) or tier not in SIZES or not 0<=offset<12+SIZES[tier]**2*2 or priority not in (3,4) or not 0<=distance<=10000:raise ValueError('Invalid art request')
                     if len(self.requests)>=24:raise ValueError('Too many art requests')
                     self.scheduler.cancel(req);self._drop_jobs(req)
                     token=object();self.requests[req]=token
                     self.jobs.put_nowait((priority,distance,time.monotonic_ns(),self.generation,req,key,tier,offset,token))
-                    log.info('art request gen=%d req=%d tier=%s offset=%d distance=%d credit=%d',self.generation,req,tier,offset,distance,self.scheduler.credit)
+                    self.art_times[req]=(time.monotonic(),key,tier,0)
+                    while len(self.art_times)>128:self.art_times.pop(next(iter(self.art_times)))
+                    log.info('art request gen=%d req=%d tier=%s offset=%d distance=%d credit=%d store_miss=%s fill=%s',self.generation,req,tier,offset,distance,self.scheduler.credit,miss,priority==4)
                 elif name=='cb' and len(fields)==4:
                     req=int(fields[2]);keys=fields[3].split(',')
                     if not 0<req<=0xffffffff:raise ValueError('Invalid request id')
@@ -597,6 +711,7 @@ class Bridge:
                     self.scheduler.cancel(req);self._drop_jobs(req)
                     token=object();self.requests[req]=token
                     self.jobs.put_nowait((3,0,time.monotonic_ns(),self.generation,req,tuple(keys),'XS',0,token))
+                    self.art_times[req]=(time.monotonic(),','.join(keys),'XS',0)
                 elif name=='cp' and len(fields)==7:
                     req=int(fields[2]);page=self.cache.page(fields[3],int(fields[4]),int(fields[5]),stale=not self.available or self.index.initial or self.index.force)
                     self.scheduler.push(2,2,page_frame(self.generation,req,page),req,bulk=True)
@@ -612,6 +727,21 @@ class Bridge:
                     if tier not in SIZES or len(keys)>7 or any(not re.fullmatch('[0-9a-f]{64}',k) for k in keys):
                         raise ValueError('Invalid visible art window')
                     self.warm_window={(key,tier) for key in keys};self._schedule_warm()
+                elif name=='ld' and len(fields)==15:
+                    if 'localdiag' not in self.capabilities:raise ValueError('Unadvertised diagnostics')
+                    values=list(map(int,fields[2:]))
+                    if any(v<0 or v>0xffffffff for v in values[:-1]) or not -5<=values[-1]<=0:raise ValueError('Invalid diagnostics')
+                    log.info('localstore diagnostic gen=%d loaded=%d entries=%d bloom_hits=%d false_positives=%d sectors=%d hits=%d misses=%d writes=%d idle_deferrals=%d loads=%d read_us=%d max_read_us=%d last_error=%d',self.generation,*values)
+                elif name=='lf' and len(fields)==3:
+                    if 'localdiag' not in self.capabilities or fields[2] not in ('0','1'):raise ValueError('Invalid cache build')
+                    self.planner.reset();self.progress_at=0
+                    log.info('localstore full build gen=%d enabled=%s',self.generation,fields[2])
+                elif name=='lr' and len(fields)==4:
+                    if 'localdiag' not in self.capabilities:raise ValueError('Unadvertised art ack')
+                    req,count=int(fields[2]),int(fields[3]);timing=self.art_times.pop(req,None)
+                    if timing:
+                        start,key,tier,ready=timing
+                        log.info('art device ack gen=%d req=%d tier=%s bytes=%d request_ready_ms=%.1f request_ack_ms=%.1f ready_ack_ms=%.1f',self.generation,req,tier,count,(ready-start)*1000 if ready else -1,(time.monotonic()-start)*1000,(time.monotonic()-ready)*1000 if ready else -1)
                 elif name in ('ls','la','lw','lv'):self._store_command(name,fields,payload)
                 elif name=='ct':self.index.request()
             return True
@@ -624,11 +754,15 @@ class Bridge:
         gen=self.generation
         if name=='ls' and len(fields)==7:
             epoch,count,digest=int(fields[2]),int(fields[3]),int(fields[4])
+            self.store_capacity=max(0,int(fields[6]))<<10
+            log.info('localstore inventory gen=%d entries=%d epoch=%d used_kib=%s capacity_kib=%s',gen,count,epoch,fields[5],fields[6])
             if not self.ledger.status(epoch,count,digest):
                 self.scheduler.push(4,2,f'CQ\t{gen}\t0'.encode())
             else:self.planner.reset()
         elif name=='lv' and len(fields)==5:
             cursor,nxt,count=int(fields[2]),int(fields[3]),int(fields[4])
+            self.inventory_pages+=1
+            log.info('localstore inventory page gen=%d page=%d entries=%d cursor=%d next=%d',gen,self.inventory_pages,count,cursor,nxt)
             rows=parse_rows(payload.decode().split('\n',1)[1] if b'\n' in payload else '')
             if len(rows)!=count:raise ValueError('Inventory row count')
             again=self.ledger.page(cursor,nxt,rows)
@@ -638,6 +772,7 @@ class Bridge:
             key,tier,crc=fields[2],fields[3],int(fields[4])
             if not re.fullmatch('[0-9a-f]{64}',key) or tier not in SIZES or not 0<=crc<=0xffffffff:raise ValueError('Invalid store ack')
             self.ledger.ack(key,tier,crc);self.offer_pairs.discard((key,tier))
+            log.info('localstore stored gen=%d tier=%s key=%s crc=%d',gen,tier,key[:16],crc)
         elif name=='lw' and len(fields)==3:
             n=max(0,min(5,int(fields[2])))
             if not n or not self.ledger.synced:return        # never offer against an unverified inventory
@@ -645,6 +780,7 @@ class Bridge:
             if self.state and self.state.get('art') not in (None,'-'):urgent.append(self.state['art'])
             if self.neighbors:urgent.extend(k for k in self.neighbors[2:] if k!='-')
             pairs=self.planner.next(n,urgent)
+            log.info('localstore offers gen=%d count=%d bytes=%d',gen,len(pairs),sum(12+SIZES[t]**2*2 for _,t in pairs))
             for record in offer_records(gen,pairs):self.scheduler.push(4,2,record)
             self.offer_pairs=set(pairs)|set(list(self.offer_pairs)[-8:])
             self._schedule_warm()
@@ -659,7 +795,7 @@ class Bridge:
         now=time.monotonic()
         if now-self.last_state<.25 and not force:return
         self.scheduler.heap=[v for v in self.scheduler.heap if not (v[4]==2 and v[5][:3] in (b'CA\t',b'CN\t'))];heapq.heapify(self.scheduler.heap)
-        self.scheduler.push(1,2,f'CA\t{self.generation}\t{int(self.available)}\t{clean(self.reason,80)}'.encode())
+        self.scheduler.push(0 if 'live' in self.capabilities else 1,2,f'CA\t{self.generation}\t{int(self.available)}\t{clean(self.reason,80)}'.encode())
         if self.available and self.state:
             s=self.state;self.state_seq+=1
             fields=['CN',self.generation,self.state_seq,int(now*1000)&0xffffffff,s['duration'],s['position'],s['rate'],s['volume'],s['shuffle'],s['repeat'],s['id'],s['art'],s['bg'],s['title'],s['artist'],s['album']]
@@ -742,9 +878,13 @@ class Bridge:
                 self.failures=0;next_poll=now+.25
             except (OSError,ValueError,TimeoutError) as error:
                 with self.lock:
-                    if self.available or self.reason=='Starting':
+                    self.failures=min(8,self.failures+1)
+                    # Preserve the last coherent state through isolated failures.
+                    # Retry promptly during grace, then use the existing backoff.
+                    if self.failures>=3 and (self.available or self.reason=='Starting'):
                         self.available=False;self.loading.cancel();self.reason=clean(str(error),80) or 'Cider unavailable';self._state(True)
-                self.failures=min(8,self.failures+1);next_poll=now+min(30,2**(self.failures-1))
+                log.warning('Cider poll failed consecutive=%d available=%s reason=%s',self.failures,self.available,clean(error,120))
+                next_poll=time.monotonic()+(.25 if self.failures<3 else min(30,2**(self.failures-3)))
     def _index(self):
         while not self.stop.is_set():
             self.index.step();self.stop.wait(.25)
@@ -798,11 +938,8 @@ class Bridge:
                         with self.lock:self.loading.expected(expected)
                         deadline=time.monotonic()+2.5
                         while True:
-                            info=self.client.request('/api/v1/playback/now-playing').get('info') or {}
-                            params=info.get('playParams') or {}
-                            ids={str(v) for v in (info.get('id'),params.get('id'),params.get('catalogId'),params.get('libraryId')) if v}
-                            if ids.intersection(expected):
-                                live=self.client.transport_snapshot()
+                            live=self.client.transport_snapshot()
+                            if live['ids'].intersection(expected):
                                 if isinstance(live,dict) and not live['rate']:
                                     self.client.control('seek',0)
                                     self.client.request('/api/v1/playback/play',{})
@@ -939,11 +1076,32 @@ class Bridge:
                     if isinstance(key,tuple):self.scheduler.push(priority,3,raw,req,distance,bulk=True)
                     else:self.scheduler.add_art(req,key,tier,raw,offset,priority,distance)
                     self.requests.pop(req,None)
-                    log.info('art ready gen=%d req=%d bytes=%d ms=%.1f',generation,req,len(raw),1000*(time.monotonic()-started))
+                    ready=time.monotonic();timing=self.art_times.get(req)
+                    if timing:self.art_times[req]=(*timing[:3],ready)
+                    log.info('art ready gen=%d req=%d bytes=%d ms=%.1f e2e_ms=%.1f fill=%s',generation,req,len(raw),1000*(ready-started),1000*(ready-timing[0]) if timing else -1,priority==4)
+    def check_liveness(self):
+        with self.lock:
+            if self.reopen_reason:raise SessionExpired(self.reopen_reason)
+            if (self.opened and 'live' in self.capabilities and self.live_pending and
+                    time.monotonic()-self.live_pending[1]>=3.0):
+                raise SessionExpired('Cider application liveness timeout gen='+str(self.generation))
+
     def poll(self,send):
         with self.lock:
+            self.check_liveness()
             if not self.opened:return
+            now=time.monotonic()
             if self.state_dirty:self._state()
+            # CA must announce the generation before its first challenge.
+            if 'live' in self.capabilities and not self.live_pending and now>=self.live_next:
+                nonce=secrets.token_hex(8)
+                self.scheduler.push(0,2,f'CH\t{self.generation}\t{nonce}'.encode())
+                self.live_pending=(nonce,now);self.live_next=now+1.0
+            if 'localdiag' in self.capabilities and time.monotonic()-self.progress_at>=5:
+                self.progress_at=time.monotonic()
+                done,total,status,revision=self.planner.progress(initial=self.index.initial or self.index.force,capacity=self.store_capacity,with_generation=True)
+                self.scheduler.push(4,2,f'CB\t{self.generation}\t{revision}\t{done}\t{total}\t{status}'.encode())
+                log.info('localstore build progress gen=%d library=%d done=%d total=%d state=%d inventory_pages=%d',self.generation,revision,done,total,status,self.inventory_pages)
             library=self.cache.generation
             if library!=self.library_sent:
                 self.scheduler.push(1,2,f'CG\t{self.generation}\t{library}'.encode());self.library_sent=library

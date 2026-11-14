@@ -156,6 +156,31 @@ class Planner:
         return out
 
 
+    def progress(self, initial=False, capacity=1 << 30, with_generation=False):
+        """Completion requires device ACKs with the rendered CRC for every tier.
+        Offers, transport-ready and index enumeration are never completion evidence.
+        """
+        with self.cache.lock:
+            generation = self.cache.generation
+            keys = {r[0] for r in self.cache.db.execute("SELECT DISTINCT art FROM items WHERE art<>'-'")}
+            missing_art = self.cache.db.execute("SELECT count(*) FROM items WHERE kind='albums' AND art='-'").fetchone()[0]
+            rendered = {(k,t):c for k,t,c in self.cache.db.execute('SELECT key,tier,crc FROM art_crc')}
+            held = {(bytes(k).hex(),t):c for k,t,c in self.cache.db.execute('SELECT k8,tier,crc FROM ipod_art')}
+        total = len(keys) * len(FILL_ORDER)
+        done = sum(rendered.get((key,tier)) is not None and
+                   held.get((key[:16],TIERS[tier])) == rendered[(key,tier)]
+                   for key in keys for tier in FILL_ORDER)
+        desired = {(key[:16], TIERS[tier]) for key in keys for tier in FILL_ORDER}
+        extra = [tier for prefix, tier in held if (prefix, tier) not in desired]
+        record_bytes = {0:115712, 1:33280, 2:6656, 3:2560}
+        required = len(keys) * (33280 + 6656 + 2560) + sum(record_bytes[t] for t in extra) + 115712
+        if initial or not self.ledger.synced:state = 0
+        elif total + len(extra) > 49152 or required > capacity or missing_art:state = 3
+        else:state = 2 if done == total else 1
+        result = (done, total, state)
+        return (*result, generation) if with_generation else result
+
+
 def offer_records(generation, pairs):
     """CO records, one tier each, at most five keys."""
     by_tier = {}

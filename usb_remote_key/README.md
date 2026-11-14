@@ -257,3 +257,24 @@ hrkeys.py backend and other runtime siblings remain compatible and bundled.
 No serial-write, service-operation or installation step is part of this
 build-only package. All hardware/desktop gesture delivery requires separately
 authorized acceptance; local tests use mocked keys and private IPC endpoints.
+
+FU30 forwards captured Apple NEC centre `04` (Dock Play), next `07`, previous
+`08`, Menu `02`/`03`, and volume `0b`/`0d`. KeyForwarder sends press, refresh and
+silence-release for centre/left/right/menu; volume retains per-report steps.
+EP0 key ids 6/7/8 are Left/Right/Play; existing 1..5 retain their meanings.
+Heartbeat id 5 with index 2 declares the complete key bridge. Firmware suppresses
+duplicate Dock centre/left/right/menu/select bits only while that heartbeat is
+fresh. Legacy index-1 heartbeats retain the previous Menu/volume ownership and
+never suppress Dock transport keys. Loss of heartbeat restores Dock ownership.
+Deploy the paired firmware and this source for the complete mapping.
+
+Remote centre holds emit native Play press/repeat/release, rather than the old
+jump-to-WPS shortcut. Existing tap/double/triple meanings and their timing are
+retained (300 ms Agents hold, 600 ms other centre hold). Explicit EP0 Select
+holds also enter native Play keymaps. Raw viewers share the classifier and a
+bounded UI poll so queued events and releases do not wait for another key.
+
+Both native and Cider quickscreens map remote Left/Right to their corresponding
+slots, once per press. Vol+/Vol- map to TOP/BOTTOM; an empty slot is a no-op.
+Menu and short centre/Select leave. Only the wheel retains quickscreen volume.
+This source was tested offline; no serial device was opened for FU30.

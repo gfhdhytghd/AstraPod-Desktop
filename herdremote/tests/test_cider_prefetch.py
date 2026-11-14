@@ -86,19 +86,19 @@ class Prefetch(unittest.TestCase):
     def test_control_ack_waits_for_the_selected_song(self):
         self.bridge.available=True
         self.bridge.library.play=Mock(return_value={'expected_ids':['chosen']})
-        self.client.request.side_effect=[{'info':{'playParams':{'id':'old'}}},{'info':{'playParams':{'catalogId':'chosen'}}}]
+        self.client.transport_snapshot.side_effect=[{'ids':{'old'},'rate':1000},{'ids':{'chosen'},'rate':1000}]
         self.bridge.controls.put((7,42,'native-play','play/library-songs/i.chosen'))
         t=threading.Thread(target=self.bridge._control);t.start();self.bridge.threads.append(t)
         deadline=time.monotonic()+2
         while not self.bridge.scheduler.heap and time.monotonic()<deadline:time.sleep(.005)
         frame=self.bridge.scheduler.next_frame()
         self.assertIsNotNone(frame);self.assertEqual(frame[1],b'CK\t7\t42\t1\tOK')
-        self.assertEqual(self.client.request.call_count,2)
+        self.assertEqual(self.client.transport_snapshot.call_count,2);self.client.request.assert_not_called()
 
     def test_control_false_success_never_acknowledges_the_old_song(self):
         self.bridge.available=True
         self.bridge.library.play=Mock(return_value={'expected_ids':['chosen']})
-        self.client.request.return_value={'info':{'playParams':{'id':'old'}}}
+        self.client.transport_snapshot.return_value={'ids':{'old'},'rate':1000}
         self.bridge.controls.put((7,43,'native-play','play/library-songs/i.chosen'))
         t=threading.Thread(target=self.bridge._control);t.start();self.bridge.threads.append(t)
         deadline=time.monotonic()+4

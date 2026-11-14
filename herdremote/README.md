@@ -745,3 +745,41 @@ the host and iPod. Install the matching firmware and `hrcider.py` together.
 Song selection uses full resource playback and confirms the selected track
 before the iPod opens Now Playing. The journal includes control request/result
 IDs and failures; no automatic playback retry occurs.
+
+FU30 adds `hrcider_context.py` for read-only Now Playing pages and explicit
+Cider library/rate/queue controls. It also logs local-store negotiation,
+inventory pages, offers/bytes, misses, durable fills and end-to-end art ACKs.
+The device's five-second `localdiag` records appear at INFO without enabling
+Remote Log. Full-cache progress counts rendered M+XS+S CRCs confirmed by the
+device; it is not a claim that the strict continuous-scroll gate passed.
+See `docs/podbox/cider-remote-protocol.md` and `FU30-REPORT.md` for limitations.
+
+FU31 merged candidate also requires the matching `tools/podlink.py`: wire
+liveness uses independent one-second nonce probes with a three-second deadline,
+and `localdiag-live` firmware additionally echoes Cider CH challenges without
+bulk credits. A stale tty/application or a replacement session closes and
+reopens through the normal daemon loop. An idle Cider library is not inferred
+from the absence of art/page/control requests. See the Cider protocol document
+for compatibility and deadline details.
+
+When deploying the FU31 package, also deploy its
+`.rockbox/tools/usb_remote_key/usb_remote_key.py` to
+`~/.local/share/podbox-usbkey/usb_remote_key.py`. Updating only firmware leaves
+the old forwarder unable to send the FU30 previous/next/play EP0 keys.
+
+FU31b: snapshots now read one `/api/v2/playback` response for metadata,
+artwork, timing, modes, rate and app volume. Now Playing pages and selection
+confirmation use the same v2 reader. Only a missing API (HTTP 404/405/501) or a
+malformed reply falls back to the legacy v1 endpoints; a timeout or transient
+server error does not start legacy requests. The host mixer still supplies
+FU23's system volume/mute for the device.
+
+The poller keeps its last good state through the first two consecutive
+failures and marks Cider unavailable on the third. A good poll clears the
+failure count and restores availability. Grace retries are 250 ms apart;
+confirmed outages use 1/2/4/.../30-second retry backoff. Each client permits
+only one active synchronous request per endpoint path (query ignored), across
+snapshot, event and control/page consumers. A busy caller waits at most its
+request timeout for ownership, then fails without starting an RPC. There are
+no queued retries or detached timeout workers. Ownership remains
+until the underlying call returns, and response contexts close on read errors.

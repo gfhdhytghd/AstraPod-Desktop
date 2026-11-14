@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import math
+import secrets
 import select
 import struct
 import threading
@@ -102,6 +103,10 @@ class Link:
         self.opened = False
         self.last_rx = time.monotonic()
         self.keepalive = None
+        self.keepalive_interval, self.keepalive_timeout = 5.0, 15.0
+        self.nonce_keepalive = False
+        self.keepalive_payload = b""
+        self.last_probe = self.last_rx
         self.foreground = None
         self.write_lock = threading.Lock()
 
@@ -134,13 +139,18 @@ class Link:
                 raise
             for frame in incoming:
                 self._check_size(frame)
+                if self.opened and frame.type in (HELLO, OPEN):
+                    self.opened = False
+                    raise LinkClosed(1001, "peer session replaced")
                 self.last_rx = time.monotonic()
                 if frame.type == PING:
                     if len(frame.payload) == 5 and frame.payload[:4] == b"PLFG" and frame.payload[4] <= 2:
                         self.foreground = frame.payload[4]
                     self.send(PONG, frame.payload, seq=frame.seq)
                     continue
-                if frame.type == PONG and self.keepalive and frame.seq == self.keepalive[0]:
+                if (frame.type == PONG and self.keepalive and
+                        frame.seq == self.keepalive[0] and
+                        frame.payload == self.keepalive_payload):
                     self.keepalive = None
                     continue
                 if frame.type == CLOSE:
@@ -155,12 +165,16 @@ class Link:
                 self.frames.append(frame)
         now = time.monotonic()
         if self.opened:
-            if self.keepalive and now - self.keepalive[1] > 15:
+            if self.keepalive and now - self.keepalive[1] >= self.keepalive_timeout:
                 self.send(CLOSE, struct.pack("<H", 1001) + b"keepalive timeout")
                 self.opened = False
                 raise LinkClosed(1001, "keepalive timeout")
-            if not self.keepalive and now - self.last_rx > 5:
-                self.keepalive = self.send(PING), now
+            # Traffic proves only that something can write to this reader.
+            # Probe the write/return path even while foreground PINGs arrive.
+            if not self.keepalive and now - self.last_probe >= self.keepalive_interval:
+                self.keepalive_payload = secrets.token_bytes(16) if self.nonce_keepalive else b""
+                self.keepalive = self.send(PING, self.keepalive_payload), now
+                self.last_probe = now
 
     def _check_size(self, frame):
         if frame.type not in (HELLO, OPEN) and len(frame.payload) > self.max_message:

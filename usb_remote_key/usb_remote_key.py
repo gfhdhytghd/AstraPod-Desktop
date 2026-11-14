@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Forward Apple IR Menu and volume to EP0. IR serial is read-only."""
+"""Forward Apple IR keys to EP0. IR serial is read-only."""
 import argparse
 import glob
 import json
@@ -19,6 +19,9 @@ SELECT = 2
 VOL_UP = 3
 VOL_DOWN = 4
 HEARTBEAT = 5
+LEFT = 6
+RIGHT = 7
+PLAY = 8
 HEARTBEAT_SECONDS = 1.0
 VOL_IGNORE_FIRST_REPEATS = 1
 USAGE_THREE_CHARS_SECONDS = 0.5
@@ -122,6 +125,41 @@ class MenuForwarder:
 
     def poll(self, now):
         if self.down and now - self.last >= RELEASE_SECONDS:
+            self.release(now)
+
+
+class KeyForwarder:
+    """Captured Apple NEC keys, held refreshes and a silence release.
+
+    04 is the centre (Dock Play) key. Keep its existing tap/double/triple
+    semantics; the firmware maps its hold to native Play in every context.
+    """
+    def __init__(self, usb):
+        self.usb = usb
+        self.key = None
+        self.last = 0.0
+
+    def frame(self, frame, now, span_seconds=0.0):
+        self.poll(now)
+        if frame is None:
+            return
+        key = ({0x02: MENU, 0x03: MENU, 0x04: PLAY, 0x07: RIGHT, 0x08: LEFT}.get(frame[2])
+               if len(frame) == 4 and frame[:2] == b'\xee\x87' else None)
+        if frame == b'':
+            key = self.key
+        if key != self.key:
+            self.release(now)
+        if key is not None:
+            self.key, self.last = key, now
+            self.usb.send(True, now, key)
+
+    def release(self, now):
+        if self.key is not None:
+            self.usb.send(False, now, self.key)
+            self.key = None
+
+    def poll(self, now):
+        if self.key is not None and now - self.last >= RELEASE_SECONDS:
             self.release(now)
 
 
@@ -253,7 +291,7 @@ class ReceiverHeartbeat:
         except ValueError:
             return
         if now >= self.next_at:
-            self.usb.send(1, now, HEARTBEAT)
+            self.usb.send(2, now, HEARTBEAT)
             self.next_at = now + HEARTBEAT_SECONDS
 
 
@@ -287,7 +325,7 @@ def main():
     import usb.core
     import usb.util
     remote = USBRemote(usb.core, usb.util)
-    forwarder = MenuForwarder(remote)
+    forwarder = KeyForwarder(remote)
     usage_volume = UsageVolume()
     volume = VolumeForwarder(remote, usage_volume)
     heartbeat = ReceiverHeartbeat(remote)

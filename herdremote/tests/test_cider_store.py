@@ -93,6 +93,24 @@ class PlannerTests(Base):
         led.cache.db.execute('DELETE FROM ipod_art');                     # player lost everything
         self.assertEqual(pl.next(5,now=3),[]);self.assertTrue(pl.next(5,now=200))
 
+    def test_fu30_completion_requires_rendered_crc_and_device_inventory(self):
+        led,pl=self.planner()
+        self.assertEqual(pl.progress(),(0,36,0))
+        led.status(0,0,0)
+        self.assertEqual(pl.progress(),(0,36,1))
+        # Merely offering/sending all images never counts as complete.
+        pl.next(40,now=0)
+        self.assertEqual(pl.progress(),(0,36,1))
+        for key in self.ids:
+            for tier in ('XS','M','S'):
+                self.cache.put_art(key,tier,native(tier,3))
+                led.ack(key,tier,self.cache.art_crc(key,tier))
+        self.assertEqual(pl.progress(),(36,36,2))
+        self.assertEqual(pl.progress(initial=True),(36,36,0))
+        self.assertEqual(pl.progress(capacity=100),(36,36,3))
+        led.ack(self.ids[0],'M',999)
+        self.assertEqual(pl.progress(),(35,36,1))
+
 class BridgeTests(Base):
     def setUp(self):
         super().setUp();self.client=Mock();self.client.request.return_value=[]
@@ -153,4 +171,15 @@ class BridgeTests(Base):
         req=f'cr\t{self.gen}\t5\t{key}\tM\t0\t4\t0'.encode()
         self.bridge.command(req);self.assertEqual(len(self.bridge.jobs.queue),1);self.assertEqual(self.bridge.jobs.queue[0][0],4)
 
+
+    def test_fu30_capabilities_diagnostics_and_art_ack_info_logs(self):
+        with self.assertLogs('herdremote.cider',level='INFO') as log:
+            self.connect(b'cn18,neighbors,warm,play-ack,localstore,modes5,localdiag')
+            self.bridge.command(f'ld\t{self.gen}\t1\t36\t20\t1\t200\t19\t2\t36\t3\t1\t12345\t22345\t0'.encode())
+            self.bridge.command(f'cr\t{self.gen}\t55\t{self.ids[0]}\tM\t0\t3\t0\t1'.encode())
+            self.bridge.command(f'lr\t{self.gen}\t55\t32780'.encode())
+            self.bridge.command(f'lf\t{self.gen}\t1'.encode())
+        lines='\n'.join(log.output)
+        for field in ('capabilities','CF queued','localstore diagnostic','store_miss=1','art device ack','request_ack_ms=','full build'):self.assertIn(field,lines)
+        self.assertNotIn(55,self.bridge.art_times)
 if __name__=='__main__':unittest.main()

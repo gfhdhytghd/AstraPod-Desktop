@@ -107,6 +107,9 @@ class Library:
         parsed = urllib.parse.urlsplit(query)
         name = parsed.path
         args = dict(urllib.parse.parse_qsl(parsed.query))
+        if name.startswith('now/'):
+            from hrcider_context import page
+            return page(self, name, offset, limit, stale)
         items, remote = [], None
         if name.startswith('root/'):
             name = ROOT.get(urllib.parse.unquote(name[5:]), 'empty')

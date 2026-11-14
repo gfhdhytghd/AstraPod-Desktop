@@ -22,7 +22,8 @@ class Handler(BaseHTTPRequestHandler):
             from PIL import Image
             out=io.BytesIO();Image.new('RGB',(240,240),(40,60,180)).save(out,format='PNG')
             raw=out.getvalue();self.send_response(200);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw);return
-        if self.path.endswith('now-playing'):value={'info':{'name':'Title','artistName':'Artist','albumName':'Album','durationInMillis':100000,'playParams':{'id':'song-1'},'artwork':{'url':'https://example.test/{w}x{h}bb.jpg','bgColor':'123456'}}}
+        if self.path=='/api/v2/playback':value={'data':{'state':'playing','nowPlaying':{'name':'Title','artistName':'Artist','albumName':'Album','durationInMillis':100000,'playParams':{'id':'song-1'},'artwork':{'url':'https://example.test/{w}x{h}bb.jpg','bgColor':'123456'}},'time':{'currentTime':12},'volume':0,'rate':1,'repeatMode':self.modes['repeat'],'shuffleMode':self.modes['shuffle']}}
+        elif self.path.endswith('now-playing'):value={'info':{'name':'Title','artistName':'Artist','albumName':'Album','durationInMillis':100000,'playParams':{'id':'song-1'},'artwork':{'url':'https://example.test/{w}x{h}bb.jpg','bgColor':'123456'}}}
         elif self.path.endswith('is-playing'):value={'is_playing':True}
         elif self.path.endswith('/time'):value={'data':{'currentTime':12,'duration':100,'remaining':88}}
         elif self.path.endswith('/volume'):value={'volume':.5}
@@ -157,6 +158,9 @@ class Cider(unittest.TestCase):
     def test_bridge_native_context_then_play_queues_the_album(self):
         Handler.collections[('library-albums','al1')]=['t1','t2','song-1','t4']
         b=hrcider.Bridge(client=self.client(),cache=self.cache,fetch=self.fetch,volume=mock.Mock(read=mock.Mock(return_value=(42,False))))
+        # This case exercises album context insertion; same-song behavior has
+        # separate real-client tests and must not bypass this fixture's play.
+        b.client.same_song=mock.Mock(return_value=False)
         b.start()
         try:
             end=time.monotonic()+4
@@ -261,7 +265,7 @@ class Cider(unittest.TestCase):
         self.assertEqual(struct.unpack_from('<H',data,12+2*(100*128+5))[0],0x001f)
 
     def test_empty_queue_never_retains_old_progress(self):
-        c=self.client();c.request=mock.Mock(side_effect=[{'info':None},{'is_playing':False},{'data':{'currentTime':174.5}},{'value':0},{'value':0}])
+        c=self.client();c.request=mock.Mock(return_value={'data':{'state':'stopped','nowPlaying':None,'time':{'currentTime':174.5},'volume':0,'rate':1,'repeatMode':0,'shuffleMode':0}})
         state=c.snapshot()
         self.assertEqual((state['duration'],state['position'],state['rate']),(0,0,0))
 
