@@ -700,7 +700,15 @@ class Bridge:
                     if miss not in ('0','1','unknown'):raise ValueError('Invalid store miss flag')
                     if not 0<req<=0xffffffff:raise ValueError('Invalid request id')
                     if not re.fullmatch('[0-9a-f]{64}',key) or tier not in SIZES or not 0<=offset<12+SIZES[tier]**2*2 or priority not in (3,4) or not 0<=distance<=10000:raise ValueError('Invalid art request')
-                    if len(self.requests)>=24:raise ValueError('Too many art requests')
+                    if (req in self.requests and self.art_times.get(req,())[1:3]==(key,tier)):
+                        # A device retry must not invalidate a slow in-flight
+                        # download every three seconds.
+                        log.info('art pending gen=%d req=%d tier=%s fill=%s',self.generation,req,tier,priority==4)
+                        return True
+                    if len(self.requests)>=24:
+                        self.scheduler.push(0,2,f'CK\t{self.generation}\t{req}\t0\tArtwork busy'.encode())
+                        log.info('art failed gen=%d req=%d tier=%s fill=%s reason=request-cap',self.generation,req,tier,priority==4)
+                        return True
                     self.scheduler.cancel(req);self._drop_jobs(req)
                     token=object();self.requests[req]=token
                     self.jobs.put_nowait((priority,distance,time.monotonic_ns(),self.generation,req,key,tier,offset,token))
@@ -711,6 +719,10 @@ class Bridge:
                     req=int(fields[2]);keys=fields[3].split(',')
                     if not 0<req<=0xffffffff:raise ValueError('Invalid request id')
                     if not 1<=len(keys)<=5 or any(not re.fullmatch('[0-9a-f]{64}',k) for k in keys):raise ValueError('Invalid XS range')
+                    if req in self.requests and self.art_times.get(req,())[1:3]==(','.join(keys),'XS'):return True
+                    if len(self.requests)>=24:
+                        self.scheduler.push(0,2,f'CK\t{self.generation}\t{req}\t0\tArtwork busy'.encode())
+                        return True
                     self.scheduler.cancel(req);self._drop_jobs(req)
                     token=object();self.requests[req]=token
                     self.jobs.put_nowait((3,0,time.monotonic_ns(),self.generation,req,tuple(keys),'XS',0,token))
@@ -970,8 +982,11 @@ class Bridge:
                 if generation==self.generation and self.opened:self.scheduler.push(0,2,f'CK\t{generation}\t{req}\t{int(ok)}\t{text}'.encode())
     def artwork(self,key,tier):
         # One CDN download per key even when a visible request joins prefetch.
-        with self.art_locks[int(key[:2],16)%len(self.art_locks)]:
+        lock=self.art_locks[int(key[:2],16)%len(self.art_locks)]
+        if not lock.acquire(timeout=2):raise TimeoutError('Artwork busy')
+        try:
             return self._artwork(key,tier)
+        finally:lock.release()
     def _artwork(self,key,tier):
         cached=self.cache.get_art(key,tier)
         expected=AAT.pack(0x5441,8,SIZES[tier],SIZES[tier],int(tier=='M'),0)
@@ -1001,8 +1016,9 @@ class Bridge:
             if pair not in desired:self.warm_jobs.pop(pair,None)
         for pair in sorted(desired):
             if pair not in self.warm_jobs:
+                try:self.prefetch.put_nowait((self.generation,pair))
+                except queue.Full:break  # bounded background work, retried next window
                 self.warm_jobs[pair]=self.generation
-                self.prefetch.put_nowait((self.generation,pair))
     def _prefetch_worker(self):
         while not self.stop.is_set():
             try:generation,pair=self.prefetch.get(timeout=.1)
@@ -1069,15 +1085,24 @@ class Bridge:
                     if len(items)!=len(key):continue
                     raw=pack_xs(generation,req,items)
                 else:raw=self.artwork(key,tier)
-            except (OSError,ValueError,TimeoutError):
+            except (OSError,ValueError,TimeoutError) as error:
                 with self.lock:
                     if generation==self.generation and self.requests.get(req) is token:
-                        self.scheduler.push(0,2,f'CK\t{generation}\t{req}\t0\tArtwork unavailable'.encode());self.requests.pop(req,None)
+                        try:self.scheduler.push(0,2,f'CK\t{generation}\t{req}\t0\tArtwork unavailable'.encode())
+                        except ValueError:self.reopen_reason='Cider artwork response queue full'
+                        self.requests.pop(req,None)
+                        log.info('art failed gen=%d req=%d tier=%s fill=%s reason=%s',generation,req,tier,priority==4,clean(error,120))
                 continue
             with self.lock:
                 if generation==self.generation and self.requests.get(req) is token:
-                    if isinstance(key,tuple):self.scheduler.push(priority,3,raw,req,distance,bulk=True)
-                    else:self.scheduler.add_art(req,key,tier,raw,offset,priority,distance)
+                    try:
+                        if isinstance(key,tuple):self.scheduler.push(priority,3,raw,req,distance,bulk=True)
+                        else:self.scheduler.add_art(req,key,tier,raw,offset,priority,distance)
+                    except ValueError:
+                        self.requests.pop(req,None)
+                        self.reopen_reason='Cider artwork response queue full'
+                        log.warning('art failed gen=%d req=%d tier=%s fill=%s reason=response-queue-full',generation,req,tier,priority==4)
+                        continue
                     self.requests.pop(req,None)
                     ready=time.monotonic();timing=self.art_times.get(req)
                     if timing:self.art_times[req]=(*timing[:3],ready)

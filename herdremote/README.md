@@ -834,3 +834,9 @@ list visit saves the complete 3 MiB app buffer in a temporary core allocation
 and restores its surfaces on return. If that allocation fails, the carousel
 stays open and reports the memory shortage. This allocation is in addition to
 the Cider static RAM cap. No device timing or panic replay is claimed here.
+
+FU35 keeps in-flight artwork jobs across identical device retries. Failed art
+requests log `art failed` and send a negative CK reply. An overfull warm queue
+leaves excess work for a later window instead of raising out of its caller.
+Deploy the matching firmware for failed-art cooldown and Home triple-Play
+navigation repair. These changes require no cache migration.
