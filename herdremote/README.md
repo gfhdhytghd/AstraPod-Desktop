@@ -21,6 +21,32 @@ computer onto the iPod, in **System > Agents**. From the player you can:
 - switch between Spaces and Usage with LEFT/RIGHT. Usage shows each service's
   5-hour and weekly limits, tokens this week and their equivalent API price.
 
+An expired stored subscription token starts a separate background refresh worker.
+Usage displays `refreshing...` during the attempt, then fresh limits or a fixed
+failure reason. Ordinary usage HTTP failures do not start a refresh. HerdRemote
+never calls an OAuth refresh endpoint or writes a CLI credential file.
+
+The worker runs `claude --safe-mode` in a dedicated PTY without sending input,
+`codex app-server` with `account/read {"refreshToken":true}`, `grok models`, or
+`~/.local/bin/agy models`. No model prompt is sent. It re-reads credentials and
+retries limits once. All four providers skip refresh while another instance of
+that CLI is running, including background servers (`expired (CLI running)`).
+This conservative guard also protects older sessions whose rotation behavior
+cannot be established from the installed CLI version.
+
+The daemon terminates only its own refresh process group, after at most 20 s or
+on shutdown. CLI time is limited to 14 s; input is closed except for the private
+Codex protocol pipe and Claude PTY. Browser launching is disabled. A dead refresh
+token shows `login required`; sign in manually in the provider CLI. API credential
+environment overrides are removed. CLI output never enters logs or the cache.
+INFO attempt logs contain only provider, method, duration, and fixed outcome.
+
+The per-provider refresh ledger in
+`~/.cache/podbox-herdremote/usage/requests/refresh-<provider>.json` shares a minimum
+30-minute interval across daemon instances and restarts. Failure backoff grows to
+four hours. The usage scan-cache override does not bypass this ledger. Package changes are host-only. An already-running daemon keeps its loaded code
+until its next normal start.
+
 Remote PLAY taps select after the 200 ms double-tap window; double taps
 switch screens. Native PLAY taps under 150 ms play/pause music. Remote holds
 of at least 300 ms and native holds of at least 150 ms talk; recording starts

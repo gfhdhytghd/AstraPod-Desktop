@@ -1,4 +1,4 @@
-"""Read-only subscription usage. No model calls, API keys, or credential logging.
+"""Subscription usage. No model calls, API keys, or credential logging.
 
 The link thread reads snapshots only. A supervisor thread owns four persistent
 processes: each has a <=5s hard deadline and keeps its incremental log index.
@@ -8,6 +8,7 @@ import base64
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 import json
+import logging
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -34,6 +35,7 @@ except ImportError:
         zstd = None
 import threading
 import time
+import pty
 import urllib.error
 import urllib.request
 
@@ -47,6 +49,12 @@ SLICE = 0.35
 SCAN_CPU_BUDGET = 0.15
 CLAUDE_INTERVAL = 900.0  # Omarchy Main.qml default; near-limit minimum is 180s.
 PROBE_BUDGET_VERSION = 1
+REFRESH_INTERVAL = 1800.0
+REFRESH_TIMEOUT = 20.0
+REFRESH_CLI_TIMEOUT = 14.0  # Leaves time for exactly one limits retry.
+REFRESH_METHODS = {'claude':'safe-mode TUI', 'codex':'account/read refreshToken',
+                   'grok':'models', 'gemini':'agy models'}
+log = logging.getLogger('herdremote')
 
 
 def atomic_json(path, data, compressed=False):
@@ -200,6 +208,10 @@ class UsageError(Exception):
         self.retry_after = retry_after
 
 
+class ExpiredToken(UsageError):
+    """Only a locally confirmed expired subscription token permits a refresh."""
+
+
 def retry_after_seconds(value, now):
     try:
         seconds = float(value)
@@ -227,7 +239,7 @@ def claude_limits(home, now, opener=None):
         if not token:
             return {}, 'no OAuth login'
         if auth.get('expiresAt', 0) / 1000 <= now:
-            raise UsageError('OAuth expired; use Claude login')
+            raise ExpiredToken('OAuth expired; use Claude login')
         request = urllib.request.Request('https://api.anthropic.com/api/oauth/usage',
             headers={'Authorization': 'Bearer ' + token,
                      'anthropic-beta': 'oauth-2025-04-20',
@@ -278,7 +290,7 @@ def codex_limits(home, now):
                 encoded = access.split('.')[1]
                 expiry = json.loads(base64.urlsafe_b64decode(encoded+'='*(-len(encoded)%4))).get('exp')
                 if expiry and expiry <= now:
-                    raise UsageError('Codex token expired')
+                    raise ExpiredToken('Codex token expired')
         except UsageError:
             raise
         except Exception:
@@ -368,7 +380,7 @@ def grok_limits(home, now, opener=None):
         if entry.get('auth_mode') not in ('oidc','oauth'):
             raise UsageError('Grok subscription login required')
         if timestamp(entry.get('expires_at')) <= now:
-            raise UsageError('Grok token expired')
+            raise ExpiredToken('Grok token expired')
         headers = {'Authorization':'Bearer '+entry['key'], 'Accept':'application/json'}
         data = _json_request(urllib.request.Request(
             'https://cli-chat-proxy.grok.com/v1/billing?format=credits', headers=headers), opener=opener)
@@ -451,18 +463,12 @@ def gemini_user_agent(home):
 def gemini_limits(home, now, opener=None):
     """Omarchy source: agy's Secret Service login, then the file fallback."""
     try:
-        try:
-            raw = subprocess.check_output(['secret-tool','lookup','service','gemini','username','antigravity'],
-                        text=True,stderr=subprocess.DEVNULL,timeout=.8)
-            auth = json.loads(raw)
-        except Exception:
-            path = home / '.gemini/antigravity-cli/antigravity-oauth-token'
-            if not path.exists():
-                return {}, 'no agy login'
-            auth = json.loads(path.read_text())
+        auth=gemini_auth(home)
+        if not auth:
+            return {}, 'no agy login'
         token = auth.get('token') or auth
         if timestamp(token.get('expiry')) <= now:
-            raise UsageError('Gemini token expired')
+            raise ExpiredToken('Gemini token expired')
         headers = {'Authorization':'Bearer '+token['access_token'],
                    'Content-Type':'application/json','User-Agent':gemini_user_agent(home)}
         def post(method, body):
@@ -479,6 +485,16 @@ def gemini_limits(home, now, opener=None):
         raise
     except Exception:
         raise UsageError('Gemini limits unavailable') from None
+
+
+def gemini_auth(home):
+    try:
+        raw=subprocess.check_output(['secret-tool','lookup','service','gemini','username','antigravity'],
+                                    text=True,stderr=subprocess.DEVNULL,timeout=.8)
+        return json.loads(raw)
+    except Exception:
+        path=home/'.gemini/antigravity-cli/antigravity-oauth-token'
+        return json.loads(path.read_text()) if path.exists() else {}
 
 
 def request_root(home):
@@ -606,23 +622,27 @@ def shared_probe(service, home, now, fetch, seed=None):
         error=''
         failures=0
         next_at=now+interval
+        token_expired=False
     except UsageError as exc:
         good=state.get('good')
         error=str(exc)
         failures=min(16,int(state.get('failures',0))+1) if exc.status==429 else 0
         delay=max(interval,min(7200,interval*2**max(0,failures-1)),exc.retry_after)
         next_at=now+delay
+        token_expired=isinstance(exc,ExpiredToken)
     except Exception:
         good=state.get('good')
         error='limits probe failed'
         failures=0
         next_at=now+interval
+        token_expired=False
     with (root/(service+'.lock')).open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         latest=budget_read(path)
         if latest.get('request_at') != request_at:
             return latest
-        state.update(good=good,error=error,failures=failures,next_at=next_at)
+        state.update(good=good,error=error,failures=failures,next_at=next_at,
+                     token_expired=token_expired)
         atomic_json(path,state)
     return state
 
@@ -640,6 +660,290 @@ def keep_limits_on_failure(item, error, now):
     if limits:
         result['sampled_at']=old['at']
     return result
+
+
+def limits_fetcher(service):
+    return {'codex':codex_limits, 'claude':claude_limits,
+            'grok':grok_limits, 'gemini':gemini_limits}[service]
+
+
+def cli_running(service, proc_root=Path('/proc')):
+    """Conservative rotation guard. Inspect identities, never search/kill patterns.
+
+    Installed versions are heterogeneous, so even CLIs with disk-reload logic
+    are guarded. A process-list failure must not authorize a refresh.
+    """
+    names={'gemini':{'agy','antigravity'}, 'claude':{'claude'},
+           'codex':{'codex'}, 'grok':{'grok'}}[service]
+    packages={'claude':'claude-code', 'codex':'@openai/codex',
+              'grok':'grok', 'gemini':'antigravity-cli'}
+    try:
+        processes=list(proc_root.iterdir())
+    except OSError:
+        return True
+    for path in processes:
+        if not path.name.isdigit() or int(path.name)==os.getpid():
+            continue
+        try:
+            if path.stat().st_uid != os.getuid():
+                continue
+            if (path/'stat').read_text().rsplit(')',1)[1].split()[0]=='Z':
+                continue
+            args=(path/'cmdline').read_bytes().split(b'\0')
+            first=os.fsdecode(args[0])
+            try:
+                executable=os.readlink(path/'exe')
+            except PermissionError:
+                executable=(path/'comm').read_text().strip()
+            if Path(first).name in names or Path(executable.removesuffix(' (deleted)')).name in names:
+                return True
+            # Node/Bun launchers: only the script identity, never prompt arguments.
+            if Path(first).name in ('node','bun','nodejs') and len(args)>1:
+                script=os.fsdecode(args[1])
+                if Path(script).name in names or packages[service] in script:
+                    return True
+        except (OSError,ValueError,IndexError):
+            if path.exists():
+                return True
+    return False
+
+
+def refresh_path(home, service):
+    # Like usage probes, this budget cannot be bypassed by a scan-cache override.
+    return request_root(home)/('refresh-'+service+'.json')
+
+
+def refresh_read(home, service):
+    try:
+        value=json.loads(refresh_path(home,service).read_text())
+        if value.get('version')!=1 or value.get('outcome') not in (
+                'refreshing...', 'success', 'already fresh', 'refresh timeout',
+                'refresh failed', 'login required', 'CLI unavailable',
+                'expired (CLI running)', 'limits retry failed', 'refresh stopped'):
+            return {}
+        for key in ('request_at','next_at','failures','pid'):
+            n=value.get(key,0)
+            if isinstance(n,bool) or not isinstance(n,(int,float)) or not math.isfinite(n) or n<0:
+                return {}
+        return value
+    except (OSError,ValueError,AttributeError,TypeError):
+        return {}
+
+
+def reserve_refresh(home, service, now):
+    root=request_root(home)
+    root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with (root/('refresh-'+service+'.lock')).open('a') as lock:
+        try:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False, 'refreshing...'
+        state=refresh_read(home,service)
+        if now<state.get('next_at',0):
+            outcome=state.get('outcome','refresh failed')
+            if outcome=='refreshing...' and (now-state.get('request_at',0)>REFRESH_TIMEOUT or
+                    process_start(state.get('pid',0))!=state.get('start')):
+                outcome='refresh stopped'
+            return False, outcome if outcome not in ('success','already fresh') else 'expired (refresh cooldown)'
+        if cli_running(service):
+            return False, 'expired (CLI running)'
+        # Reserve before spawning. A crash still consumes the minimum cooldown.
+        state.update(version=1,request_at=now,next_at=now+REFRESH_INTERVAL,
+                     outcome='refreshing...',pid=os.getpid(),start=process_start(os.getpid()))
+        atomic_json(refresh_path(home,service),state)
+        return True, 'refreshing...'
+
+
+def finish_refresh(home, service, outcome, good=None):
+    """Publish a fixed status and the single retry, preserving last-good limits."""
+    root=request_root(home)
+    with (root/('refresh-'+service+'.lock')).open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        state=refresh_read(home,service)
+        failures=0 if good else min(8,int(state.get('failures',0))+1)
+        state.update(outcome=outcome,failures=failures,
+                     next_at=max(state.get('next_at',0),time.time()+min(14400,REFRESH_INTERVAL*2**max(0,failures-1))))
+        atomic_json(refresh_path(home,service),state)
+    with (root/(service+'.lock')).open('a') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX)
+        path=root/(service+'.json')
+        state=budget_read(path)
+        at=time.time()
+        state.update(version=PROBE_BUDGET_VERSION,request_at=at,
+                     next_at=at+(CLAUDE_INTERVAL if service=='claude' else INTERVAL),
+                     error='' if good else outcome,
+                     token_expired=not bool(good) and outcome!='limits retry failed')
+        if good:
+            state['good']=good
+        atomic_json(path,state)
+    return at
+
+
+def refresh_environment(home):
+    env=dict(os.environ)
+    # A subscription refresh must not fall through to ambient API credentials.
+    for key in list(env):
+        if key.endswith(('_API_KEY','_AUTH_TOKEN','_BASE_URL')) or key in (
+                'CLAUDE_CODE_OAUTH_TOKEN','CLAUDE_CODE_API_KEY_HELPER',
+                'GOOGLE_APPLICATION_CREDENTIALS','GROK_AUTH_PROVIDER_COMMAND',
+                'CLAUDE_CODE_USE_BEDROCK','CLAUDE_CODE_USE_VERTEX','CLAUDE_CODE_USE_FOUNDRY'):
+            env.pop(key,None)
+    env.update(HOME=str(home),CODEX_HOME=str(Path(home)/'.codex'),
+               CLAUDE_CONFIG_DIR=str(Path(home)/'.claude'),BROWSER='/bin/false',
+               GIT_TERMINAL_PROMPT='0',TERM='xterm-256color')
+    return env
+
+
+def run_refresh_cli(service, home, fresh, timeout=REFRESH_CLI_TIMEOUT, commands=None):
+    """Runs inside the refresh worker's dedicated session/process group.
+
+    Never submit a prompt or request login. All CLI output is discarded. The
+    supervisor kills this whole group after a reply, timeout, shutdown or crash.
+    """
+    commands=commands or {
+        'claude':['claude','--safe-mode'],
+        'codex':['codex','-c','model_provider="openai"','app-server','--listen','stdio://'],
+        'grok':['grok','models'], 'gemini':[str(Path(home)/'.local/bin/agy'),'models']}
+    proc=None
+    master=slave=None
+    try:
+        if service=='claude':
+            master,slave=pty.openpty()
+        proc=subprocess.Popen(commands[service],cwd='/',env=refresh_environment(home),
+                              stdin=slave if slave is not None else
+                              subprocess.PIPE if service=='codex' else subprocess.DEVNULL,
+                              stdout=slave if slave is not None else subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+        if slave is not None:
+            os.close(slave)
+            slave=None
+        if service=='codex':
+            # Explicit refresh is cheaper and more reliable than a TUI/model turn.
+            for message in [
+                {'id':1,'method':'initialize','params':{'clientInfo':{'name':'herdremote-refresh','version':'1'}}},
+                {'method':'initialized','params':{}},
+                {'id':2,'method':'account/read','params':{'refreshToken':True}},
+            ]:
+                proc.stdin.write((json.dumps(message)+'\n').encode())
+            proc.stdin.flush()
+        end=time.monotonic()+timeout
+        output=master if master is not None else proc.stdout.fileno()
+        pending=b''
+        while time.monotonic()<end:
+            if fresh():
+                return 'success'
+            if select.select([output],[],[],0)[0]:
+                try:
+                    chunk=os.read(output,65536)
+                except OSError:
+                    chunk=b''
+                # Bounded, ephemeral classification only. No output enters logs/cache.
+                pending=(pending+chunk)[-65536:]
+                lower=pending.lower()
+                if any(marker in lower for marker in (
+                        b'login required',b'not logged in',b'run /login',
+                        b'refresh_token_reused',b'invalid_grant',b'refresh token has expired',
+                        b'refresh token was revoked',b'sign in to',b'log in to',
+                        b'select login method',b'authentication required',
+                        b'not authenticated',b'reauthorization required',
+                        b're-authenticate',b'please sign in',b'please log in',
+                        b'grok login',b'agy login')):
+                    return 'login required'
+                if service=='codex':
+                    while b'\n' in pending:
+                        line,pending=pending.split(b'\n',1)
+                        try:
+                            answer=json.loads(line)
+                        except (ValueError,TypeError):
+                            continue
+                        if answer.get('id')==2:
+                            return 'success' if fresh() else 'login required'
+            if proc.poll() is not None:
+                return 'success' if fresh() else 'login required' if proc.returncode==0 else 'refresh failed'
+            time.sleep(.05)
+        return 'refresh timeout'
+    except FileNotFoundError:
+        return 'CLI unavailable'
+    except Exception:
+        return 'refresh failed'
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=.5)
+            if proc.stdin:
+                proc.stdin.close()
+            if proc.stdout:
+                proc.stdout.close()
+        for fd in (master,slave):
+            if fd is not None:
+                os.close(fd)
+
+
+def _refresh_worker(conn, service, home):
+    os.setsid()
+    home=Path(home)
+    fetch=limits_fetcher(service)
+    good=None
+    try:
+        # A CLI may have refreshed since the collector observed the expiry.
+        try:
+            limits,note=fetch(home,time.time())
+            good=dict(limits=limits,note=note,at=time.time())
+            outcome='already fresh'
+        except ExpiredToken:
+            if cli_running(service):
+                outcome='expired (CLI running)'
+            else:
+                # Check only expiry locally while waiting; no usage HTTP polling.
+                outcome=run_refresh_cli(service,home,lambda: not stored_token_expired(service,home))
+                # Retry once, re-reading the CLI-owned credentials, even on exit !=0.
+                try:
+                    limits,note=fetch(home,time.time())
+                    if stored_token_expired(service,home):
+                        outcome='login required'
+                    else:
+                        good=dict(limits=limits,note=note,at=time.time())
+                        outcome='success'
+                except ExpiredToken:
+                    if outcome=='success':
+                        outcome='login required'
+                except UsageError:
+                    outcome='limits retry failed'
+        except UsageError:
+            outcome='limits retry failed'
+        conn.send(dict(outcome=outcome,good=good))
+    except Exception:
+        conn.send(dict(outcome='refresh failed',good=None))
+    finally:
+        conn.close()
+        # Also clean descendants if the daemon itself died before reading our
+        # reply. This session/group was created by this worker, never borrowed.
+        if os.getpgrp()==os.getpid():
+            os.killpg(os.getpid(),signal.SIGKILL)
+
+
+def stored_token_expired(service, home):
+    """Expiry only. Unknown/deleted/malformed credentials are never fresh."""
+    try:
+        if service=='claude':
+            auth=json.loads((home/'.claude/.credentials.json').read_text()).get('claudeAiOauth') or {}
+            expiry=auth.get('expiresAt',0)/1000 if auth.get('accessToken') else 0
+        elif service=='codex':
+            auth=json.loads((home/'.codex/auth.json').read_text())
+            encoded=auth['tokens']['access_token'].split('.')[1]
+            expiry=json.loads(base64.urlsafe_b64decode(encoded+'='*(-len(encoded)%4))).get('exp',0)
+        elif service=='grok':
+            auth=json.loads((home/'.grok/auth.json').read_text())
+            entry=next(v for v in auth.values() if isinstance(v,dict))
+            expiry=timestamp(entry.get('expires_at')) if entry.get('key') else 0
+        else:
+            auth=gemini_auth(home)
+            token=auth.get('token') or auth
+            expiry=timestamp(token.get('expiry')) if token.get('access_token') else 0
+        return not isinstance(expiry,(int,float)) or not math.isfinite(expiry) or expiry<=time.time()
+    except Exception:
+        return True
 
 
 class LogFile:
@@ -687,6 +991,7 @@ class Collector:
         self.last_row = saved
         self.scan_cursor = None
         self.next_probe_at = 0
+        self.token_expired = False
         self.last_good = saved.get('last_good') if saved else None
         if not self.last_good and self.live_limits:
             self.last_good = dict(limits=self.live_limits,at=self.limit_at,note=self.limit_note)
@@ -875,14 +1180,14 @@ class Collector:
         self.now = now
         error = ''
         # Every process uses the same reservation ledger, even cold diagnostics.
-        if self.network and now >= self.next_probe_at:
-            fetch = {'codex':codex_limits,'claude':claude_limits,
-                     'grok':grok_limits,'gemini':gemini_limits}[self.service]
+        if self.network:
+            fetch = limits_fetcher(self.service)
             state=shared_probe(self.service,self.home,now,fetch,self.last_good)
             self.next_probe_at=state.get('next_at',now+INTERVAL)
             self.probed_at=state.get('request_at',self.probed_at)
             self.last_good=state.get('good') or self.last_good
             self.limit_error=state.get('error','')
+            self.token_expired=state.get('token_expired',False)
         good=self.last_good or dict(limits=self.live_limits,at=self.limit_at,note=self.limit_note)
         self.live_limits=dict(good['limits'])
         self.limit_at=good['at']
@@ -973,6 +1278,7 @@ class Collector:
             if unknown:
                 note += '; unpriced'
         out.update(note=note,indexing=not complete,indexed_bytes=read,source_bytes=total,
+                   token_expired=self.token_expired,
                    probe_at=self.probed_at,probe_error=self.limit_error,quota_note=self.limit_note,
                    last_good=self.last_good,
                    next_probe_at=self.next_probe_at if self.network else now+INTERVAL)
@@ -1029,10 +1335,11 @@ def _worker(conn, service, home, network):
 
 class UsageCache:
     def __init__(self, home=None, interval=INTERVAL, timeout=TIMEOUT, network=True,
-                 worker=_worker):
+                 worker=_worker, refresh_worker=_refresh_worker):
         self.home = str(home or Path.home())
         self.interval, self.timeout = max(INTERVAL, interval), min(TIMEOUT, timeout)
         self.network, self.worker = network, worker
+        self.refresh_worker=refresh_worker
         self.lock = threading.Lock()
         self.rows = {}
         for service in SERVICES:
@@ -1043,6 +1350,9 @@ class UsageCache:
         self.stopping = threading.Event()
         self.thread = None
         self.processes = {}
+        self.refreshes = {}
+        self.refresh_status = {}
+        self.refresh_published = {}
 
     def request(self):
         """Called after sending cached U. Never waits for I/O or a collector."""
@@ -1058,7 +1368,12 @@ class UsageCache:
 
     def snapshot(self):
         with self.lock:
-            return copy.deepcopy([self.rows[s] for s in SERVICES])
+            result=copy.deepcopy([self.rows[s] for s in SERVICES])
+            for item in result:
+                status=self.refresh_status.get(item['svc'])
+                if status:
+                    item.update(note=status,probe_error=status)
+            return result
 
     def _drop(self, service):
         proc, conn = self.processes.pop(service)
@@ -1072,6 +1387,56 @@ class UsageCache:
 
     def start(self):
         self.request()
+
+    def _queue_refresh(self, context, service):
+        if not self.network or service in self.refreshes:
+            return
+        allowed,status=reserve_refresh(self.home,service,time.time())
+        with self.lock:
+            self.refresh_status[service]=status
+        if not allowed:
+            return
+        started=time.monotonic()
+        conn,child=context.Pipe()
+        proc=context.Process(target=self.refresh_worker,args=(child,service,self.home),daemon=True)
+        try:
+            proc.start()
+        except Exception:
+            child.close()
+            conn.close()
+            finish_refresh(self.home,service,'refresh failed')
+            with self.lock:
+                self.refresh_status[service]='refresh failed'
+            log.info('usage refresh provider=%s method=%s duration=%.3fs outcome=refresh failed',
+                     service,REFRESH_METHODS[service],time.monotonic()-started)
+            return
+        child.close()
+        self.refreshes[service]=(proc,conn,started)
+
+    def _finish_refresh(self, service, result):
+        proc,conn,started=self.refreshes.pop(service)
+        conn.close()
+        try:
+            os.killpg(proc.pid,signal.SIGKILL)
+        except ProcessLookupError:
+            if proc.is_alive():
+                proc.kill()
+        proc.join(timeout=.2)
+        outcome=result['outcome']
+        published=finish_refresh(self.home,service,outcome,result.get('good'))
+        with self.lock:
+            self.refresh_status[service]='' if result.get('good') else outcome
+            self.refresh_published[service]=published
+            good=result.get('good')
+            if good:
+                item=self.rows[service]
+                for key in ('h5_pct','h5_reset','wk_pct','wk_reset'):
+                    item[key]=good['limits'].get(key)
+                item.update(state='ok',sampled_at=good['at'],last_good=good,
+                            note=good['note'],quota_note=good['note'],probe_error='',
+                            probe_at=published,token_expired=False)
+        log.info('usage refresh provider=%s method=%s duration=%.3fs outcome=%s',
+                 service,REFRESH_METHODS[service],time.monotonic()-started,outcome)
 
     def _failed(self, service, error):
         now=time.time()
@@ -1096,6 +1461,18 @@ class UsageCache:
         pending = {}
         try:
             while not self.stopping.is_set():
+                for service,(proc,conn,started) in list(self.refreshes.items()):
+                    result=None
+                    try:
+                        if conn.poll():
+                            result=conn.recv()
+                    except (OSError,EOFError):
+                        result=dict(outcome='refresh failed')
+                    if result is None and time.monotonic()-started>=REFRESH_TIMEOUT:
+                        result=dict(outcome='refresh timeout')
+                    if result is not None:
+                        self._finish_refresh(service,result)
+                        scheduled[service]=0
                 for service in SERVICES:
                     now = time.monotonic()
                     if service not in pending and now >= scheduled[service]:
@@ -1121,8 +1498,18 @@ class UsageCache:
                     try:
                         if conn.poll():
                             result = conn.recv()
+                            # A pre-refresh collection may already be in flight.
+                            # Never let that old row replace the completed retry.
+                            if result.get('probe_at',0)<self.refresh_published.get(service,0):
+                                scheduled[service]=0
+                                del pending[service]
+                                continue
                             with self.lock:
                                 self.rows[service] = result
+                                if not result.get('token_expired') and service not in self.refreshes:
+                                    self.refresh_status.pop(service,None)
+                            if result.get('token_expired'):
+                                self._queue_refresh(context,service)
                             # Small CPU slices keep indexing alive with Usage closed.
                             scheduled[service] = now+(0.75 if result.get('indexing') else
                                 max(.75,min(INTERVAL,result.get('next_probe_at',time.time()+INTERVAL)-time.time())))
@@ -1138,6 +1525,8 @@ class UsageCache:
                         scheduled[service] = now+INTERVAL
                 self.stopping.wait(.01)
         finally:
+            for service in list(self.refreshes):
+                self._finish_refresh(service,dict(outcome='refresh stopped'))
             for service in list(self.processes):
                 self._drop(service)
 
