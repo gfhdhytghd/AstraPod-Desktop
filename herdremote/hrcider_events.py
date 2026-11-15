@@ -53,6 +53,9 @@ class AudioStream:
 
 def playback_events(client,stop,callback):
     """Read public API:Playback events using the existing websockets dependency."""
+    watcher = getattr(client, 'watch_events', None)
+    if watcher:
+        return watcher(stop, callback)
     try:from websockets.sync.client import connect
     except ImportError:
         log.warning('Cider event monitor unavailable: websockets missing');return

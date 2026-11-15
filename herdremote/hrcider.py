@@ -241,6 +241,8 @@ class Client:
         return self.playback().get('nowPlaying') or {}
     def _snapshot(self):
         data=self.playback(full=True)
+        return self._snapshot_data(data)
+    def _snapshot_data(self,data):
         info=data.get('nowPlaying') or {};timing=data['time']
         artwork=info.get('artwork') or {};params=info.get('playParams') or {}
         repeat,shuffle=int(data['repeatMode']),int(data['shuffleMode'])
@@ -469,6 +471,59 @@ class Client:
         return self.request('/api/v2/playback/play-href',{'href':'/v1/me/library/songs'})
 
 
+class CiderPluginClient(Client):
+    """Same consumer interface; state comes from authenticated push frames."""
+    def __init__(self, transport, timeout=.8):
+        super().__init__(timeout=timeout)
+        self.transport = transport
+
+    using_plugin = True
+
+    def start(self):
+        self.transport.start()
+
+    def close(self):
+        self.transport.close()
+
+    def watch_events(self, stop, callback):
+        self.transport.callbacks.append(callback)
+        try:
+            while not stop.wait(.1): pass
+        finally:
+            self.transport.callbacks.remove(callback)
+
+    def request(self, path, body=None, timeout=None, method=None, allow_list=False):
+        if body is None and path == '/api/v1/playback/queue':
+            return self.transport.playback().get('queue', {}).get('neighbors', [])
+        if body is None and path == '/api/v1/playback/is-playing':
+            return {'is_playing': self.transport.playback().get('state') == 'playing'}
+        observer = getattr(self, 'rpc_observer', None)
+        playback = body is not None and ('/playback/' in path or path == '/api/v2/queue/jump')
+        if observer and playback: observer('rpc-sent', path)
+        result = self.transport.request(path, body, self.timeout if timeout is None else timeout, method)
+        if observer and playback: observer('rpc-returned', path)
+        return result
+
+    def playback(self, full=False):
+        return self._playback_valid(self.transport.playback(), full)
+
+    def control(self, command, value=0):
+        if command == 'volume':
+            volume = float(value)
+            if not math.isfinite(volume) or not 0 <= volume <= 100:
+                raise ValueError('Invalid Cider volume')
+            return self.request('/api/v2/playback/volume', {'volume': volume/100}, method='PUT')
+        return super().control(command, value)
+
+    def _snapshot(self):
+        data = self.playback(full=True)
+        result = self._snapshot_data(data)
+        info = data.get('nowPlaying') or {}
+        result.update(inFavorites=bool(info.get('inFavorites')), inLibrary=bool(info.get('inLibrary')),
+                      loading=bool(data.get('loading')))
+        return result
+
+
 class Scheduler:
     def __init__(self):
         self.lock=threading.RLock();self.reset(0,DEFAULT_WINDOW)
@@ -616,7 +671,10 @@ class Loading:
 class Bridge:
     def __init__(self,client=None,cache=None,fetch=None,volume=None,realtime=None):
         self.realtime = client is None if realtime is None else realtime
-        self.client=client or Client(os.environ.get('CIDER_API_URL','http://127.0.0.1:10767'),os.environ.get('CIDER_API_TOKEN'))
+        if client is None:
+            from hrcider_plugin import make_clients
+            client = make_clients(Client)
+        self.client=client
         self.fetch=fetch or urllib.request.urlopen
         self.cache=cache or Cache();self.scheduler=Scheduler();self.lock=threading.RLock()
         self.stop=threading.Event();self.requests={};self.jobs=queue.PriorityQueue(32);self.controls=queue.Queue(16)
@@ -634,6 +692,8 @@ class Bridge:
         self.ledger=Ledger(self.cache);self.planner=Planner(self.cache,self.ledger);self.offer_pairs=set();self.art_times={};self.progress_at=0;self.store_capacity=1<<30;self.inventory_pages=0
         self.live_pending=None;self.live_next=0.;self.reopen_reason=None
     def start(self):
+        starter = getattr(self.client, 'start', None)
+        if starter: starter()
         for target,name in [(self._prefetch_worker,'cider-prefetch-'+str(i)) for i in range(4)]+[(self._poll,'cider-state'),(self._work,'cider-art'),(self._control,'cider-control'),(self._index,'cider-index'),(self._pages,'cider-pages'),(self._neighbors,'cider-neighbors')]:
             t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
         if self.realtime:
@@ -642,6 +702,8 @@ class Bridge:
     def close(self):
         self.stop.set()
         self.fill_cancel.set()
+        closer = getattr(self.client, 'close', None)
+        if closer: closer()
         for t in self.threads:t.join(timeout=3)
         if not any(t.is_alive() for t in self.threads):self.cache.close()
     def disconnect(self):
@@ -844,21 +906,29 @@ class Bridge:
             if event=='rpc-sent' and path=='/api/v2/queue/jump':self.loading.final_leg(time.monotonic())
     def _fast_sample(self):
         with self.lock:epoch=self.loading.epoch
-        state=self.client.transport_snapshot()
+        if getattr(self.client, 'using_plugin', False) is True:
+            snapshot=self.client.snapshot()
+            state={k:snapshot[k] for k in ('id','duration','position','rate','loading')}
+        else:state=self.client.transport_snapshot()
         if not isinstance(state,dict):return
         with self.lock:
             if epoch!=self.loading.epoch or not self.state:return
             self.state.update({k:v for k,v in state.items() if k!='ids'})
-            before=self.loading.value;self.loading.sample(state,time.monotonic())
+            before=self.loading.value
+            if 'loading' in state:self.loading.value=state['loading']
+            else:self.loading.sample(state,time.monotonic())
             if before!=self.loading.value:self._state(True)
     def _on_event(self,event,stamp):
         kind=event.get('type','')
-        if kind not in ('playbackStatus.nowPlayingItemDidChange','playbackStatus.playbackStateDidChange','playbackStatus.playbackTimeDidChange'):return
+        if kind not in ('playbackStatus.nowPlayingItemDidChange','playbackStatus.playbackStateDidChange','playbackStatus.playbackTimeDidChange',
+                        'queueStatus.queueChanged','playbackStatus.loadingDidChange','playerStatus.volumeDidChange',
+                        'playerStatus.shuffleModeDidChange','playerStatus.repeatModeDidChange','playbackStatus.nowPlayingStatusDidChange'):return
         with self.lock:self.loading.note('cider-event',stamp,type=kind)
         try:self._fast_sample()
         except (OSError,ValueError,TimeoutError):pass
         self.wake.set()
     def _on_stream(self,state,stamp):
+        if getattr(self.client, 'using_plugin', False) is True: return
         try:self._fast_sample()
         except (OSError,ValueError,TimeoutError):pass
         with self.lock:
@@ -883,7 +953,9 @@ class Bridge:
                 except OSError:state['volume'],state['muted']=0,False
                 with self.lock:
                     loading_before=self.loading.value
-                    if loading_epoch==self.loading.epoch:self.loading.sample(state,time.monotonic())
+                    if 'loading' in state:
+                        self.loading.value=state['loading']
+                    elif loading_epoch==self.loading.epoch:self.loading.sample(state,time.monotonic())
                     transition=loading_before!=self.loading.value
                     changed=not self.available or published is None or any(state[k]!=published[k] for k in state if k not in ('position','template'))
                     predicted=published['position']+(now-anchor)*published['rate'] if published else 0

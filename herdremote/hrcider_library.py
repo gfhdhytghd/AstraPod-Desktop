@@ -19,6 +19,8 @@ LIST_BEFORE, LIST_AFTER = 5, 20  # queue window around a song of a plain list
 
 
 def page_error(error):
+    if getattr(error, 'plugin_reason', None):
+        return 'Cider plugin: ' + error.plugin_reason
     code=getattr(error,'code',None)
     reason='HTTP '+str(code) if isinstance(code,int) else type(error).__name__
     if getattr(error,'cider_message','') == 'Network connection unavailable':

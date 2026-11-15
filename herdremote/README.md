@@ -848,3 +848,7 @@ omitted. A GET 404 from `/api/v1/amapi/run-v3` is expected: that endpoint is POS
 Read-only `/v1/catalog/<storefront>/{albums,playlists}/<id>/tracks` requests are
 also allowed. This patch does not change firmware, UI notices or Cider's internal
 MusicKit network state.
+
+### Cider plugin backend (FU38)
+
+`CIDER_BACKEND=auto` now selects the authenticated PodBox renderer bridge when it is connected. `plugin` forces this backend; `rpc` preserves the original RPC backend. See [the plugin installation and protocol instructions](../cider-plugin/README.md). The prepared installer must be reviewed before running against a real Cider profile. First pairing pastes a PodBox-only secret from its 0600 file; Apple credentials stay inside Cider. Playback push events populate the host cache. RPC fallback retains its prior behavior. The device protocol and library cache schema are unchanged.
