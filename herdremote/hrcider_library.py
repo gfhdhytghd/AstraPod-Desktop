@@ -17,6 +17,14 @@ log = logging.getLogger('herdremote.cider')
 
 LIST_BEFORE, LIST_AFTER = 5, 20  # queue window around a song of a plain list
 
+
+def page_error(error):
+    code=getattr(error,'code',None)
+    reason='HTTP '+str(code) if isinstance(code,int) else type(error).__name__
+    if getattr(error,'cider_message','') == 'Network connection unavailable':
+        reason += ': Network connection unavailable'
+    return reason
+
 ROOT = {'Search':'search', 'Album':'albums', 'Random Album':'random',
         'Album Artist':'albumartists', 'Artist':'artists', 'Genre':'genres',
         'Year':'years', 'Composer':'composers', 'Featured Artists':'featured',
@@ -99,10 +107,10 @@ class Library:
             while len(self.remote) > 32:
                 self.remote.popitem(last=False)
             return reply
-        except (OSError, ValueError, TimeoutError):
+        except (OSError, ValueError, TimeoutError) as error:
             if cached:
-                return dict(cached[1], stale=True)
-            return dict(data=[], stale=True, meta={'total':0})
+                return dict(cached[1], stale=True, _error=page_error(error))
+            return dict(data=[], stale=True, meta={'total':0}, _error=page_error(error))
 
     def page(self, query, offset, limit, stale=False):
         if len(query) > 380 or offset < 0 or not 1 <= limit <= 50:
@@ -237,7 +245,9 @@ class Library:
             # Relationship artwork is registered only as whitelisted metadata.
             self.cache.register_templates(remote['data'])
             total=remote.get('meta',{}).get('total',offset+len(items)+(1 if remote.get('next') else 0))
-            return dict(generation=self.cache.generation,offset=offset,total=total,stale=stale or remote.get('stale',False),items=items)
+            page=dict(generation=self.cache.generation,offset=offset,total=total,stale=stale or remote.get('stale',False),items=items)
+            if remote.get('_error'):page['_error']=remote['_error']
+            return page
         return dict(generation=self.cache.generation,offset=offset,total=len(items),stale=bool(stale),items=items[offset:offset+limit])
 
     def play(self, path):

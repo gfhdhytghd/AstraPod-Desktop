@@ -840,3 +840,11 @@ requests log `art failed` and send a negative CK reply. An overfull warm queue
 leaves excess work for a later window instead of raising out of its caller.
 Deploy the matching firmware for failed-art cooldown and Home triple-Play
 navigation repair. These changes require no cache migration.
+
+FU37 logs each failed native page at WARNING with its generation, request,
+query kind, offset and HTTP status. Cider's static `Network connection unavailable`
+message is retained; arbitrary error bodies, query values and credentials are
+omitted. A GET 404 from `/api/v1/amapi/run-v3` is expected: that endpoint is POST.
+Read-only `/v1/catalog/<storefront>/{albums,playlists}/<id>/tracks` requests are
+also allowed. This patch does not change firmware, UI notices or Cider's internal
+MusicKit network state.

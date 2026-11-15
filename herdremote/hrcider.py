@@ -17,7 +17,7 @@ import urllib.request
 import zlib
 from hrcider_cache import Cache, Index, art_id, canonical_art_url
 from hrcider_volume import SystemVolume
-from hrcider_library import Library
+from hrcider_library import Library, ROOT, page_error
 from hrcider_store import Ledger, Planner, offer_records, parse_rows
 
 log = logging.getLogger('herdremote.cider')
@@ -30,8 +30,11 @@ RESIDENT_WINDOW = 128 * 1024
 
 
 class HTTPStatusError(OSError):
-    def __init__(self, code):
+    def __init__(self, code, message=''):
         self.code = code
+        # Only a known static diagnosis may cross into page logs. Arbitrary
+        # server bodies can contain URLs, credentials or private query values.
+        self.cider_message = message if message == 'Network connection unavailable' else ''
         super().__init__('Cider HTTP '+str(code))
 
 
@@ -176,8 +179,13 @@ class Client:
                 if len(raw)>2*1024*1024:raise ValueError('Cider reply too large')
                 value=json.loads(raw)
         except urllib.error.HTTPError as e:
-            code=e.code;e.close()
-            raise HTTPStatusError(code) from None
+            code=e.code;message=''
+            try:
+                value=json.loads(e.read(4096))
+                if isinstance(value,dict):message=value.get('message','')
+            except (ValueError,OSError):pass
+            finally:e.close()
+            raise HTTPStatusError(code,message) from None
         if observer and playback:observer('rpc-returned',path)
         if allow_list and isinstance(value,list):return value
         if not isinstance(value,dict):raise ValueError('Malformed Cider reply')
@@ -452,7 +460,8 @@ class Client:
         return self.request('/api/v1/amapi/run-v3',{'path':f'/v1/me/library/{kind}?limit={limit}&offset={offset}'+('&include=albums,catalog' if kind=='songs' else '')},timeout=3)
 
     def library_path(self,path):
-        if not path.startswith('/v1/me/') or len(path)>1024:
+        catalog=re.fullmatch(r'/v1/catalog/[A-Za-z-]{2,16}/(?:albums|playlists)/[A-Za-z0-9][\w.:-]{0,127}/tracks(?:\?[^#]*)?',path)
+        if (not path.startswith('/v1/me/') and not catalog) or len(path)>1024:
             raise ValueError('Invalid library path')
         return self.request('/api/v1/amapi/run-v3',{'path':path},timeout=3)
     def shuffle_library(self):
@@ -912,11 +921,17 @@ class Bridge:
                 if generation!=self.generation or not self.opened:continue
             started=time.monotonic()
             try:page=self.library.page(query,offset,limit,stale=not self.available or self.index.initial)
-            except (ValueError,OSError,TimeoutError):page=dict(generation=self.cache.generation,offset=offset,total=0,stale=True,items=[])
+            except (ValueError,OSError,TimeoutError) as error:
+                page=dict(generation=self.cache.generation,offset=offset,total=0,stale=True,items=[],_error=page_error(error))
+            path=urllib.parse.urlsplit(query).path
+            kind=ROOT.get(urllib.parse.unquote(path[5:]),'unknown') if path.startswith('root/') else path.split('/',1)[0]
+            if kind not in set(ROOT.values())|{'songs','albums','artists','playlists','album','playlist','now'}:kind='unknown'
+            if page.get('_error'):
+                log.warning('page failed gen=%d req=%d kind=%s offset=%d reason=%s',generation,req,kind,offset,page['_error'])
             with self.lock:
                 if generation==self.generation and self.opened and token==self.page_token:
                     self.scheduler.push(2,2,native_page_frame(generation,req,page),req,bulk=True)
-                    log.info('page ready gen=%d req=%d offset=%d rows=%d ms=%.1f',generation,req,offset,len(page['items']),1000*(time.monotonic()-started))
+                    log.info('page ready gen=%d req=%d kind=%s offset=%d rows=%d stale=%s ms=%.1f',generation,req,kind,offset,len(page['items']),bool(page['stale']),1000*(time.monotonic()-started))
     def _control(self):
         while not self.stop.is_set():
             with self.lock:
