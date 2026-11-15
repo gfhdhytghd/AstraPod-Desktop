@@ -5,7 +5,7 @@ const ATTRS = ['name','artistName','albumName','albumArtistName','composerName',
   'trackCount','trackNumber','discNumber','releaseDate','dateAdded','genreNames','contentRating',
   'inFavorites','inLibrary','personalRating','rating','value','hasLyrics','url'];
 const EVENTS = ['playbackStatus.playbackStateDidChange','playbackStatus.nowPlayingItemDidChange',
-  'playbackStatus.playbackTimeDidChange','queueStatus.queueChanged','playerStatus.volumeDidChange',
+  'playbackStatus.playbackTimeDidChange','playbackStatus.loadingDidChange','queueStatus.queueChanged','playerStatus.volumeDidChange',
   'playerStatus.shuffleModeDidChange','playerStatus.repeatModeDidChange','playbackStatus.nowPlayingStatusDidChange'];
 export class BridgeError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -84,7 +84,7 @@ export class CiderAdapter {
       inFavorites:!!p.inFavorites,inLibrary:!!p.inLibrary} : null;
     return {state:str(am.state || p.playbackState,32)||'stopped',nowPlaying:info,
       time:{currentTime:number(am.currentTime ?? p.currentPlaybackTime)},
-      volume:number(am.volume),rate:number(am.audioElement?.playbackRate,1),
+      volume:number(am.volume),rate:number(am.getPlaybackRate?.() ?? am.audioElement?.playbackRate,1),
       repeatMode:({none:0,one:1,all:2})[am.repeatMode]??0,shuffleMode:am.isShuffled?1:0,
       loading:this.loading || !!am.isSwitching || !!am.isSeeking,
       queue:{position:am.queuePosition,total:am.queue.length,neighbors:am.queue.slice(Math.max(0,am.queuePosition-1),am.queuePosition+2).map(i=>resource(i.track))}};
@@ -116,7 +116,7 @@ export class CiderAdapter {
     path=path.replace('$STOREFRONT',this.storefront());
     const parsed=new URL(path,'https://amp-api.music.apple.com');
     if (parsed.origin!=='https://amp-api.music.apple.com' ||
-      !/^\/v1\/(?:me\/(?:library(?:\/(?:songs|albums|artists|playlists)(?:\/[\w.:-]+(?:\/(?:tracks|catalog))?)?|\/(?:search|recently-added))?|ratings\/songs|recent\/played(?:\/tracks)?)|catalog\/[A-Za-z-]{2,16}\/(?:songs|albums|playlists)(?:\/[\w.:-]+(?:\/(?:tracks|library))?)?)$/.test(parsed.pathname)) throw new BridgeError('invalid-request');
+      !/^\/v1\/(?:me\/(?:library(?:\/(?:songs|albums|artists|playlists)(?:\/[\w.:-]+(?:\/(?:tracks|catalog))?)?|\/(?:search|recently-added))?|ratings\/songs|recent\/played(?:\/tracks)?)|catalog\/(?:[A-Za-z-]{2,16}|\$STOREFRONT)\/(?:songs|albums|playlists)(?:\/[\w.:-]+(?:\/(?:tracks|library))?)?)$/.test(parsed.pathname)) throw new BridgeError('invalid-request');
     for (const key of ['offset','limit']) if (parsed.searchParams.has(key)) {
       const n=Number(parsed.searchParams.get(key)); index(n,key==='limit'?1000:1000000);
       if (key==='limit' && !n) throw new BridgeError('invalid-request');

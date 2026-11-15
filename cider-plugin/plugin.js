@@ -1,17 +1,14 @@
 import {CiderAdapter, connectBridge} from './core.mjs';
 import config from './connection.mjs';
-// Pinned internal helpers propagate Apple errors. No credential getter is used.
-import {fi as api, dt as useStorefrontStore, Ai as useMembershipStore} from '/assets/ws-BYB7BHl2.js';
-import {r as initEvents,t as bus} from '/assets/PlaybackEventBus--BJS1dhm.js';
+import {verifyRenderer, hostBindings} from './renderer.mjs';
 export default {
   identifier:'org.podbox.cider-bridge', name:'PodBox Cider Bridge',
   description:'Local authenticated metadata and explicit remote controls',
-  version:'1.0.0', author:'PodBox', pluginKitVersion:'4',
+  version:'1.0.1', author:'PodBox', pluginKitVersion:'4',
   async setup() {
     globalThis.__podboxBridgeStop?.();
-    initEvents();
-    const app=globalThis.CiderApp, am=globalThis.__PLUGINSYS__?.Stores?.appleMusicStore;
-    if (!am) throw new Error('PodBox unsupported-host');
+    await verifyRenderer(config.assets,location.href);
+    const bindings=hostBindings(globalThis.CiderApp,globalThis.__PLUGINSYS__);
     const storageKey='podbox.bridge.secret.v1';
     let secret=localStorage.getItem(storageKey);
     if (!/^[a-f0-9]{64}$/.test(secret || '')) {
@@ -20,20 +17,9 @@ export default {
       if (!/^[a-f0-9]{64}$/.test(secret || '')) return;
       localStorage.setItem(storageKey,secret);
     }
-    const membership=useMembershipStore();
-    const metadata={
-      subscribe:fn=>app.musicKitStore.$subscribe(fn,{detached:true}),
-      get isAuthorized(){return app.musicKitStore.isAuthorized;},
-      get player(){
-        const item=am.nowPlayingItem, id=item?.id || '', type=item?.type || 'songs';
-        return {nowPlayingItem:item,inLibrary:membership.isInLibrary(id,type),inFavorites:membership.isFavorited(id,type)};
-      },
-      setOptimisticValue:(key,id,value)=>app.musicKitStore.setOptimisticValue(key,id,value),
-    };
-    const adapter=new CiderAdapter({am,metadata,api,bus,lyrics:id=>app.lyrics.getLyrics(id),
-      storefront:()=>useStorefrontStore().sid,online:()=>navigator.onLine});
+    const adapter=new CiderAdapter({...bindings,online:()=>navigator.onLine});
     const stopConnection=connectBridge(adapter,{...config,secret});
-    const networkChange=()=>bus.emit('playbackStatus.nowPlayingStatusDidChange',{});
+    const networkChange=()=>bindings.bus.emit('playbackStatus.nowPlayingStatusDidChange',{});
     window.addEventListener('online',networkChange);
     window.addEventListener('offline',networkChange);
     globalThis.__podboxBridgeStop=()=>{

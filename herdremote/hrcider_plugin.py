@@ -8,11 +8,13 @@ import secrets
 import stat
 import threading
 import time
+import urllib.parse
 
 log = logging.getLogger('herdremote.cider')
 VERSION = 1
 MAX_BYTES = 2 * 1024 * 1024
 MAX_PENDING = 16
+DEFAULT_RENDERER_ORIGIN = 'http://127.0.0.1:10767'
 REASONS = frozenset(('offline', 'unauthorized', 'timeout', 'unsupported-host',
                      'unsupported-operation', 'invalid-request', 'reply-too-large', 'host-error', 'busy'))
 
@@ -21,6 +23,21 @@ class PluginError(OSError):
     def __init__(self, reason):
         self.plugin_reason = reason if reason in REASONS else 'host-error'
         super().__init__('Cider plugin: ' + self.plugin_reason)
+
+
+def renderer_origin(value):
+    """Exact loopback tuple origin, independent of the RPC fallback URL."""
+    url = urllib.parse.urlsplit(value)
+    if (url.scheme not in ('http', 'https') or url.hostname not in ('127.0.0.1', 'localhost', '::1')
+            or url.username is not None or url.password is not None or url.path not in ('', '/')
+            or url.query or url.fragment):
+        raise ValueError('CIDER_PLUGIN_RENDERER_ORIGIN must be an exact loopback HTTP(S) origin')
+    port = url.port
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError('Invalid renderer origin port')
+    host = '[::1]' if url.hostname == '::1' else url.hostname
+    suffix = '' if port is None or port == (443 if url.scheme == 'https' else 80) else ':'+str(port)
+    return url.scheme+'://'+host+suffix
 
 
 def install_secret(path):
@@ -53,7 +70,7 @@ class PluginTransport:
     """One renderer connection, bounded synchronous requests, push state cache."""
     def __init__(self, secret, port=10768, origins=None):
         self.secret, self.port = secret, port
-        self.origins = origins or ['http://127.0.0.1:10767', 'http://localhost:10767']
+        self.origins = [DEFAULT_RENDERER_ORIGIN] if origins is None else origins
         self.lock = threading.RLock()
         self.outgoing = queue.Queue(MAX_PENDING)
         self.sender_stop = threading.Event()
@@ -236,8 +253,9 @@ def make_clients(rpc_class, env=os.environ):
     if mode == 'rpc':
         return rpc
     from hrcider import CiderPluginClient
+    origin = renderer_origin(env.get('CIDER_PLUGIN_RENDERER_ORIGIN', DEFAULT_RENDERER_ORIGIN))
     transport = PluginTransport(install_secret(env.get('CIDER_PLUGIN_SECRET_FILE', default_secret_path())),
-                                int(env.get('CIDER_PLUGIN_PORT', '10768')), [rpc.base])
+                                int(env.get('CIDER_PLUGIN_PORT', '10768')), [origin])
     return Backend(rpc, CiderPluginClient(transport), mode)
 
 

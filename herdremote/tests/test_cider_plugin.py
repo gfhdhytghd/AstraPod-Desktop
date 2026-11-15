@@ -261,3 +261,48 @@ def test_stalled_sender_does_not_extend_request_deadline(transport):
                 assert not transport.pending
                 release.set()
         finally:release.set()
+
+
+def test_renderer_origin_is_independent_of_rpc_and_strict(tmp_path):
+    from hrcider_plugin import renderer_origin
+    env={'CIDER_API_URL':'http://127.0.0.1:19999','CIDER_PLUGIN_SECRET_FILE':str(tmp_path/'secret')}
+    backend=make_clients(hrcider.Client,env)
+    assert backend.plugin.transport.origins==['http://127.0.0.1:10767']
+    backend=make_clients(hrcider.Client,dict(env,CIDER_PLUGIN_RENDERER_ORIGIN='http://localhost:19000/'))
+    assert backend.plugin.transport.origins==['http://localhost:19000']
+    assert renderer_origin('http://LOCALHOST:80/')=='http://localhost'
+    for origin in ['null','*','https://evil.test','http://127.0.0.1.evil.test',
+                   'http://user@127.0.0.1:19000','http://127.0.0.1:19000/path']:
+        with pytest.raises(ValueError):renderer_origin(origin)
+
+
+def test_explicit_renderer_origin_handshake_and_wrong_plugin_origin_rejected():
+    origin='http://127.0.0.1:19501'
+    transport=PluginTransport('a'*64,port=0,origins=[origin]);transport.start()
+    try:
+        with pytest.raises(InvalidStatus):connect(f'ws://127.0.0.1:{transport.port}/',origin=ORIGIN)
+        with connect(f'ws://127.0.0.1:{transport.port}/',origin=origin) as ws:
+            ws.send(json.dumps(dict(v=1,type='hello',secret='a'*64,state=STATE)))
+            assert json.loads(ws.recv(timeout=1))['ok'] is True
+    finally:transport.close()
+
+
+def test_installer_prefers_active_ota_and_rejects_changed_bytes(tmp_path):
+    import hashlib,shutil,zipfile
+    source=Path(__file__).resolve().parents[2]/'cider-plugin/install.py'
+    spec=importlib.util.spec_from_file_location('fu38_ota_installer',source)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    staged=tmp_path/'source';shutil.copytree(source.parent,staged);module.SOURCE=staged
+    profile=tmp_path/'profile';profile.mkdir();secret=tmp_path/'secret'
+    raw=b'known active renderer entry'
+    (staged/'host-assets.json').write_text(json.dumps({'index-fixture.js':hashlib.sha256(raw).hexdigest()}))
+    with zipfile.ZipFile(profile/'update.cup','w') as z:z.writestr('spa/assets/index-fixture.js',raw)
+    module.install(profile,secret,10768)
+    target=profile/'plugins'/module.IDENTIFIER
+    assert (target/'renderer.mjs').exists()
+    assert 'index-fixture.js' in (target/'connection.mjs').read_text()
+    with zipfile.ZipFile(profile/'update.cup','w') as z:z.writestr('spa/assets/index-fixture.js',b'changed')
+    before=(target/'plugin.js').read_bytes()
+    with pytest.raises(ValueError,match='Unsupported Cider'):module.install(profile,secret,10768)
+    assert (target/'plugin.js').read_bytes()==before
+    assert not (profile/'podbox-backups').exists()

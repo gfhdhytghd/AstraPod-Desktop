@@ -4,7 +4,9 @@ Metadata and explicit controls inside Cider 4, with an authenticated local rende
 
 ## Compatibility and installation after review
 
-The inspected installation changed externally from Cider 4.0.0 to **4.0.9.1-1** during FU38. This package targets the latter build. `host-assets.json` pins the two private Cider assets used for strict-error Apple API requests, storefront, membership and events. The installer refuses different asset bytes. Playback uses `__PLUGINSYS__.Stores.appleMusicStore`, the supported PluginKit host bridge. The obsolete `MusicKit.getInstance()` and `useMusicKit()` path is not used.
+The current target is Cider 4.0.9.1-1 with the active OTA frontend whose entry is `index-DIvsmjeS.js`. Built-in `/usr/lib/cider/resources/spa/` files can differ from the frontend actually served by Cider. `host-assets.json` pins the active renderer entry (SHA256 `74e5f389b2b4adcd7bd6572445023267d03bc647897306c86539e987cbe80e5e`). The installer checks the profile's `update.cup` first, or the built-in asset directory if no OTA exists. An explicit `--assets` selects an asset directory or OTA ZIP. Unknown or changed bytes cause refusal before profile changes.
+
+At runtime, the plugin resolves `/assets/<pinned entry>` against the renderer's `location.origin`, fetches it without credentials or redirects, and verifies its SHA256 before binding. It does not execute or import that entry. All plugin imports are relative plugin-local modules. Playback uses `__PLUGINSYS__.Stores.appleMusicStore`; library calls use `CiderApp.v3` with `throwOnHTTPError: true`, which the pinned active frontend supports. Metadata comes from `CiderApp.musicKitStore`. No private hashed module aliases or deprecated `MusicKit.getInstance()` call is used.
 
 After review, run from a host with Python 3.10+ and the HerdRemote dependencies:
 
@@ -27,7 +29,8 @@ Cider remembers enabled identifiers in origin localStorage `c3api/applied-plugin
 - `CIDER_BACKEND=rpc`: original RPC only; does not create a plugin listener or secret.
 - `CIDER_PLUGIN_PORT=10768`: bind only `127.0.0.1`. Pass the same `--port` to the installer.
 - `CIDER_PLUGIN_SECRET_FILE`: override the secret path; pass the same `--secret-file` to the installer.
-- Existing `CIDER_API_URL` / `CIDER_API_TOKEN` configure RPC fallback. The RPC URL also sets the exact allowed renderer Origin. Use the Cider renderer origin (default `http://127.0.0.1:10767`). No wildcard Origin, remote bind address or browser extension is required.
+- `CIDER_PLUGIN_RENDERER_ORIGIN=http://127.0.0.1:10767`: the exact renderer Origin, independent of the RPC URL. Set it to the renderer page's origin if the renderer uses a different loopback host or port. Only exact HTTP(S) loopback origins are accepted; no wildcard, missing or `null` origin is accepted in production.
+- Existing `CIDER_API_URL` / `CIDER_API_TOKEN` configure RPC fallback only. Changing a proxy or fallback API URL does not change the renderer Origin allow-list.
 
 Both sides reconnect: Cider retries the outbound connection from 250 ms up to 10 seconds; the host listener accepts a fresh authenticated renderer after the previous connection closes. Host WebSocket ping/pong detects a dead Cider within the configured 10+5 second heartbeat interval. Authentication failure does not select the plugin. A connected plugin reporting offline/unauthorized remains selected and reports that static reason; it does not silently route that operation to RPC. An in-flight mutation is never replayed on fallback.
 
@@ -47,7 +50,7 @@ The wire carries neither audio nor Apple tokens. Snapshots contain state, curren
 
 Requests are bounded to 16 KiB and 16 outstanding operations. Replies/events are bounded to 2 MiB UTF-8, with WebSocket queue depth four and no compression. Replies use request ids; late replies are discarded. Deadlines are capped at ten seconds. Only one renderer mutation may run at once; after a timeout, its gate remains occupied until the host operation settles. Read-only library calls support cancellation through AbortSignal. No timeout retries a control.
 
-State/item/time/queue/mode/status events come from Cider PlaybackEventBus. Loading/buffering/seeking notifications use media-element events only; no samples, media source, DRM internals or audio graph are read. Host snapshot and adjacent-artwork consumers read the pushed cache. The existing quarter-second host/device publication tick remains local. Explicit queue pages and library index scans still request data on demand. RPC fallback retains its previous polling behavior.
+State/item/time/queue/mode/status events come from Cider reactive store subscriptions. In-place queue mutations also produce events. The plugin does not poll. Loading/buffering/seeking notifications use media-element events only; no samples, media source, DRM internals or audio graph are read. Host snapshot and adjacent-artwork consumers read the pushed cache. The existing quarter-second host/device publication tick remains local. Explicit queue pages and library index scans still request data on demand. RPC fallback retains its previous polling behavior.
 
 The adapter handles the compatibility routes consumed by `hrcider*.py`: playback and timing, play/pause/toggle/next/previous/seek/rate/volume/shuffle/repeat, favorites/library mutations, direct song queue, collection queue with verified index jump, queue paging/move/append, songs/albums/playlists and their catalog/library tracks, search, recent additions, history, ratings, lyrics and audio-quality metadata. Library reads allow only those Apple paths. Arbitrary origins, token APIs, account APIs, local files and audio endpoints are rejected. Resources are serialized using a metadata whitelist. Errors cross the bridge only as short static reasons.
 
@@ -55,7 +58,19 @@ The adapter handles the compatibility routes consumed by `hrcider*.py`: playback
 
 ```sh
 python -m pytest -q tools/herdremote/tests/test_cider_plugin.py
-node --test tools/cider-plugin/core.test.mjs
+node --test tools/cider-plugin/core.test.mjs tools/cider-plugin/renderer.test.mjs
 ```
 
 The Python suite uses a fake renderer peer on the real host listener, plus a Node peer using the actual JS adapter and a mocked host. The Node suite uses mocked playback/library APIs. Neither suite controls live Cider. `mock-host.mjs` and `integration-peer.mjs` are test fixtures and are not copied into the Cider profile by the installer. Offline checks do not establish live playback or Apple Music account acceptance.
+
+## Update the installed copy after review (Claude)
+
+Run the updated `install.py` to regenerate `connection.mjs` with the non-secret asset hash map. Copying only plugin.js is insufficient. The installed directory must contain exactly the current runtime files:
+
+- `plugin.yml`
+- `plugin.js`
+- `core.mjs`
+- `renderer.mjs`
+- `connection.mjs` (generated by the installer; no bridge secret)
+
+The host runtime change is `tools/herdremote/hrcider_plugin.py`. The complete package also carries all FU38 host runtime files. Existing origin localStorage retains the paired PodBox secret. Reload/enable and any host-service restart remain manual actions after review; this task performs neither.
