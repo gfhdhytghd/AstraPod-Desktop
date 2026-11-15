@@ -5,12 +5,15 @@ Only this worker calls the read-only Apple endpoints. Playback stays explicit.
 """
 import collections
 import json
+import logging
 import random
 import re
 import time
 import urllib.parse
 from hrcider_cache import art_id
 from hrcider_featured import featured_guests
+
+log = logging.getLogger('herdremote.cider')
 
 LIST_BEFORE, LIST_AFTER = 5, 20  # queue window around a song of a plain list
 
@@ -271,7 +274,18 @@ class Library:
         match=re.fullmatch(r'(album|playlist)/(?:catalog-([a-zA-Z-]+)/)?([^/?]+)',route)
         if match:
             ctype=('' if match[2] else 'library-')+('albums' if match[1]=='album' else 'playlists')
-            return self.client.play_collection(ctype,urllib.parse.unquote(match[3]),aliases,index)
+            try:
+                result=self.client.play_collection(ctype,urllib.parse.unquote(match[3]),aliases,index)
+                _,queued=self.client.queue_state()
+                expected=self.page(route,0,1)['total']
+                if queued>=expected and expected>0:
+                    log.info('collection queue verified type=%s id=%s entries=%d expected=%d',ctype,match[3],queued,expected)
+                    return result
+                log.warning('collection queue incomplete type=%s id=%s entries=%d expected=%d; recovering list window',ctype,match[3],queued,expected)
+            except (OSError,ValueError,TimeoutError) as error:
+                log.warning('collection queue failed type=%s id=%s reason=%s; recovering list window',ctype,match[3],error)
+            # A refused/truncated collection must not silently degrade to a
+            # single song. Reuse the verified paged-list queue fill below.
         start=max(0,index-LIST_BEFORE)
         rows=self.page(route,start,LIST_BEFORE+LIST_AFTER+1)['items']
         songs=[(r['id'],r['route'].split('/')[1],urllib.parse.unquote(r['route'].split('/')[2]))

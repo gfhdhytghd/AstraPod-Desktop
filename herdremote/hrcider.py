@@ -671,7 +671,10 @@ class Bridge:
                         log.info('localstore CF queued gen=%d',self.generation)
                     if 'localdiag' in self.capabilities:self.scheduler.push(1,2,f'CF\t{self.generation}\tlocaldiag'.encode())
                     return True
-                if len(fields)<2 or int(fields[1])!=self.generation:return True
+                if name=='cc' and len(fields)==5:log.info('control received gen=%s req=%s command=%s',fields[1],fields[2],fields[3])
+                if len(fields)<2 or int(fields[1])!=self.generation:
+                    if name=='cc':log.warning('control dropped: stale generation current=%d received=%s',self.generation,fields[1] if len(fields)>1 else '-')
+                    return True
                 if name=='ch' and len(fields)==3:
                     if ('live' in self.capabilities and self.live_pending and
                             fields[2]==self.live_pending[0]):
@@ -917,8 +920,8 @@ class Bridge:
                 if generation!=self.generation or not self.opened:continue
             loading_epoch=None
             try:
-                if not self.available:raise OSError('Cider unavailable')
                 log.info('control request gen=%d req=%d command=%s',generation,req,command)
+                if not self.available:raise OSError('Cider unavailable')
                 log.info('control timeline gen=%d req=%d command=%s event=command-sent monotonic=%.6f',generation,req,command,time.monotonic())
                 route=value
                 if command=='play-item':

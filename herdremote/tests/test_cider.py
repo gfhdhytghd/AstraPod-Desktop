@@ -114,7 +114,9 @@ class Cider(unittest.TestCase):
     def posts(self):return [(v[1].split('/api/')[1],v[2]) for v in Handler.calls if v[0]=='POST' and 'amapi' not in v[1]]
     def test_song_in_album_plays_the_whole_album_from_that_song(self):
         Handler.collections[('library-albums','al1')]=['t1','t2','t3','t4','t5']
-        lib=self.lib();lib.set_context('2|album/al1');r=lib.play('play/library-songs/t3')
+        lib=self.lib();original_page=lib.page
+        lib.page=lambda route,offset,limit:dict(total=len(Handler.collections[('albums' if 'catalog-' in route else 'library-playlists' if route.startswith('playlist/') else 'library-albums', route.rsplit('/',1)[1])]),items=[]) if (route.startswith('album/') or route.startswith('playlist/')) else original_page(route,offset,limit)
+        lib.set_context('2|album/al1');r=lib.play('play/library-songs/t3')
         self.assertEqual(Handler.queue,{'ids':['t1','t2','t3','t4','t5'],'pos':2})
         self.assertEqual(self.posts(),[('v2/playback/play-collection',{'type':'library-albums','id':'al1'}),('v2/queue/jump',{'index':2})])
         self.assertIn('t3',r['expected_ids'])

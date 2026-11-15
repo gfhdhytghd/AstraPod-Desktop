@@ -783,3 +783,28 @@ snapshot, event and control/page consumers. A busy caller waits at most its
 request timeout for ownership, then fails without starting an RPC. There are
 no queued retries or detached timeout workers. Ownership remains
 until the underlying call returns, and response contexts close on read errors.
+
+### FU32 controls and source handoff
+
+The WPS Play hold opens the source-bound control menu, like Select hold. MENU
+returns one level through control pages to the same selected row. On the quick
+screen, physical MENU keeps its TOP action; remote MENU exits, and remote Play
+acts as Select. Cider mode labels in the status-bar skin use the Cider values.
+
+When Cider becomes available on the connected session, it becomes the system
+Now Playing source. Local audio pauses. The open WPS updates in place; other
+screens use Cider on their next WPS entry. Disconnect/unavailability returns to
+local audio, paused; it never resumes automatically. Remote Play double/triple
+shortcuts choose Cider WPS/covers while available, otherwise local screens.
+
+Pending native-play ACKs are completed while WPS is showing. Album/playlist
+play checks the resulting queue against the declared collection length. A
+failed or incomplete collection request recovers with a paged neighbor window
+(up to 5 before and 20 after the selected song) and the existing queue fill.
+Logs record received controls before availability/generation rejection.
+
+Carousel page/provider changes stop and join the picture loader first. A track
+list visit saves the complete 3 MiB app buffer in a temporary core allocation
+and restores its surfaces on return. If that allocation fails, the carousel
+stays open and reports the memory shortage. This allocation is in addition to
+the Cider static RAM cap. No device timing or panic replay is claimed here.
