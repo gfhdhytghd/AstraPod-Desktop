@@ -94,9 +94,8 @@ class WireTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         lib = Path(cls.tmp.name) / "wire.so"
-        subprocess.run(["cc", "-std=c99", "-Wall", "-Wextra", "-Werror", "-shared", "-fPIC",
-                        "-I" + str(ROOT / "firmware/export"),
-                        str(ROOT / "firmware/usbstack/podlink_wire.c"), "-o", str(lib)], check=True)
+        from podlink_rust_build import shared_wire
+        shared_wire(lib)
         cls.c = ctypes.CDLL(str(lib))
         cls.c.podlink_encode.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint32,
                                          ctypes.c_void_p, ctypes.c_uint]

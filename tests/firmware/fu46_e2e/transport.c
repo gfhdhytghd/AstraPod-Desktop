@@ -14,12 +14,12 @@
 #undef podlink_close
 #undef podlink_poll
 #undef podlink_wait
-static void sleep(int ticks) { current_tick += ticks; }
+
 static int disk_requests;
 void usb_podlink_disk(void) { disk_requests++; }
 static int clock_wakes;
 void button_queue_post(long id, intptr_t data) { assert(id == 0x20000000 && !data); clock_wakes++; }
-#include "../../../firmware/usbstack/podlink_service.c"
+#include "podlink_rust_service.h"
 #include "herdremote_model.h"
 
 #include <stdlib.h>
