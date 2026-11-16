@@ -23,6 +23,7 @@ LEFT = 6
 RIGHT = 7
 PLAY = 8
 HEARTBEAT_SECONDS = 1.0
+BRIDGE_PROFILE = 1  # legacy-compatible presence; Dock owns LEFT/RIGHT/PLAY
 VOL_IGNORE_FIRST_REPEATS = 1
 USAGE_THREE_CHARS_SECONDS = 0.5
 USAGE_TEN_CHARS_SECONDS = 1.0
@@ -131,8 +132,8 @@ class MenuForwarder:
 class KeyForwarder:
     """Captured Apple NEC keys, held refreshes and a silence release.
 
-    04 is the centre (Dock Play) key. Keep its existing tap/double/triple
-    semantics; the firmware maps its hold to native Play in every context.
+    LEFT/RIGHT/PLAY belong exclusively to the Dock. MENU is forwarded by
+    the computer; explicit SELECT and volume retain their EP0 wire IDs.
     """
     def __init__(self, usb):
         self.usb = usb
@@ -143,7 +144,7 @@ class KeyForwarder:
         self.poll(now)
         if frame is None:
             return
-        key = ({0x02: MENU, 0x03: MENU, 0x04: PLAY, 0x07: RIGHT, 0x08: LEFT}.get(frame[2])
+        key = ({0x02: MENU, 0x03: MENU}.get(frame[2])
                if len(frame) == 4 and frame[:2] == b'\xee\x87' else None)
         if frame == b'':
             key = self.key
@@ -278,7 +279,7 @@ class USBRemote:
 
     def disk_status(self, now):
         if self.device is None:
-            self.send(2, now, HEARTBEAT)
+            self.send(BRIDGE_PROFILE, now, HEARTBEAT)
         if self.device is None:
             return None
         try:
@@ -316,7 +317,7 @@ class ReceiverHeartbeat:
         except ValueError:
             return
         if now >= self.next_at:
-            self.usb.send(2, now, HEARTBEAT)
+            self.usb.send(BRIDGE_PROFILE, now, HEARTBEAT)
             self.next_at = now + HEARTBEAT_SECONDS
 
 

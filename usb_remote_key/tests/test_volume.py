@@ -45,7 +45,7 @@ class Heartbeat(unittest.TestCase):
         self.assertFalse(r.events)
         h.line(b'STATE 1 1',0);h.line(b'EDGE 1000 0',.5)
         h.line(b'STATE 1001 1',1);h.line(b'STATE 2001 1',2)
-        self.assertEqual(r.events,[(k.HEARTBEAT,2,0),(k.HEARTBEAT,2,1),(k.HEARTBEAT,2,2)])
+        self.assertEqual(r.events,[(k.HEARTBEAT,1,0),(k.HEARTBEAT,1,1),(k.HEARTBEAT,1,2)])
     def test_recorded_ir_cadence_has_one_step_per_later_repeat(self):
         from test_gestures import groups
         for group in groups():

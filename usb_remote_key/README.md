@@ -278,3 +278,22 @@ Both native and Cider quickscreens map remote Left/Right to their corresponding
 slots, once per press. Vol+/Vol- map to TOP/BOTTOM; an empty slot is a no-op.
 Menu and short centre/Select leave. Only the wheel retains quickscreen volume.
 This source was tested offline; no serial device was opened for FU30.
+
+## FU43 routing (supersedes FU30 transport forwarding above)
+
+LEFT/RIGHT/PLAY now always use the Dock. The host stops forwarding EP0 IDs
+6/7/8 and sends presence heartbeat profile 1. New firmware masks only Dock
+MENU/SELECT with either fresh profile; legacy transport reports are ACKed but
+not injected, including late duplicates. Volume and FU42 Disk Mode long-MENU
+logic remain unchanged. QuickScreen Play remains immediate Select; its physical
+triple still toggles Cover Flow across an overlay close.
+
+An old profile-2 host paired with new firmware keeps Dock transport without
+duplicates. A new host paired with old firmware keeps Dock transport through
+profile 1, but strict MENU/SELECT ownership requires the new firmware. The full
+compatibility table is in `docs/covers-navigation.md` in the release package
+(source: `docs/podbox/covers-navigation.md`).
+
+The package includes `disk_mode.py`, `herdremote.py`, `hrdisk.py`, and
+`podlink_disk.py` from the FU42 base revision so the forwarder has its runtime
+dependencies and the combined firmware's Disk Mode handshake remains usable.
