@@ -2,10 +2,42 @@
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import logging
+import re
 import subprocess
 
 LOG = logging.getLogger('podbox-usbkey')
 UUID = Path('/dev/disk/by-uuid/8DD6-4F07')
+UDISKS = 'org.freedesktop.UDisks2'
+
+
+def eject_drive(dev, run):
+    """Ask udisksd to eject as its service user; never open the disk here."""
+    name = Path(dev).name
+    # UDisks object components escape every non-alphanumeric byte as _xx.
+    component = ''.join(c if c.isascii() and c.isalnum() else
+                        f'_{ord(c):02x}' for c in name)
+    command = ['gdbus', 'call', '--system', '--dest', UDISKS,
+               '--object-path', f'/org/freedesktop/UDisks2/block_devices/{component}',
+               '--method', 'org.freedesktop.DBus.Properties.Get', '--timeout', '2',
+               UDISKS + '.Block', 'Drive']
+    result = run(command, capture_output=True, text=True, timeout=3, check=False)
+    if result.returncode:
+        LOG.warning('Disk Mode drive lookup failed: %s; no force', result.stderr.strip())
+        return False
+    match = re.fullmatch(r"\(<objectpath '(/org/freedesktop/UDisks2/drives/[A-Za-z0-9_]+)'>,\)\s*",
+                         result.stdout)
+    if not match:
+        LOG.warning('Disk Mode drive lookup returned no valid Drive; no force')
+        return False
+    # No polkit password prompt. A denied/inactive session fails closed.
+    command = ['gdbus', 'call', '--system', '--dest', UDISKS,
+               '--object-path', match[1], '--method', UDISKS + '.Drive.Eject',
+               '--timeout', '12', "{'auth.no_user_interaction': <true>}"]
+    result = run(command, capture_output=True, text=True, timeout=13, check=False)
+    if result.returncode:
+        LOG.warning('Disk Mode Drive.Eject failed: %s; no force', result.stderr.strip())
+        return False
+    return True
 
 
 def volume():
@@ -30,8 +62,7 @@ def clean(eject, find=volume, run=subprocess.run):
     if dev is None:
         LOG.warning('Disk Mode volume unavailable or identity mismatch')
         return False
-    for command in ([['udisksctl', 'unmount', '-b', dev]] +
-                    ([['eject', '-s', dev]] if eject else [])):
+    for command in [['udisksctl', 'unmount', '-b', dev]]:
         try:
             result = run(command, capture_output=True, text=True, timeout=2, check=False)
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -42,6 +73,13 @@ def clean(eject, find=volume, run=subprocess.run):
             if command[1] == 'unmount' and 'NotMounted' in result.stderr:
                 continue
             LOG.warning('Disk Mode %s failed: %s; no force', ' '.join(command[:2]), result.stderr.strip())
+            return False
+    if eject:
+        try:
+            if not eject_drive(dev, run):
+                return False
+        except (OSError, subprocess.TimeoutExpired) as error:
+            LOG.warning('Disk Mode Drive.Eject failed: %s; no force', error)
             return False
     LOG.info('Disk Mode %s complete', 'eject' if eject else 'unmount')
     return True

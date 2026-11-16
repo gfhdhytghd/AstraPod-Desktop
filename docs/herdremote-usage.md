@@ -348,15 +348,26 @@ acknowledgement arrives, the restored UI shows a two-second warning:
 PodLink CDC profile returns, allowing HerdRemote to reconnect without a popup.
 
 Hold the **Apple remote MENU** for one second while Disk Mode is active. The
-usbkey daemon runs `udisksctl unmount -b <volume>`, then `eject -s <volume>`.
-The explicit SCSI eject sets LOEJ, which reaches Rockbox's FU29 all-LUN eject
-path. `udisksctl power-off` alone is not used because SCSI STOP without LOEJ
+usbkey daemon runs `udisksctl unmount -b <volume>`, then resolves the UDisks
+Block's `Drive` property and calls `org.freedesktop.UDisks2.Drive.Eject` on
+the system bus using `gdbus`. UDisks2 2.11.2 runs util-linux `eject` as root.
+Linux's SCSI ioctl maps CDROMEJECT to START STOP UNIT with LOEJ even on an
+`sd` disk. If that ioctl fails, util-linux 2.42.4 also tries an explicit SCSI
+START STOP UNIT with LOEJ, reaching FU29's all-LUN eject
+path (the iPod6g has one storage drive). `udisksctl power-off` is not used because SCSI STOP without LOEJ
 does not establish that path. Firmware waits 200 ms for the SCSI status to drain
 and restores PodLink. Short MENU forwarding is unchanged. IR serial remains
 read-only. No sudo, interface claim, driver detach or forced unmount is used.
 
 The usbkey helper checks UUID plus the sysfs USB VID, PID and storage-profile
-serial before invoking host commands. Each command has a two-second timeout.
+serial before invoking host commands. Unmount retains its two-second timeout.
+The Drive lookup has a two-second D-Bus deadline and three-second process
+deadline. Eject has a twelve-second D-Bus deadline and thirteen-second process
+deadline, allowing util-linux's ten-second SCSI command timeout. `gdbus` is
+required (GLib). The call disables interactive authorization. The installed
+polkit default permits `eject-media` for active local sessions; other-seat or
+system disks use separate policies. Actual daemon authorization still depends
+on the session. A denial never falls back to sudo or direct block-device I/O.
 Busy/unavailable/error results are logged; an unmount failure never triggers
 eject or a flush acknowledgement. Already-unmounted UDisks `NotMounted` is a
 safe result. Missing host support, a busy mount, a slow flush, USB transport
