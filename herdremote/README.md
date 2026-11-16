@@ -852,3 +852,14 @@ MusicKit network state.
 ### Cider plugin backend (FU38)
 
 `CIDER_BACKEND=auto` now selects the authenticated PodBox renderer bridge when it is connected. `plugin` forces this backend; `rpc` preserves the original RPC backend. See [the plugin installation and protocol instructions](../cider-plugin/README.md). The prepared installer must be reviewed before running against a real Cider profile. First pairing pastes a PodBox-only secret from its 0600 file; Apple credentials stay inside Cider. Playback push events populate the host cache. RPC fallback retains its prior behavior. The device protocol and library cache schema are unchanged.
+
+## FU44 IR fallback local API
+
+`hrfallback.py` extends the existing FU42 `hrdisk.py` private Unix socket.
+It authorizes debounced IR fallback and reuses this daemon's KeyTaps and
+HoldToTalk instances at current desktop focus. Keyboard/voice commands from
+the player are suppressed while fallback owns desktop input, including the
+EP0-failed/CDC-live case. No new network listener or dependency is added.
+Deploy it together with the matching bridge's `host_fallback.py` and the six
+runtime files listed in `docs/podbox/ir-host-fallback.md`. Both herdremote and
+podbox-usbkey require restart after the copies; FU44 performs neither action.

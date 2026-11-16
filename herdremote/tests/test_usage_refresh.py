@@ -48,6 +48,20 @@ def success_refresh(conn, service, home):
         usage._refresh_worker(conn,service,home)
 
 
+def wait_group_exit(pids, timeout=1.0):
+    # killpg delivers a signal; grandchild exit isn't synchronous with return.
+    # Preserve the all-owned-PIDs assertion with a bounded scheduling window.
+    end=time.monotonic()+timeout
+    def finished(pid):
+        try:
+            return (Path('/proc')/str(pid)/'stat').read_text().rsplit(')',1)[1].split()[0]=='Z'
+        except FileNotFoundError:
+            return True
+    while time.monotonic()<end and not all(finished(pid) for pid in pids):
+        time.sleep(.005)
+    return all(finished(pid) for pid in pids)
+
+
 class RefreshTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory()
@@ -283,9 +297,7 @@ class RefreshTests(unittest.TestCase):
                     time.sleep(.01)
                 self.assertEqual({r['svc']:r for r in cache.snapshot()}['grok']['note'],'refresh timeout')
                 pids=json.loads((self.home/'child.json').read_text())
-                for pid in pids:
-                    stat=Path('/proc')/str(pid)/'stat'
-                    self.assertTrue(not stat.exists() or stat.read_text().rsplit(')',1)[1].split()[0]=='Z')
+                self.assertTrue(wait_group_exit(pids))
                 self.assertIsNone(canary.poll())
                 text=' '.join(logs.output)
                 for key in ['provider=grok','method=models','duration=','outcome=refresh timeout']:
@@ -303,9 +315,7 @@ class RefreshTests(unittest.TestCase):
         pids=json.loads((self.home/'child.json').read_text())
         with self.assertLogs('herdremote',level='INFO'):
             cache._finish_refresh('grok',dict(outcome='refresh stopped'))
-        for pid in pids:
-            stat=Path('/proc')/str(pid)/'stat'
-            self.assertTrue(not stat.exists() or stat.read_text().rsplit(')',1)[1].split()[0]=='Z')
+        self.assertTrue(wait_group_exit(pids))
         self.assertEqual(usage.refresh_read(self.home,'grok')['outcome'],'refresh stopped')
 
     def test_real_worker_fake_cli_completes_and_publishes_fresh_numbers(self):

@@ -277,6 +277,20 @@ class USBRemote:
             return False
 
 
+    def probe(self, now):
+        """Fresh GET_CONFIGURATION, independent of key forwarding and CDC."""
+        if self.device is None:
+            self.send(BRIDGE_PROFILE, now, HEARTBEAT)
+        if self.device is None:
+            return False
+        try:
+            value = bytes(self.device.ctrl_transfer(0x80, 8, 0, 0, 1, timeout=100))
+            return len(value) == 1 and value[0] != 0
+        except (self.core.USBError, ValueError):
+            self.close()
+            self.retry_at = now + .5
+            return False
+
     def disk_status(self, now):
         if self.device is None:
             self.send(BRIDGE_PROFILE, now, HEARTBEAT)
@@ -351,12 +365,14 @@ def main():
     import usb.core
     import usb.util
     import disk_mode
+    import host_fallback
     remote = USBRemote(usb.core, usb.util)
     disk = disk_mode.DiskMode(remote)
     forwarder = KeyForwarder(remote)
     usage_volume = UsageVolume()
     volume = VolumeForwarder(remote, usage_volume)
     heartbeat = ReceiverHeartbeat(remote)
+    router = host_fallback.Router(remote, disk, forwarder, volume)
     stopped = False
 
     def stop(signum, frame):
@@ -369,8 +385,7 @@ def main():
     try:
         while not stopped:
             now = time.monotonic()
-            disk.poll(now)
-            forwarder.poll(now)
+            router.poll(now)
             if fd is None:
                 if now >= retry_at:
                     retry_at = now + 1.0
@@ -402,18 +417,15 @@ def main():
                     heartbeat.line(line, now)
                     frame = decoder.line(line)
                     at = time.monotonic()
-                    disk.frame(frame, at, decoder.span_us / 1e6)
-                    forwarder.frame(frame, at, decoder.span_us / 1e6)
-                    volume.frame(frame, at, decoder.span_us / 1e6)
+                    router.frame(frame, at, decoder.span_us / 1e6)
             except OSError as exc:
                 LOG.warning('IR unavailable: %s', exc)
-                forwarder.release(time.monotonic())
+                router.release(time.monotonic())
                 os.close(fd)
                 fd, buffer, decoder = None, b'', NECDecoder()
-                volume = VolumeForwarder(remote, usage_volume)
     finally:
+        router.release(time.monotonic())
         disk.close()
-        forwarder.release(time.monotonic())
         remote.close()
         if fd is not None:
             os.close(fd)

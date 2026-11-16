@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import podlink  # noqa: E402  tools/podlink.py: the PodLink frame codec
 
 import hrdisk
+import hrfallback
 import hrdetect  # noqa: E402
 import hrdetail  # noqa: E402
 import hrherdr  # noqa: E402
@@ -183,7 +184,7 @@ class Daemon:
         self.keys = hrkeys.KeyTaps(hrkeys.KeyTool(getattr(args, "key_tool", None)),
                                   key_scale=getattr(args, "key_scale", None))
         self.usage_keys = hrusagekeys.UsageKeys(self.keys, lambda:
-            bool(self.link and self.link.opened and self.sent_ws is not None and
+            bool(not self._ir_owns_desktop() and self.link and self.link.opened and self.sent_ws is not None and
                  self.foreground in (None, 1) and
                  (self.usage_keys.view != 'detail' or
                   self.detail_keys_pane == self.usage_keys.pane == self.detail_pane)))
@@ -200,14 +201,17 @@ class Daemon:
         self.appserver = hrappserver.Reader()
         self.cider = None
         self.remote_log = hrremotelog.Writer()
-        self.disk_control = hrdisk.Control(getattr(args, "disk_control_socket", None))
+        self.ir_fallback = hrfallback.Executor(self.keys, self.voice)
+        self.disk_control = hrdisk.Control(getattr(args, "disk_control_socket", None),
+                                          fallback=self.ir_fallback)
         self.reset_session()
 
     def reset_session(self):
         self.clock_sync = ClockSync()
         self.session_generation = getattr(self, "session_generation", 0) + 1
         self.keys.reset()
-        self.voice.stop()
+        if not getattr(self, "ir_fallback", None) or not self.ir_fallback.talking:
+            self.voice.stop()
         self.sent_ws = None
         self.sent_status = None
         self.sent_agents = None
@@ -578,6 +582,8 @@ class Daemon:
             return
         if self.remote_log.submit(payload):
             return
+        if self._ir_owns_desktop() and payload.startswith(b"cc\t"):
+            return  # Dock input must not also mutate Cider during IR ownership.
         if payload.startswith(b"ci\t1\t") and self.cider is None:
             self.cider = hrcider.Bridge()
             self.cider.start()
@@ -588,6 +594,9 @@ class Daemon:
             log.info("ignored message from player: %r", payload[:40])
             return
         name, args = parsed
+        if self._ir_owns_desktop() and name in ("fw", "fp", "ft", "a", "qi"):
+            self.send(hrproto.result(args[0], False, "IR host fallback active"))
+            return
         if name == "hr":
             self.reset_session()
             self.sent_ws = b""
@@ -661,7 +670,14 @@ class Daemon:
         except hrherdr.HerdrError as error:
             self.send(hrproto.result(req, False, str(error)))
 
+    def _ir_owns_desktop(self):
+        fallback = getattr(self, "ir_fallback", None)
+        return fallback is not None and fallback.active
+
     def key_command(self, req, key, count=1):
+        if self._ir_owns_desktop():
+            self.send(hrproto.result(req, False, "IR host fallback active"))
+            return
         result = ((False, "Session not ready") if self.sent_ws is None else
                   self.keys.request(req, key, count))
         if result is None and self.detail_pane:
@@ -689,6 +705,9 @@ class Daemon:
         self.changed.set()
 
     def voice_command(self, name, req, target=None):
+        if self._ir_owns_desktop():
+            self.send(hrproto.result(req, False, "IR host fallback active"))
+            return
         result = (self.voice.press(target) if name == "vd" else
                   self.voice.discard() if name == "vc" else self.voice.release())
         self.send(hrproto.result(req, *result))

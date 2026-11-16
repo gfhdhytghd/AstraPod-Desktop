@@ -297,3 +297,14 @@ compatibility table is in `docs/covers-navigation.md` in the release package
 The package includes `disk_mode.py`, `herdremote.py`, `hrdisk.py`, and
 `podlink_disk.py` from the FU42 base revision so the forwarder has its runtime
 dependencies and the combined firmware's Disk Mode handshake remains usable.
+
+## FU44 host fallback
+
+When EP0/PodLink is unavailable continuously for one second, the bridge uses
+HerdRemote's private local API for the exact Usage keyboard/voice mapping.
+Recovery requires working EP0 plus an open PodLink session. FU43 routing is
+retained while connected. FU42 Disk Mode long-MENU eject has exclusive MENU
+priority. Six physical IR keys include centre's SELECT-tap/PLAY-hold meanings.
+See `docs/podbox/ir-host-fallback.md` in source, or
+`.rockbox/docs/ir-host-fallback.md` in the package, for all gestures, safety
+limits, tests, host files and exact service restart instructions.

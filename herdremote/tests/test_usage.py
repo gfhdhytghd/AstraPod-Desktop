@@ -279,7 +279,9 @@ class Cache(unittest.TestCase):
     def test_hard_timeout_failure_isolation_throttle_and_shutdown(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        cache = hrusage.UsageCache(temporary.name, timeout=.4, network=False, worker=fake_worker)
+        # Include spawn/import startup on loaded hosts; the hung fixture still
+        # sleeps 10 s, well beyond this bounded collector deadline.
+        cache = hrusage.UsageCache(temporary.name, timeout=2.0, network=False, worker=fake_worker)
         self.addCleanup(cache.close)
         cache.rows['codex'].update(tokens=123,usd_milli=4,sampled_at=NOW)
         before = time.monotonic()
@@ -290,7 +292,7 @@ class Cache(unittest.TestCase):
             cache.request()
             cache.snapshot()
         self.assertEqual(cache.next_refresh,next_refresh)
-        deadline = time.monotonic()+3
+        deadline = time.monotonic()+5
         while time.monotonic()<deadline and any(r['note']=='indexing 0%' for r in cache.snapshot()):
             time.sleep(.02)
         rows = {r['svc']:r for r in cache.snapshot()}

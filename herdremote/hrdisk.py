@@ -15,8 +15,9 @@ def default_socket():
 
 
 class Control:
-    def __init__(self, path=None):
+    def __init__(self, path=None, *, fallback=None):
         self.path = path or default_socket()
+        self.fallback = fallback
         self.server = None
         self.reset()
 
@@ -67,8 +68,21 @@ class Control:
                     socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
                 if uid != os.getuid():
                     reply = b'5 unauthorized\n'
-                elif channel.recv(64) != b'enter-disk-v1\n':
-                    reply = b'5 invalid request\n'
+                else:
+                    request = b''
+                    while b'\n' not in request and len(request) < 512:
+                        part = channel.recv(512 - len(request))
+                        if not part:
+                            break
+                        request += part
+                    if request.startswith(b'ir-') and self.fallback is not None:
+                        channel.sendall(self.fallback.handle(request, link))
+                        return
+                    if request != b'enter-disk-v1\n':
+                        channel.sendall(b'5 invalid request\n')
+                        return
+                if uid != os.getuid():
+                    pass
                 elif link is None or not link.opened:
                     reply = b'3 no PodLink session\n'
                 elif self.token is None:
@@ -84,6 +98,8 @@ class Control:
                 return
 
     def close(self):
+        if self.fallback is not None:
+            self.fallback.close()
         if self.server is not None:
             self.server.close()
             self.server = None

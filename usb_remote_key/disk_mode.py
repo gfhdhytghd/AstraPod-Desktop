@@ -48,8 +48,9 @@ def clean(eject, find=volume, run=subprocess.run):
 
 
 class DiskMode:
-    def __init__(self, remote):
+    def __init__(self, remote, *, find=None):
         self.remote = remote
+        self.find_volume = find if find is not None else volume
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='disk-eject')
         self.job = None
         self.request = None
@@ -93,7 +94,7 @@ class DiskMode:
             return
         self.next_poll = now + .1
         status = self.remote.disk_status(now)
-        self.active = bool(status and status[1])
+        self.active = bool(status[1]) if status else bool(self.find_volume())
         if status and status[2]:
             request = int.from_bytes(status[4:8], 'little')
             if request != self.seen:
