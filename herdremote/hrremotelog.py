@@ -5,9 +5,10 @@ from pathlib import Path
 import queue
 import threading
 import time
+from hrlogcap import PART_BYTES, append
 
 log = logging.getLogger("herdremote.remote-log")
-MAX_BYTES = 4 * 1024 * 1024
+MAX_BYTES = PART_BYTES
 
 
 class Writer:
@@ -50,15 +51,7 @@ class Writer:
         prefix = f"{stamp} mono={mono:.6f} "
         data = ((prefix + f"LOG HOST LOST {lost}\n") if lost else "")
         data = (data + prefix + text + "\n").encode("utf-8")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            size = self.path.stat().st_size
-        except FileNotFoundError:
-            size = 0
-        if size and size + len(data) > self.max_bytes:
-            self.path.replace(self.path.with_name(self.path.name + ".1"))
-        with self.path.open("ab") as stream:
-            stream.write(data)
+        append(self.path, data, self.max_bytes)
 
     def _run(self):
         while not self.stopping.is_set() or not self.jobs.empty():
