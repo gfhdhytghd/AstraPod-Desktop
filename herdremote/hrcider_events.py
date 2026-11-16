@@ -6,6 +6,7 @@ import select
 import shutil
 import subprocess
 import time
+from hrcider_workers import WorkerErrors
 
 log=logging.getLogger('herdremote.cider')
 
@@ -56,11 +57,14 @@ def playback_events(client,stop,callback):
     watcher = getattr(client, 'watch_events', None)
     if watcher:
         return watcher(stop, callback)
-    try:from websockets.sync.client import connect
+    try:
+        from websockets.sync.client import connect
+        from websockets.exceptions import WebSocketException
     except ImportError:
         log.warning('Cider event monitor unavailable: websockets missing');return
     url='ws'+client.base[4:]+'/socket.io/?EIO=4&transport=websocket'
     headers={'apptoken':client.token} if client.token else {}
+    errors=WorkerErrors()
     while not stop.is_set():
         try:
             with connect(url,additional_headers=headers,open_timeout=2,close_timeout=.3,max_size=1024*1024) as ws:
@@ -77,4 +81,7 @@ def playback_events(client,stop,callback):
         except Exception as e:
             # A stopped Cider must not stop the daemon; metadata polling remains.
             if stop.is_set():break
-            log.debug('Cider event monitor reconnect: %s',type(e).__name__);stop.wait(1)
+            if isinstance(e,(OSError,ValueError,TimeoutError,WebSocketException)):
+                log.debug('Cider event monitor reconnect: %s',type(e).__name__)
+            else:errors.note('rpc-events',e)
+            stop.wait(1)

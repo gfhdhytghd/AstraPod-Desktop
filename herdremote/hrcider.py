@@ -19,6 +19,7 @@ from hrcider_cache import Cache, Index, art_id, canonical_art_url
 from hrcider_volume import SystemVolume
 from hrcider_library import Library, ROOT, page_error
 from hrcider_store import Ledger, Planner, offer_records, parse_rows
+from hrcider_workers import WorkerErrors, survive
 
 log = logging.getLogger('herdremote.cider')
 SIZES = {'L':240,'M':128,'S':56,'XS':32}
@@ -49,6 +50,10 @@ class SessionExpired(RuntimeError):
 def clean(value, limit=120):
     text=' '.join(''.join(' ' if ord(c)<32 or ord(c)==127 else c for c in str(value)).split())
     return text.encode()[:limit].decode('utf-8','ignore')
+
+
+def item_id(value):
+    return str(value) if isinstance(value,(str,int)) and not isinstance(value,bool) else ''
 
 
 def capped_url(template):
@@ -199,6 +204,7 @@ class Client:
     def _playback_valid(data, full=False):
         if not isinstance(data,dict) or not isinstance(data.get('state'),str) or not data['state']:
             raise ValueError('Malformed Cider playback state')
+        data=dict(data)
         info=data.get('nowPlaying');timing=data.get('time')
         if 'nowPlaying' not in data or (info is not None and not isinstance(info,dict)):
             raise ValueError('Malformed Cider now-playing item')
@@ -211,6 +217,11 @@ class Client:
         if full:
             if not all(k in data for k in ('volume','repeatMode','shuffleMode','rate')):
                 raise ValueError('Incomplete Cider playback state')
+            # Current Cider RPC uses named repeat modes and boolean shuffle;
+            # plugin v1 uses MusicKit's numeric enums. Keep one host contract.
+            if isinstance(data['repeatMode'],str):
+                data['repeatMode']={'none':0,'one':1,'all':2}.get(data['repeatMode'],data['repeatMode'])
+            if isinstance(data['shuffleMode'],bool):data['shuffleMode']=int(data['shuffleMode'])
             values.extend(data[k] for k in ('volume','repeatMode','shuffleMode','rate'))
             if data['repeatMode'] not in (0,1,2) or data['shuffleMode'] not in (0,1):
                 raise ValueError('Malformed Cider playback modes')
@@ -245,15 +256,22 @@ class Client:
     def _snapshot_data(self,data):
         info=data.get('nowPlaying') or {};timing=data['time']
         artwork=info.get('artwork') or {};params=info.get('playParams') or {}
+        text=lambda value: value if isinstance(value,str) else ''
+        template=text(artwork.get('url'))
+        background=text(artwork.get('bgColor'))
+        if not re.fullmatch(r'[a-fA-F0-9]{6}',background):background='181818'
         repeat,shuffle=int(data['repeatMode']),int(data['shuffleMode'])
         duration=max(0,int(info.get('durationInMillis') or 0))
         position=min(duration,max(0,int(float(timing.get('currentTime',timing.get('currentPlaybackTime',0)))*1000)))
-        track=str(params.get('id') or info.get('id') or '')
-        return dict(id=track,repeat5=self._mode5(repeat,shuffle,track),title=info.get('name',''),artist=info.get('artistName',''),
-                    album=info.get('albumName',''),composer=info.get('composerName',''),duration=duration,
+        track=item_id(params.get('id')) or item_id(info.get('id'))
+        return dict(id=track,repeat5=self._mode5(repeat,shuffle,track),title=text(info.get('name')),artist=text(info.get('artistName')),
+                    album=text(info.get('albumName')),composer=text(info.get('composerName')),duration=duration,
                     position=position,rate=max(0,round(float(data['rate'])*1000)) if data['state']=='playing' else 0,
                     volume=max(0,min(100,round(float(data['volume'])*100))),repeat=repeat,shuffle=shuffle,
-                    art=art_id(artwork.get('url','')),template=artwork.get('url',''),bg=str(artwork.get('bgColor','181818'))[:6])
+                    art=art_id(template),template=template,bg=background)
+    def loading_state(self):
+        """Plugin-private buffering metadata; absent in the RPC snapshot."""
+        return None
     def transport_snapshot(self):
         try:return self._transport_snapshot()
         except (TypeError,AttributeError,KeyError,OverflowError,ValueError):
@@ -261,9 +279,9 @@ class Client:
     def _transport_snapshot(self):
         data=self.playback()
         info=data.get('nowPlaying') or {};params=info.get('playParams') or {}
-        ids={str(v) for v in (info.get('id'),params.get('id'),params.get('catalogId'),params.get('libraryId')) if v}
+        ids={item_id(v) for v in (info.get('id'),params.get('id'),params.get('catalogId'),params.get('libraryId')) if item_id(v)}
         timing=data['time'];duration=max(0,int(info.get('durationInMillis') or 0))
-        return dict(id=str(params.get('id') or info.get('id') or ''),ids=ids,
+        return dict(id=item_id(params.get('id')) or item_id(info.get('id')),ids=ids,
                     duration=duration,position=min(duration,max(0,int(float(timing.get('currentTime',timing.get('currentPlaybackTime',0)))*1000))),
                     rate=max(0,round(float(data.get('rate',1))*1000)) if data.get('state')=='playing' else 0)
     def same_song(self,route):
@@ -505,7 +523,13 @@ class CiderPluginClient(Client):
         return result
 
     def playback(self, full=False):
-        return self._playback_valid(self.transport.playback(), full)
+        data=self.transport.playback()
+        # Unknown optional scalars use the same defaults as the legacy RPC
+        # fallback. Required item/time structure and nonfinite values still fail.
+        data=dict(data)
+        for key,default in (('volume',0),('rate',1),('repeatMode',0),('shuffleMode',0)):
+            if data.get(key) is None:data[key]=default
+        return self._playback_valid(data, full)
 
     def control(self, command, value=0):
         if command == 'volume':
@@ -515,13 +539,8 @@ class CiderPluginClient(Client):
             return self.request('/api/v2/playback/volume', {'volume': volume/100}, method='PUT')
         return super().control(command, value)
 
-    def _snapshot(self):
-        data = self.playback(full=True)
-        result = self._snapshot_data(data)
-        info = data.get('nowPlaying') or {}
-        result.update(inFavorites=bool(info.get('inFavorites')), inLibrary=bool(info.get('inLibrary')),
-                      loading=bool(data.get('loading')))
-        return result
+    def loading_state(self):
+        return self.playback().get('loading') is True
 
 
 class Scheduler:
@@ -678,6 +697,7 @@ class Bridge:
         self.fetch=fetch or urllib.request.urlopen
         self.cache=cache or Cache();self.scheduler=Scheduler();self.lock=threading.RLock()
         self.stop=threading.Event();self.requests={};self.jobs=queue.PriorityQueue(32);self.controls=queue.Queue(16)
+        self.worker_errors=WorkerErrors()
         self.state=None;self.available=False;self.reason='Starting';self.state_seq=0;self.last_state=0
         self.opened=False;self.state_dirty=False;self.library_sent=0;self.wake=threading.Event();self.failures=0;self.templates={};self.generation=0;self.threads=[]
         self.fill_cancel=threading.Event()
@@ -908,14 +928,15 @@ class Bridge:
         with self.lock:epoch=self.loading.epoch
         if getattr(self.client, 'using_plugin', False) is True:
             snapshot=self.client.snapshot()
-            state={k:snapshot[k] for k in ('id','duration','position','rate','loading')}
-        else:state=self.client.transport_snapshot()
+            state={k:snapshot[k] for k in ('id','duration','position','rate')}
+            source_loading=self.client.loading_state()
+        else:state=self.client.transport_snapshot();source_loading=None
         if not isinstance(state,dict):return
         with self.lock:
             if epoch!=self.loading.epoch or not self.state:return
             self.state.update({k:v for k,v in state.items() if k!='ids'})
             before=self.loading.value
-            if 'loading' in state:self.loading.value=state['loading']
+            if source_loading is not None:self.loading.value=source_loading
             else:self.loading.sample(state,time.monotonic())
             if before!=self.loading.value:self._state(True)
     def _on_event(self,event,stamp):
@@ -934,14 +955,18 @@ class Bridge:
         with self.lock:
             before=self.loading.value;self.loading.stream(state['running'],stamp)
             if before!=self.loading.value:self._state(True)
+    @survive()
     def _event_worker(self):
         from hrcider_events import playback_events
         playback_events(self.client,self.stop,self._on_event)
+    @survive()
     def _stream_worker(self):
         from hrcider_events import AudioStream
         AudioStream().watch(self.stop,self._on_stream)
+    @survive()
     def _poll(self):
         next_poll=0;published=None;anchor=0
+        missing=object()
         while not self.stop.is_set():
             now=time.monotonic()
             if self.wake.is_set():self.wake.clear();next_poll=0
@@ -949,15 +974,18 @@ class Bridge:
             try:
                 with self.lock:loading_epoch=self.loading.epoch
                 state=self.client.snapshot()
+                source_loading=self.client.loading_state() if getattr(self.client,'using_plugin',False) is True else None
                 try:state['volume'],state['muted']=self.volume.read()
                 except OSError:state['volume'],state['muted']=0,False
                 with self.lock:
                     loading_before=self.loading.value
-                    if 'loading' in state:
-                        self.loading.value=state['loading']
+                    if source_loading is not None:
+                        self.loading.value=source_loading
                     elif loading_epoch==self.loading.epoch:self.loading.sample(state,time.monotonic())
                     transition=loading_before!=self.loading.value
-                    changed=not self.available or published is None or any(state[k]!=published[k] for k in state if k not in ('position','template'))
+                    changed=not self.available or published is None or any(
+                        state.get(k,missing)!=published.get(k,missing)
+                        for k in state.keys()|published.keys() if k not in ('position','template'))
                     predicted=published['position']+(now-anchor)*published['rate'] if published else 0
                     changed |= abs(state['position']-predicted)>2000 or now-self.last_state>=15
                     self.available=True;self.reason='';self.state=state;self.library.state=state
@@ -972,18 +1000,23 @@ class Bridge:
                         self.client.control('seek',target);self.wake.set()
                     except (OSError,ValueError,TimeoutError):pass
                 self.failures=0;next_poll=now+.25
-            except (OSError,ValueError,TimeoutError) as error:
+            except Exception as error:
+                expected=isinstance(error,(OSError,ValueError,TimeoutError))
+                reason=clean(str(error),80) if expected else 'Cider state worker failure'
+                if not expected:self.worker_errors.note('_poll',error)
                 with self.lock:
                     self.failures=min(8,self.failures+1)
                     # Preserve the last coherent state through isolated failures.
                     # Retry promptly during grace, then use the existing backoff.
                     if self.failures>=3 and (self.available or self.reason=='Starting'):
-                        self.available=False;self.loading.cancel();self.reason=clean(str(error),80) or 'Cider unavailable';self._state(True)
-                log.warning('Cider poll failed consecutive=%d available=%s reason=%s',self.failures,self.available,clean(error,120))
+                        self.available=False;self.loading.cancel();self.reason=reason or 'Cider unavailable';self._state(True)
+                if expected:log.warning('Cider poll failed consecutive=%d available=%s reason=%s',self.failures,self.available,reason)
                 next_poll=time.monotonic()+(.25 if self.failures<3 else min(30,2**(self.failures-3)))
+    @survive()
     def _index(self):
         while not self.stop.is_set():
             self.index.step();self.stop.wait(.25)
+    @survive()
     def _pages(self):
         while not self.stop.is_set():
             try:
@@ -993,7 +1026,8 @@ class Bridge:
                 if generation!=self.generation or not self.opened:continue
             started=time.monotonic()
             try:page=self.library.page(query,offset,limit,stale=not self.available or self.index.initial)
-            except (ValueError,OSError,TimeoutError) as error:
+            except Exception as error:
+                if not isinstance(error,(ValueError,OSError,TimeoutError)):self.worker_errors.note('_pages',error)
                 page=dict(generation=self.cache.generation,offset=offset,total=0,stale=True,items=[],_error=page_error(error))
             path=urllib.parse.urlsplit(query).path
             kind=ROOT.get(urllib.parse.unquote(path[5:]),'unknown') if path.startswith('root/') else path.split('/',1)[0]
@@ -1004,6 +1038,7 @@ class Bridge:
                 if generation==self.generation and self.opened and token==self.page_token:
                     self.scheduler.push(2,2,native_page_frame(generation,req,page),req,bulk=True)
                     log.info('page ready gen=%d req=%d kind=%s offset=%d rows=%d stale=%s ms=%.1f',generation,req,kind,offset,len(page['items']),bool(page['stale']),1000*(time.monotonic()-started))
+    @survive()
     def _control(self):
         while not self.stop.is_set():
             with self.lock:
@@ -1059,11 +1094,13 @@ class Bridge:
                 self.loading.note('rpc-returned',ok=1)
                 log.info('control timeline gen=%d req=%d command=%s event=rpc-returned monotonic=%.6f',generation,req,command,time.monotonic())
                 ok=True;text='OK';self.wake.set()
-            except (OSError,ValueError,TimeoutError) as error:
+            except Exception as error:
                 with self.lock:
                     if loading_epoch==self.loading.epoch:self._loading_cancel()
                 ok=False;text='Control failed; not retried'
-                log.warning('control failed gen=%d req=%d command=%s reason=%s',generation,req,command,clean(error,120))
+                if isinstance(error,(OSError,ValueError,TimeoutError)):
+                    log.warning('control failed gen=%d req=%d command=%s reason=%s',generation,req,command,clean(error,120))
+                else:self.worker_errors.note('_control',error)
             log.info('control result gen=%d req=%d ok=%s',generation,req,ok)
             with self.lock:
                 if generation==self.generation and self.opened:self.scheduler.push(0,2,f'CK\t{generation}\t{req}\t{int(ok)}\t{text}'.encode())
@@ -1106,6 +1143,7 @@ class Bridge:
                 try:self.prefetch.put_nowait((self.generation,pair))
                 except queue.Full:break  # bounded background work, retried next window
                 self.warm_jobs[pair]=self.generation
+    @survive()
     def _prefetch_worker(self):
         while not self.stop.is_set():
             try:generation,pair=self.prefetch.get(timeout=.1)
@@ -1119,9 +1157,11 @@ class Bridge:
             with self.lock:
                 if generation!=self.generation or pair not in self.warm_window|self.warm_queue|self.offer_pairs:return
             self.artwork(key,tier)
-        except (OSError,ValueError,TimeoutError):
+        except Exception as error:
+            if not isinstance(error,(OSError,ValueError,TimeoutError)):self.worker_errors.note('_warm',error)
             with self.lock:
                 if self.warm_jobs.get(pair)==generation:self.warm_jobs.pop(pair,None)
+    @survive()
     def _neighbors(self):
         while not self.stop.is_set():
             try:
@@ -1152,9 +1192,11 @@ class Bridge:
                             if signature!=self.neighbors:
                                 self.neighbors=signature
                                 self.scheduler.push(1,2,('CP\t'+'\t'.join(map(str,signature))).encode())
-            except (OSError,ValueError,TimeoutError,AttributeError,TypeError):
-                pass
+            except Exception as error:
+                if not isinstance(error,(OSError,ValueError,TimeoutError)):
+                    self.worker_errors.note('_neighbors',error)
             self.stop.wait(1)
+    @survive()
     def _work(self):
         while not self.stop.is_set():
             try:priority,distance,order,generation,req,key,tier,offset,token=self.jobs.get(timeout=.2)
@@ -1172,13 +1214,16 @@ class Bridge:
                     if len(items)!=len(key):continue
                     raw=pack_xs(generation,req,items)
                 else:raw=self.artwork(key,tier)
-            except (OSError,ValueError,TimeoutError) as error:
+            except Exception as error:
+                expected=isinstance(error,(OSError,ValueError,TimeoutError))
+                if not expected:self.worker_errors.note('_work',error)
                 with self.lock:
                     if generation==self.generation and self.requests.get(req) is token:
                         try:self.scheduler.push(0,2,f'CK\t{generation}\t{req}\t0\tArtwork unavailable'.encode())
                         except ValueError:self.reopen_reason='Cider artwork response queue full'
                         self.requests.pop(req,None)
-                        log.info('art failed gen=%d req=%d tier=%s fill=%s reason=%s',generation,req,tier,priority==4,clean(error,120))
+                        reason=clean(error,120) if expected else 'Unexpected artwork worker failure'
+                        log.info('art failed gen=%d req=%d tier=%s fill=%s reason=%s',generation,req,tier,priority==4,reason)
                 continue
             with self.lock:
                 if generation==self.generation and self.requests.get(req) is token:

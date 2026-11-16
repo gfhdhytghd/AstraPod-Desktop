@@ -9,6 +9,7 @@ import stat
 import threading
 import time
 import urllib.parse
+from hrcider_workers import WorkerErrors, run_worker, survive
 
 log = logging.getLogger('herdremote.cider')
 VERSION = 1
@@ -74,6 +75,7 @@ class PluginTransport:
         self.lock = threading.RLock()
         self.outgoing = queue.Queue(MAX_PENDING)
         self.sender_stop = threading.Event()
+        self.worker_errors = WorkerErrors()
         self.sender = None
         self.ws = None
         self.state = None
@@ -103,11 +105,14 @@ class PluginTransport:
                                 ping_interval=10, ping_timeout=5,
                                 compression=None, logger=protocol_log)
             self.port = self.server.socket.getsockname()[1]
-            self.thread = threading.Thread(target=self.server.serve_forever, name='cider-plugin', daemon=True)
+            self.thread = threading.Thread(target=run_worker,
+                                           args=(self.server.serve_forever,self.sender_stop,'plugin-server',self.worker_errors),
+                                           name='cider-plugin', daemon=True)
             self.thread.start()
             self.sender = threading.Thread(target=self._send_worker, name='cider-plugin-send', daemon=True)
             self.sender.start()
 
+    @survive('sender_stop')
     def _send_worker(self):
         # A stalled peer must not trap a request caller in socket.send(). One
         # bounded sender serves all requests; heartbeat/close releases its I/O.
@@ -130,8 +135,8 @@ class PluginTransport:
         for callback in callbacks:
             try:
                 callback({'type': kind}, time.monotonic())
-            except Exception:
-                log.debug('Cider plugin event consumer failed')
+            except Exception as error:
+                self.worker_errors.note('plugin-events',error)
 
     def _connection(self, ws):
         # Server Origin checking prevents browser cross-site use. Authentication
@@ -263,6 +268,7 @@ class Backend:
     """Select once per public operation; never replay a failed mutation on RPC."""
     def __init__(self, rpc, plugin, mode='auto'):
         self.rpc, self.plugin, self.mode = rpc, plugin, mode
+        self.worker_errors = WorkerErrors()
         self.base, self.token = rpc.base, rpc.token
 
     @property
@@ -302,7 +308,9 @@ class Backend:
                     if rpc_stop: rpc_stop.set()
                 elif self.mode == 'auto' and (worker is None or not worker.is_alive()):
                     rpc_stop = threading.Event()
-                    worker = threading.Thread(target=playback_events, args=(self.rpc, rpc_stop, callback), daemon=True)
+                    target = lambda active_stop=rpc_stop: playback_events(self.rpc,active_stop,callback)
+                    worker = threading.Thread(target=run_worker,
+                                              args=(target,rpc_stop,'rpc-events',self.worker_errors), daemon=True)
                     worker.start()
         finally:
             if rpc_stop: rpc_stop.set()

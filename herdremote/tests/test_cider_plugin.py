@@ -66,7 +66,7 @@ def test_events_cached_snapshot_neighbors_no_polling(transport):
         state=dict(STATE,time={'currentTime':23},loading=True,queue={'neighbors':[{'id':'one'}]})
         ws.send(json.dumps(dict(v=1,type='event',event='playbackStatus.loadingDidChange',state=state)))
         wait_for(lambda:client.snapshot()['position']==23000)
-        assert client.snapshot()['loading'] is True
+        assert client.loading_state() is True
         assert client.request('/api/v1/playback/queue')==[{'id':'one'}]
         assert events[-1]['type']=='playbackStatus.loadingDidChange'
 
@@ -233,13 +233,13 @@ def test_plugin_loading_events_are_authoritative_over_stream_metadata(transport,
             ws.recv(timeout=1)
             bridge.state=client.snapshot();bridge.available=True
             ws.send(json.dumps(dict(v=1,type='event',event='playbackStatus.loadingDidChange',state=dict(STATE,loading=True))))
-            wait_for(lambda:client.snapshot()['loading'])
+            wait_for(lambda:client.loading_state())
             bridge._on_event({'type':'playbackStatus.loadingDidChange'},time.monotonic())
             assert bridge.loading.value is True
             bridge._on_stream({'running':True},time.monotonic())
             assert bridge.loading.value is True
             ws.send(json.dumps(dict(v=1,type='event',event='playbackStatus.loadingDidChange',state=STATE)))
-            wait_for(lambda:not client.snapshot()['loading'])
+            wait_for(lambda:not client.loading_state())
             bridge._on_event({'type':'playbackStatus.loadingDidChange'},time.monotonic())
             assert bridge.loading.value is False
     finally:bridge.close()
