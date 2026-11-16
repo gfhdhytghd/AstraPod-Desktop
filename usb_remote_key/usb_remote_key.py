@@ -276,6 +276,31 @@ class USBRemote:
             return False
 
 
+    def disk_status(self, now):
+        if self.device is None:
+            self.send(2, now, HEARTBEAT)
+        if self.device is None:
+            return None
+        try:
+            data = bytes(self.device.ctrl_transfer(0xc0, 0x5c, 0, 0, 8, timeout=100))
+            return data if len(data) == 8 and data[0] == 1 else None
+        except (self.core.USBError, ValueError) as error:
+            # EPIPE is an old firmware's optional-request stall. A vanished
+            # profile must release the handle even when no IR receiver runs.
+            if getattr(error, 'errno', None) != 32:
+                self.close()
+                self.retry_at = now + .5
+            return None
+
+    def disk_ack(self, request):
+        if self.device is not None:
+            try:
+                self.device.ctrl_transfer(0x40, 0x5c, request & 0xffff,
+                                          request >> 16, b'', timeout=100)
+            except (self.core.USBError, ValueError) as error:
+                LOG.warning('Disk flush acknowledgement failed: %s', error)
+
+
 class ReceiverHeartbeat:
     def __init__(self, usb):
         self.usb = usb
@@ -324,7 +349,9 @@ def main():
                         format='%(asctime)s %(levelname)s %(message)s')
     import usb.core
     import usb.util
+    import disk_mode
     remote = USBRemote(usb.core, usb.util)
+    disk = disk_mode.DiskMode(remote)
     forwarder = KeyForwarder(remote)
     usage_volume = UsageVolume()
     volume = VolumeForwarder(remote, usage_volume)
@@ -341,6 +368,7 @@ def main():
     try:
         while not stopped:
             now = time.monotonic()
+            disk.poll(now)
             forwarder.poll(now)
             if fd is None:
                 if now >= retry_at:
@@ -373,6 +401,7 @@ def main():
                     heartbeat.line(line, now)
                     frame = decoder.line(line)
                     at = time.monotonic()
+                    disk.frame(frame, at, decoder.span_us / 1e6)
                     forwarder.frame(frame, at, decoder.span_us / 1e6)
                     volume.frame(frame, at, decoder.span_us / 1e6)
             except OSError as exc:
@@ -382,6 +411,7 @@ def main():
                 fd, buffer, decoder = None, b'', NECDecoder()
                 volume = VolumeForwarder(remote, usage_volume)
     finally:
+        disk.close()
         forwarder.release(time.monotonic())
         remote.close()
         if fd is not None:

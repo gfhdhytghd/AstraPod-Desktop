@@ -792,6 +792,7 @@ class EndToEnd(unittest.TestCase):
         self.ipod = FakeIpod(getattr(self, "max_message", 4096))
         args = types.SimpleNamespace(socket=self.herdr.path,
                                      port=self.ipod.path, once=False,
+                                     disk_control_socket=os.path.join(self.tmp.name, "disk-control", "disk.sock"),
                                      state=os.path.join(self.tmp.name,
                                                         "order.json"))
         self.daemon = herdremote.Daemon(args)

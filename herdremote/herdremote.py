@@ -27,6 +27,7 @@ import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import podlink  # noqa: E402  tools/podlink.py: the PodLink frame codec
 
+import hrdisk
 import hrdetect  # noqa: E402
 import hrdetail  # noqa: E402
 import hrherdr  # noqa: E402
@@ -199,6 +200,7 @@ class Daemon:
         self.appserver = hrappserver.Reader()
         self.cider = None
         self.remote_log = hrremotelog.Writer()
+        self.disk_control = hrdisk.Control(getattr(args, "disk_control_socket", None))
         self.reset_session()
 
     def reset_session(self):
@@ -469,6 +471,7 @@ class Daemon:
         return True
 
     def close_link(self):
+        self.disk_control.reset()
         if self.cider is not None:
             self.cider.disconnect()
         self.reset_session()
@@ -571,6 +574,8 @@ class Daemon:
             self.next_tick = now + TICK_SECONDS
 
     def command(self, payload):
+        if payload == hrdisk.CAPABILITY and self.disk_control.hello(payload, self.send):
+            return
         if self.remote_log.submit(payload):
             return
         if payload.startswith(b"ci\t1\t") and self.cider is None:
@@ -720,6 +725,7 @@ class Daemon:
             log.warning("focus %s failed: %s", target, error)
 
     def run(self):
+        self.disk_control.start()
         self.usage_keys.start()
         self.usage.start()
         hrherdr.Watcher(self.herdr, self.changed).start()
@@ -729,6 +735,7 @@ class Daemon:
             self.run_loop()
         finally:
             self.stopping.set()
+            self.disk_control.close()
             self.remote_log.close()
             if self.cider is not None:
                 self.cider.close()
@@ -745,6 +752,7 @@ class Daemon:
         next_probe = 0.0
         while not self.stopping.is_set():
             now = time.monotonic()
+            self.disk_control.poll(self.link)
             if not self.link:
                 self.pump_reads()
                 if now >= next_probe:

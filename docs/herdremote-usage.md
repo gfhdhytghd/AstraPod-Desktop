@@ -293,3 +293,75 @@ herdr daemon or probes serial devices. Tests mock every HTTP, keyring, and live
 RPC request. pty integration uses a private fake herdr and fake iPod. See
 `/home/wilf/data/PodJS/ipod/AGENTS-USAGE-BACKEND.md` for the real output,
 measurements, Omarchy-source comparison, and remaining upstream omissions.
+
+## Disk Mode control (FU42)
+
+Updated HerdRemote and firmware advertise `disk-mode-v1` with the resident
+`DH\t1\tdisk-mode-v1` hello. Run:
+
+```sh
+python3 tools/herdremote/podlink_disk.py --timeout 20
+```
+
+The CLI talks only to the running daemon's private Unix socket, by default
+`$XDG_RUNTIME_DIR/podbox-herdremote/disk.sock` (fallback `/run/user/<uid>/...`).
+The daemon is the only serial owner. The socket directory is mode 0700, the
+socket is 0600, and the daemon checks `SO_PEERCRED` for its own UID. The daemon
+sends a fresh 128-bit bearer token after each PodLink OPEN and the device hello.
+The disk request must echo that token in the same live session, after the host
+HR hello. Firmware consumes it once and invalidates it on session reset.
+
+This authenticates the local caller and authorizes a USB session. It does not
+cryptographically authenticate the physical USB peer: PodLink has no paired
+key, encryption or device identity proof. Possession of this trusted USB
+connection and access as the daemon's user are the trust boundary. Do not
+expose this socket over a network.
+
+The request is consent. It replaces the consent popup, resets the old eject
+latch and follows the normal storage broadcast / all-thread ACK barrier. It
+works independently of the foreground PodLink client (Home, WPS, Cider,
+Agents or a quick screen). A cable epoch on the queued USB event rejects
+requests left over from a replug.
+
+Exit codes: `0` means FAT UUID `8DD6-4F07` is present; `2` means the volume wait
+timed out; `3` means the daemon/session is unavailable; `4` means the firmware
+hello lacks the capability; `5` means the request/response was rejected. If the
+volume already exists, the CLI returns 0 without sending another request.
+Volume presence does not mean an installer has mounted or finished writing it.
+
+A fast_swap-style installer can call this CLI, require exit 0, then perform its
+existing UUID wait, backup, swap and eject. `fast_swap.py` is unchanged. A timed
+out request is not retried automatically because the device may already be
+switching profiles. The updated host files must be deployed separately by the
+operator; the firmware ZIP does not install host scripts or restart services.
+
+### Leaving Disk Mode
+
+Hold the **body MENU** for one second. The USB thread reads the raw body bit,
+independent of HID mappings and remote key events. EP0 vendor request `0x5c`
+remains available during mass storage. The updated usbkey daemon polls it every
+100 ms and asks UDisks to unmount the matching volume before acknowledging.
+Firmware gives the host three seconds, then detaches USB, remounts storage and
+returns through the existing USB screen to the caller. When no successful
+acknowledgement arrives, the restored UI shows a two-second warning:
+`Host flush unanswered: disk detached`. The cable stays attached and the
+PodLink CDC profile returns, allowing HerdRemote to reconnect without a popup.
+
+Hold the **Apple remote MENU** for one second while Disk Mode is active. The
+usbkey daemon runs `udisksctl unmount -b <volume>`, then `eject -s <volume>`.
+The explicit SCSI eject sets LOEJ, which reaches Rockbox's FU29 all-LUN eject
+path. `udisksctl power-off` alone is not used because SCSI STOP without LOEJ
+does not establish that path. Firmware waits 200 ms for the SCSI status to drain
+and restores PodLink. Short MENU forwarding is unchanged. IR serial remains
+read-only. No sudo, interface claim, driver detach or forced unmount is used.
+
+The usbkey helper checks UUID plus the sysfs USB VID, PID and storage-profile
+serial before invoking host commands. Each command has a two-second timeout.
+Busy/unavailable/error results are logged; an unmount failure never triggers
+eject or a flush acknowledgement. Already-unmounted UDisks `NotMounted` is a
+safe result. Missing host support, a busy mount, a slow flush, USB transport
+loss, or an unanswered EP0 notification all leave the body timeout as an
+unplug-like fallback. That fallback can lose host-cached writes. A successful
+unmount assumes the host does not remount or write the raw device before the
+firmware detaches. Actual Linux permissions, SCSI delivery, timing and device
+screen restoration still require a separately authorized hardware check.
