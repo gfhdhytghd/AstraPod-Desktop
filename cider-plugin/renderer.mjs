@@ -53,14 +53,32 @@ export function hostBindings(app, system) {
     },
     setOptimisticValue:(...args)=>metadataStore.setOptimisticValue(...args),
   };
-  const listeners=new Map();let unsubscribe;
+  const listeners=new Map();let unsubscribe,player,removePlayer=()=>{},active=false,pendingItem=false;
   const stamp=()=>({state:store.state,id:store.nowPlayingItem?.id,time:store.currentTime,
     queue:store.queue,position:store.queuePosition,total:store.queue.length,
     volume:store.volume,repeat:store.repeatMode,shuffle:store.isShuffled,
     loading:!!store.isSwitching||!!store.isSeeking});
   let previous=stamp();
   const emit=(name)=>{for(const fn of [...(listeners.get(name) || [])])fn();};
+  // nowPlayingItem is computed from a shallow queue in the pinned host. A
+  // Pinia state subscription alone need not see an in-place track replacement.
+  // The engine's metadata events supply item hints independently of that store.
+  const itemHint=()=>{
+    if (!active || pendingItem) return;
+    pendingItem=true;
+    queueMicrotask(()=>{pendingItem=false;if(active)emit('playbackStatus.nowPlayingItemDidChange');});
+  };
+  const bindPlayer=()=>{
+    if (player===store.player) return;
+    removePlayer();player=store.player;
+    const target=player?.events;
+    if (!target?.addEventListener || !target?.removeEventListener) {removePlayer=()=>{};return;}
+    const events=['MKLite:itemIdChanged','MKLite:resolvedItemChanged','MKLite:loadedmetadata','MKLite:crossfadeComplete'];
+    for(const event of events)target.addEventListener(event,itemHint);
+    removePlayer=()=>{for(const event of events)target.removeEventListener(event,itemHint);};
+  };
   const changed=()=>{
+    bindPlayer();
     const next=stamp(),events=[];
     for (const [keys,event] of [
       [['state'],'playbackStatus.playbackStateDidChange'],[['id'],'playbackStatus.nowPlayingItemDidChange'],
@@ -76,8 +94,15 @@ export function hostBindings(app, system) {
   };
   const bus={emit,on(name,callback){
     if (!listeners.has(name))listeners.set(name,new Set());listeners.get(name).add(callback);
-    unsubscribe ||= store.$subscribe(changed,{detached:true});
-    return ()=>{listeners.get(name).delete(callback);if([...listeners.values()].every(s=>!s.size)){unsubscribe?.();unsubscribe=undefined;}};
+    if (!active) {
+      active=true;bindPlayer();
+      unsubscribe=store.$subscribe(changed,{detached:true,flush:'sync'});
+      // Some hosts initialize the player only after the plugin connects.
+      store.onPlayerReady?.(()=>{if(active)bindPlayer();});
+    }
+    return ()=>{listeners.get(name).delete(callback);if([...listeners.values()].every(s=>!s.size)){
+      active=false;unsubscribe?.();unsubscribe=undefined;removePlayer();player=undefined;
+    }};
   }};
   return {am,metadata,bus,
     // The pinned active frontend explicitly rethrows when this option is true.

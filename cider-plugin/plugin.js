@@ -4,7 +4,7 @@ import {verifyRenderer, hostBindings} from './renderer.mjs';
 export default {
   identifier:'org.podbox.cider-bridge', name:'PodBox Cider Bridge',
   description:'Local authenticated metadata and explicit remote controls',
-  version:'1.0.1', author:'PodBox', pluginKitVersion:'4',
+  version:'1.0.2', author:'PodBox', pluginKitVersion:'4',
   async setup() {
     globalThis.__podboxBridgeStop?.();
     await verifyRenderer(config.assets,location.href);

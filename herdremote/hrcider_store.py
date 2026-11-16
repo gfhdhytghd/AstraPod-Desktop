@@ -162,8 +162,8 @@ class Planner:
         """
         with self.cache.lock:
             generation = self.cache.generation
-            keys = {r[0] for r in self.cache.db.execute("SELECT DISTINCT art FROM items WHERE art<>'-'")}
-            missing_art = self.cache.db.execute("SELECT count(*) FROM items WHERE kind='albums' AND art='-'").fetchone()[0]
+            keys = set(self.cache.library_arts(limit=1000000))
+            missing_art = sum(a['art']=='-' for a in self.cache.album_view().rows)
             rendered = {(k,t):c for k,t,c in self.cache.db.execute('SELECT key,tier,crc FROM art_crc')}
             held = {(bytes(k).hex(),t):c for k,t,c in self.cache.db.execute('SELECT k8,tier,crc FROM ipod_art')}
         total = len(keys) * len(FILL_ORDER)

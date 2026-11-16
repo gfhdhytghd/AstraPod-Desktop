@@ -94,3 +94,34 @@ test('actual plugin bootstrap loads only plugin-local modules and verified rende
   await rm(directory,{recursive:true});
  }
 });
+
+test('engine-only auto advance, next/previous and queue jump push the new item without Pinia/time/state events',async()=>{
+ const f=injected(),engine=new EventTarget();f.am.player={events:engine};
+ const bindings=hostBindings(f.app,f.system),adapter=new CiderAdapter(bindings),received=[];
+ const stop=adapter.subscribe(event=>received.push({event,state:adapter.snapshot()}));
+ const select=id=>{f.am.nowPlayingItem=f.track(id);engine.dispatchEvent(new Event('MKLite:itemIdChanged'));};
+ f.am.skipToNext=()=>select('next');f.am.skipToPrevious=()=>select('previous');
+ f.am.jumpToQueuePosition=()=>select('jump');
+ select('auto');await Promise.resolve();
+ assert.equal(received.at(-1).state.nowPlaying.id,'auto');
+ for(const [path,body,id] of [['/api/v1/playback/next',{},'next'],['/api/v1/playback/previous',{},'previous'],['/api/v2/queue/jump',{index:1},'jump']]) {
+  await adapter.dispatch(path,body,'POST');await Promise.resolve();
+  const last=received.at(-1);assert.equal(last.event,'playbackStatus.nowPlayingItemDidChange');
+  assert.equal(last.state.nowPlaying.id,id);assert.equal(last.state.nowPlaying.name,'Song '+id);
+  assert.equal((await adapter.dispatch('/api/v2/playback',null,'GET')).data.nowPlaying.id,id);
+ }
+ assert.equal(received.length,4);
+ stop();select('after-unload');await Promise.resolve();assert.equal(received.length,4);
+});
+
+test('late/replaced engine listeners detach and a burst coalesces into one current-item hint',async()=>{
+ const f=injected();let ready;f.am.player=null;f.am.onPlayerReady=fn=>{ready=fn;};
+ const b=hostBindings(f.app,f.system),events=[];const off=b.bus.on('playbackStatus.nowPlayingItemDidChange',()=>events.push(b.metadata.player.nowPlayingItem.id));
+ const first=new EventTarget();f.am.player={events:first};ready();f.am.nowPlayingItem=f.track('late');
+ first.dispatchEvent(new Event('MKLite:itemIdChanged'));first.dispatchEvent(new Event('MKLite:resolvedItemChanged'));await Promise.resolve();
+ assert.deepEqual(events,['late']);
+ const second=new EventTarget();f.am.player={events:second};for(const fn of f.changes)fn();events.length=0;
+ f.am.nowPlayingItem=f.track('replacement');first.dispatchEvent(new Event('MKLite:itemIdChanged'));await Promise.resolve();assert.equal(events.length,0);
+ second.dispatchEvent(new Event('MKLite:itemIdChanged'));await Promise.resolve();assert.deepEqual(events,['replacement']);
+ off();second.dispatchEvent(new Event('MKLite:itemIdChanged'));await Promise.resolve();assert.equal(events.length,1);
+});

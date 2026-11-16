@@ -102,6 +102,11 @@ def page(library, name, offset, limit, stale):
                 songs = library._items('songs')
                 song = next((v for v in songs if str(v['id']) == track), {})
                 albums = song.get('albums') or []
+                view = library.cache.album_view()
+                logical = next((view.by_id[a] for a in albums if a in view.by_id), None)
+                if logical is None:
+                    logical = next((a for a in view.rows if any(t['id']==track for t in a.get('_tracks',[]))), None)
+                if logical: albums = [logical['id']]
                 target = 'album/'+urllib.parse.quote(str(albums[0]), safe='') if albums else route('albums', album=info.get('albumName', ''), artist=info.get('artistName', ''))
             else:
                 target = route('albums', artist=info.get('artistName', ''))

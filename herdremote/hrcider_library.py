@@ -12,13 +12,22 @@ import time
 import urllib.parse
 from hrcider_cache import art_id
 from hrcider_featured import featured_guests
+from hrcider_albums import normalized, ordered_tracks, resource
 
 log = logging.getLogger('herdremote.cider')
 
 LIST_BEFORE, LIST_AFTER = 5, 20  # queue window around a song of a plain list
 
 
+class LibraryReadError(OSError):
+    def __init__(self, reason, items):
+        # `reason` comes exclusively from page_error(), never a server body.
+        super().__init__(reason)
+        self.reason, self.items = reason, items
+
+
 def page_error(error):
+    if isinstance(error, LibraryReadError): return error.reason
     if getattr(error, 'plugin_reason', None):
         return 'Cider plugin: ' + error.plugin_reason
     code=getattr(error,'code',None)
@@ -84,8 +93,10 @@ class Library:
         self.remote = collections.OrderedDict()
         self.state = {}
         self.context = None
+        self.merged = {}
 
     def _items(self, kind):
+        if kind == 'albums': return self.cache.album_view().rows
         with self.cache.lock:
             rows = self.cache.db.execute('SELECT value FROM items WHERE kind=?', (kind,)).fetchall()
         return [json.loads(r[0]) for r in rows]
@@ -101,7 +112,9 @@ class Library:
             if isinstance(reply.get('data'), dict):
                 reply = reply['data']
             if isinstance(reply.get('results'),dict):
-                reply=dict(data=[item for kind in ('library-songs','library-albums','library-artists') for item in reply['results'].get(kind,{}).get('data',[])])
+                results=reply['results']
+                reply=dict(data=[item for kind in ('library-songs','library-albums','library-artists') for item in results.get(kind,{}).get('data',[])],
+                           next=any(v.get('next') for v in results.values()))
             if not isinstance(reply.get('data'), list):
                 raise ValueError('Invalid library relationship')
             self.remote[key] = (time.monotonic(), reply)
@@ -113,6 +126,54 @@ class Library:
             if cached:
                 return dict(cached[1], stale=True, _error=page_error(error))
             return dict(data=[], stale=True, meta={'total':0}, _error=page_error(error))
+
+    def _all(self, path):
+        """Read complete relationships before logical deduplication/pagination."""
+        data=[]; offset=0
+        while offset<10000:
+            reply=self._read(path,offset,50)
+            if reply.get('_error'): raise LibraryReadError(reply['_error'],data+reply['data'])
+            rows=reply['data']; data.extend(rows)
+            total=reply.get('meta',{}).get('total')
+            if not reply.get('next') and (total is None or len(data)>=int(total)):
+                return data
+            if not rows: raise ValueError('Incomplete library relationship')
+            offset+=50 if '/library/search?' in path else len(rows)
+        raise ValueError('Library relationship exceeds 10000 rows')
+
+    def _merged_tracks(self, album, strict=False):
+        view=self.cache.album_view(); key=album['id']; saved=self.merged.get(key)
+        if saved and saved[0]==view.signature and time.monotonic()-saved[1]<60:
+            return saved[2], None
+        try:
+            tracks=[];member_counts={}
+            for member in album['members']:
+                path='/v1/me/library/albums/'+urllib.parse.quote(member,safe='')+'/tracks?include=catalog'
+                rows=self._all(path);tracks.extend(rows)
+                member_counts[member]=len(ordered_tracks(rows))
+            # Include strongly matched songs whose Apple album id is absent from
+            # the index (observed for 13 of La La Land's 15 indexed songs).
+            tracks=ordered_tracks(tracks+view.indexed_tracks(album,orphans_only=True))
+            if not tracks: raise ValueError('Merged album has no playable tracks')
+            self.cache.register_templates(tracks)
+            self.cache.remember_album_tracks(key,view.signature,tracks,member_counts)
+            self.merged[key]=(view.signature,time.monotonic(),tracks)
+            return tracks,None
+        except (OSError,ValueError,TimeoutError) as error:
+            if strict: raise
+            return album.get('_tracks',[]),page_error(error)
+
+    def _album_resource_rows(self, items):
+        view=self.cache.album_view(); seen=set(); rows=[]
+        for item in items:
+            if 'albums' in item.get('type',''):
+                logical=view.find_resource(item,art_id(item.get('attributes',{}).get('artwork',{}).get('url','')))
+                if logical: item=resource(logical)
+                identity=(item.get('type'),item['id'])
+                if identity in seen: continue
+                seen.add(identity)
+            rows.append(item_row(item))
+        return rows
 
     def page(self, query, offset, limit, stale=False):
         if len(query) > 380 or offset < 0 or not 1 <= limit <= 50:
@@ -126,6 +187,11 @@ class Library:
         items, remote = [], None
         if name.startswith('root/'):
             name = ROOT.get(urllib.parse.unquote(name[5:]), 'empty')
+        if name=='albums':stale=stale or any(not a.get('_complete',True) for a in self._items('albums'))
+        if name=='albums' and (not args or set(args)=={'format'}):
+            values=sorted(self._items('albums'),key=lambda a:(a['title'].casefold(),a['id']))
+            return dict(generation=self.cache.generation,offset=offset,total=len(values),stale=bool(stale),
+                        items=[cached_row(v,args.get('format')=='duration') for v in values[offset:offset+limit]])
         if name in ('albums','songs','playlists') and (not args or set(args)=={'format'}):
             with self.cache.lock:
                 total=self.cache.db.execute('SELECT count(*) FROM items WHERE kind=?',(name,)).fetchone()[0]
@@ -168,28 +234,41 @@ class Library:
                 path='/v1/catalog/'+parts[1][8:]+'/'+kind+'s/'+key+'/tracks'
             elif len(parts)==2:path='/v1/me/library/'+kind+'s/'+key+'/tracks'
             else:raise ValueError('Invalid collection route')
+            album=self.cache.album_view().by_id.get(urllib.parse.unquote(key)) if kind=='album' and len(parts)==2 else None
+            if album and len(album['members'])>1:
+                tracks,error=self._merged_tracks(album)
+                page=dict(generation=self.cache.generation,offset=offset,total=len(tracks),stale=bool(stale or error),
+                          items=[item_row(v) for v in tracks[offset:offset+limit]])
+                if error:page['_error']=error
+                return page
             remote=self._read(path,offset,limit)
         elif name=='recent':
-            remote=self._read('/v1/me/library/recently-added',offset,limit)
+            return self._album_page('/v1/me/library/recently-added',offset,limit,stale)
         elif name.startswith('history/'):
             target=name.split('/',1)[1]
             endpoint={'tracks':'/v1/me/recent/played/tracks','albums':'/v1/me/recent/played','artists':'/v1/me/recent/played/tracks'}.get(target)
             if endpoint:
+                if target=='albums':return self._album_page(endpoint,offset,limit,stale,albums_only=True)
                 remote=self._read(endpoint,offset,limit)
                 if target=='artists':
                     names=list(dict.fromkeys(i.get('attributes',{}).get('artistName','') for i in remote['data']))
                     remote=dict(remote,data=[dict(id=n,type='artists',attributes={'name':n}) for n in names if n])
                 else:remote=dict(remote,data=[i for i in remote['data'] if target in i.get('type','')])
         elif name=='search' and args.get('q'):
-            reply=self._read('/v1/me/library/search?term='+urllib.parse.quote(args['q'])+'&types=library-songs,library-albums,library-artists',0,50)
-            data=reply['data']
-            remote=dict(reply,data=data[offset:offset+limit],meta={'total':len(data)})
+            return self._album_page('/v1/me/library/search?term='+urllib.parse.quote(args['q'])+'&types=library-songs,library-albums,library-artists',offset,limit,stale)
         elif name.startswith('same/'):
             field=name[5:]
             value=self.state.get(field,'')
             return self.page(route('songs' if field in ('title','composer','album') else 'albums',**{field:value or '\x00'}),offset,limit,stale)
         elif name in ('albums','songs','playlists','artists','albumartists','genres','years','composers','featured','books','podcasts'):
             songs=self._items('songs')
+            album_matches=set()
+            if args.get('album') or args.get('album~'):
+                view=self.cache.album_view(); term=normalized(args.get('album',args.get('album~')))
+                for a in view.rows:
+                    titles=set().union(*(view.title_aliases[k] for k in a['members']))
+                    if any(term in t if 'album~' in args else term==t for t in titles):
+                        album_matches.update(t['id'] for t in a.get('_tracks',view.indexed_tracks(a)))
             if name=='featured' or 'guest' in args:
                 known={s.get('albumartist') or s.get('subtitle','') for s in songs}
                 known.update(a['title'] for a in self._items('artists'))
@@ -206,6 +285,7 @@ class Library:
                         if len(bounds)!=2 or not bounds[0]<=s.get('releaseDate','')[:4]<=bounds[1]:return False
                     elif field=='guest' and (val not in s.get('guests',[]) or val.strip().lower()==s.get('albumartist','').strip().lower()):return False
                     elif field not in ('genre','year','guest','rating'):
+                        if field=='album' and s['id'] in album_matches:continue
                         actual=str(s.get(field,'')).casefold()
                         if (val.casefold() not in actual) if contains else (val.casefold()!=actual):return False
                     if field=='rating' and str(s.get('rating',0))!=('-1' if val=='2' else val):return False
@@ -228,10 +308,12 @@ class Library:
             else:
                 values=songs if name=='songs' else self._items(name)
                 if name=='songs':values=songs
-                elif args and name=='albums':
+                elif name=='albums' and set(args)-{'letter','format'}:
                     album_ids={key for s in songs for key in s.get('albums',[])}
+                    song_ids={s['id'] for s in songs}
                     albums={s.get('album','') for s in songs if not s.get('albums')}
-                    values=[s for s in values if s['id'] in album_ids or s['title'] in albums]
+                    values=[s for s in values if set(s.get('members',[s['id']])) & album_ids or s['title'] in albums
+                            or any(v['id'] in song_ids for v in s.get('_tracks',[]))]
                 for v in values:
                     kind=v.get('type') or 'library-'+name
                     attrs={'name':v['title'],'artistName':v.get('subtitle',''),'durationInMillis':v.get('duration',0),'trackCount':v.get('count',0),'releaseDate':v.get('releaseDate',''),'artwork':{'url':v.get('artwork',''),'bgColor':v.get('bg','181818')}}
@@ -252,19 +334,45 @@ class Library:
             return page
         return dict(generation=self.cache.generation,offset=offset,total=len(items),stale=bool(stale),items=items[offset:offset+limit])
 
+    def _album_page(self,path,offset,limit,stale,albums_only=False):
+        error=None
+        try: data=self._all(path)
+        except (OSError,ValueError,TimeoutError) as e:
+            data=getattr(e,'items',[]);error=page_error(e)
+        if albums_only:data=[v for v in data if 'albums' in v.get('type','')]
+        self.cache.register_templates(data)
+        rows=self._album_resource_rows(data)
+        result=dict(generation=self.cache.generation,offset=offset,total=len(rows),stale=bool(stale or error),items=rows[offset:offset+limit])
+        if error:result['_error']=error
+        return result
+
     def play(self, path):
         if path=='random':
             albums=self._items('albums')
             if not albums:raise ValueError('No albums')
             chosen=random.choice(albums)
-            return self.client.control('play-item','library-albums:'+chosen['id'])
+            return self.play('play/library-albums/'+urllib.parse.quote(chosen['id'],safe=''))
         if path=='shuffle':
             return self.client.shuffle_library()
         parts=path.split('/')
         if len(parts)!=3 or parts[0]!='play':raise ValueError('Invalid play route')
         kind,key=parts[1],urllib.parse.unquote(parts[2])
         context,self.context=self.context,None
+        album=self.cache.album_view().by_id.get(key) if kind=='library-albums' else None
+        if album and len(album['members'])>1:
+            return self.client.play_items(self._merged_tracks(album,strict=True)[0],0)
         if context and kind in ('songs','library-songs') and time.monotonic()-context[2]<15:
+            match=re.fullmatch(r'album/([^/?]+)',context[1])
+            album=self.cache.album_view().by_id.get(urllib.parse.unquote(match[1])) if match else None
+            if album and len(album['members'])>1:
+                tracks=self._merged_tracks(album,strict=True)[0]
+                from hrcider_albums import aliases
+                wanted=self.client.song_aliases(kind,key)
+                index=context[0]
+                if not 0<=index<len(tracks) or not (aliases(tracks[index]) & wanted):
+                    index=next((i for i,t in enumerate(tracks) if aliases(t)&wanted),None)
+                if index is None:raise ValueError('Selected song is not in merged album')
+                return self.client.play_items(tracks,index)
             try:
                 result=self._play_in_list(context[0],context[1],kind,key)
                 if result is not None:return result

@@ -37,6 +37,7 @@ class Cache:
         self.art_limit = art_limit
         self.touches = {}
         self.closed = False
+        self._albums = None
         self.db = sqlite3.connect(self.root/'library.sqlite3', check_same_thread=False, timeout=1)
         with self.lock, self.db:
             self.db.execute('PRAGMA journal_mode=WAL')
@@ -50,6 +51,7 @@ class Cache:
                 CREATE INDEX IF NOT EXISTS items_art ON items(art);
                 CREATE INDEX IF NOT EXISTS items_name ON items(kind,json_extract(value,'$.title') COLLATE NOCASE,id);
                 CREATE TABLE IF NOT EXISTS templates (art TEXT PRIMARY KEY,url TEXT);
+                CREATE TABLE IF NOT EXISTS album_tracks (id TEXT PRIMARY KEY, signature TEXT, value TEXT);
                 CREATE TABLE IF NOT EXISTS catalog (song TEXT, id TEXT, PRIMARY KEY(song,id));
                 CREATE INDEX IF NOT EXISTS catalog_id ON catalog(id);
                 CREATE TABLE IF NOT EXISTS art (key TEXT, tier TEXT, path TEXT,
@@ -110,6 +112,7 @@ class Cache:
                              type=item.get('type','library-'+kind),
                              albums=[a['id'] for a in item.get('relationships',{}).get('albums',{}).get('data',[])],
                              catalog=[a['id'] for a in item.get('relationships',{}).get('catalog',{}).get('data',[])],
+                             playParams={k:v for k,v in (attrs.get('playParams') or {}).items() if k in ('id','kind','catalogId','libraryId')},
                              artist=attrs.get('artistName',''),
                              album=attrs.get('albumName',''),
                              albumartist=attrs.get('albumArtistName',attrs.get('artistName','')),
@@ -161,10 +164,38 @@ class Cache:
         if kind not in KINDS or offset < 0 or not 1 <= limit <= 50:
             raise ValueError('Invalid library page')
         with self.lock:
+            if kind == 'albums':
+                values = sorted(self.album_view().rows, key=lambda v:v['id'])
+                return dict(generation=self.generation, offset=offset, total=len(values), stale=bool(stale or any(not a.get('_complete',True) for a in values)),
+                            items=[{k:v for k,v in r.items() if k != 'artwork' and not k.startswith('_')}
+                                   for r in values[offset:offset+limit]])
             total = self.db.execute('SELECT count(*) FROM items WHERE kind=?', (kind,)).fetchone()[0]
             rows = self.db.execute('SELECT value FROM items WHERE kind=? ORDER BY id LIMIT ? OFFSET ?', (kind,limit,offset)).fetchall()
             return dict(generation=self.generation, offset=offset, total=total, stale=bool(stale),
                         items=[{k:v for k,v in json.loads(r[0]).items() if k != 'artwork'} for r in rows])
+
+    def album_view(self):
+        from hrcider_albums import AlbumView, source_signature
+        with self.lock:
+            generation = self.generation
+            if self._albums and self._albums[0] == generation: return self._albums[1]
+            rows = self.db.execute("SELECT kind,id,digest,value FROM items WHERE kind IN ('albums','songs') ORDER BY kind,id").fetchall()
+            signature = source_signature([(k,i,d) for k,i,d,_ in rows])
+            overrides = self.db.execute('SELECT id,value FROM album_tracks WHERE signature=?', (signature,)).fetchall()
+            view = AlbumView([json.loads(v) for k,_,_,v in rows if k=='albums'],
+                             [json.loads(v) for k,_,_,v in rows if k=='songs'],
+                             [(i,json.loads(v)) for i,v in overrides], signature)
+            self._albums = generation, view
+            return view
+
+    def remember_album_tracks(self, key, signature, tracks, member_counts=None):
+        raw = json.dumps(dict(tracks=tracks,member_counts=member_counts or {}), sort_keys=True, ensure_ascii=False)
+        with self.lock, self.db:
+            if self.album_view().signature != signature: return
+            old = self.db.execute('SELECT signature,value FROM album_tracks WHERE id=?', (key,)).fetchone()
+            if old == (signature, raw): return
+            self.db.execute('INSERT OR REPLACE INTO album_tracks VALUES (?,?,?)', (key,signature,raw))
+            self.db.execute("UPDATE settings SET value=value+1 WHERE key='generation'")
 
     def template(self, key):
         with self.lock:
@@ -206,7 +237,9 @@ class Cache:
     def library_arts(self, after='', limit=64):
         """Distinct artwork ids of the indexed library, in id order, after `after`."""
         with self.lock:
-            return [r[0] for r in self.db.execute("SELECT DISTINCT art FROM items WHERE art<>'-' AND art>? ORDER BY art LIMIT ?",(after,limit))]
+            keys = {r[0] for r in self.db.execute("SELECT DISTINCT art FROM items WHERE kind<>'albums' AND art<>'-'")}
+            keys.update(a['art'] for a in self.album_view().rows if a['art'] != '-')
+            return sorted(k for k in keys if k>after)[:limit]
 
     def put_art(self, key, tier, raw):
         if len(key) != 64 or any(c not in '0123456789abcdef' for c in key) or tier not in ('original','L','M','S','XS'):
@@ -254,7 +287,11 @@ class Cache:
 
 
 class Index:
-    """One 50-item request per step; complete scans alone remove missing ids."""
+    """One 50-item request per step; complete scans alone remove missing ids.
+
+    After each scan, hydrate merged albums in the same bounded worker. Global
+    library-song relationships can be stale/incomplete even after a full scan.
+    """
     def __init__(self, cache, client, interval=1):
         self.cache,self.client,self.interval = cache,client,interval
         self.kind = self.offset = 0
@@ -269,6 +306,7 @@ class Index:
         self.errors = {}
         self.rating_jobs=[];self.rating_seen={}
         self.rating_retry=0
+        self.album_jobs=[]
 
     def request(self):
         self.requested.set()
@@ -278,6 +316,7 @@ class Index:
         if self.requested.is_set():
             self.requested.clear();self.next=0;self.force=True
             self.kind=self.offset=0;self.scan=time.time_ns()
+            self.album_jobs.clear()
         if now < self.next:
             return
         if self.kind==0 and self.offset==0 and now-self.last_full>=900:
@@ -294,6 +333,9 @@ class Index:
                 self.rating_jobs.clear();self.rating_retry=now+300
             self.next=now+self.interval
             return
+        if self.album_jobs:
+            self._album_step(now)
+            return
         kind = KINDS[self.kind]
         try:
             response = self.client.library(kind,self.offset,50)
@@ -306,7 +348,7 @@ class Index:
                 for key in ids:self.rating_seen[key]=now
                 if ids:self.rating_jobs.append(ids[:50])
             total = response.get('meta',{}).get('total')
-            fingerprint = (total,tuple((i.get('id'),hashlib.sha256(json.dumps(i.get('attributes',{}),sort_keys=True).encode()).hexdigest()) for i in items))
+            fingerprint = (total,tuple((i.get('id'),hashlib.sha256(json.dumps(i,sort_keys=True).encode()).hexdigest()) for i in items))
             unchanged = not self.initial and not self.force and self.offset == 0 and self.fingerprints.get(kind) == fingerprint
             if not unchanged:
                 self.cache.ingest(kind,items,self.scan)
@@ -317,6 +359,11 @@ class Index:
                 self.kind += 1;self.offset=0;self.scan=time.time_ns()
                 if self.kind == len(KINDS):
                     self.kind=0;self.initial=False;self.next=now+180
+                    view=self.cache.album_view()
+                    self.album_jobs=[dict(album=a,signature=view.signature,member=0,offset=0,tracks=[],
+                                          orphans=view.indexed_tracks(a,orphans_only=True))
+                                     for a in view.rows if len(a['members'])>1]
+                    if self.album_jobs:self.next=now+self.interval
                     if self.force:self.last_full=now
                     self.force=False
                 else:self.next=now+self.interval
@@ -332,3 +379,34 @@ class Index:
                 self.kind=(self.kind+1)%len(KINDS);self.offset=0
                 self.scan=time.time_ns();self.next=now+180
                 self.errors[kind]=0
+
+    def _album_step(self, now):
+        import urllib.parse
+        from hrcider_albums import ordered_tracks
+        job=self.album_jobs[0]; album=job['album']
+        try:
+            key=album['members'][job['member']]
+            reply=self.client.library_path('/v1/me/library/albums/'+urllib.parse.quote(key,safe='')+
+                                           f"/tracks?include=catalog&offset={job['offset']}&limit=50")
+            if isinstance(reply.get('data'),dict):reply=reply['data']
+            rows=reply.get('data')
+            if not isinstance(rows,list):raise ValueError('Invalid album relationship')
+            job['tracks'].extend(rows);job['offset']+=len(rows)
+            job.setdefault('member_tracks',[]).extend(rows)
+            total=reply.get('meta',{}).get('total')
+            more=reply.get('next') or total is not None and job['offset']<int(total)
+            if more and (not rows or len(job['tracks'])>=10000):raise ValueError('Incomplete album relationship')
+            if not more:
+                job.setdefault('member_counts',{})[key]=len(ordered_tracks(job['member_tracks']))
+                job['member_tracks']=[];job['member']+=1;job['offset']=0
+            if job['member']==len(album['members']):
+                tracks=ordered_tracks(job['tracks']+job['orphans'])
+                if not tracks:raise ValueError('Empty merged album')
+                self.cache.register_templates(tracks)
+                self.cache.remember_album_tracks(album['id'],job['signature'],tracks,job['member_counts'])
+                self.album_jobs.pop(0)
+                self.errors.pop('merged-albums',None)
+        except (OSError,ValueError,TimeoutError):
+            self.album_jobs.pop(0)
+            self.errors['merged-albums']=self.errors.get('merged-albums',0)+1
+        self.next=now+(self.interval if self.album_jobs else 180)

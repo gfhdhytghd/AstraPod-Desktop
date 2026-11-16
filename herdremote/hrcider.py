@@ -476,8 +476,34 @@ class Client:
             return True
         except (OSError,ValueError,TimeoutError):
             return False
+
+    def play_items(self, items, index):
+        """Build a whole logical album with the existing RPC/plugin item APIs.
+
+        Start the selected song first, append the rest and move preceding songs
+        ahead of it. A partial queue is an error, never a successful singleton or
+        a reason to replay mutations through another backend.
+        """
+        if not items or not 0 <= index < len(items): raise ValueError('Invalid album index')
+        rows = [(v.get('type', 'library-songs'), str(v['id'])) for v in items]
+        if any(k not in ('library-songs','songs') or not re.fullmatch(r'[\w.:-]{1,128}',i) for k,i in rows):
+            raise ValueError('Invalid album song')
+        kind,key = rows[index]
+        result = self.control('play-item', kind+':'+key)
+        wanted = set(result.get('expected_ids', [])) | self.aliases(items[index])
+        if not self.fill_queue(wanted, rows[:index], rows[index+1:], threading.Event()):
+            raise OSError('Merged album queue incomplete; not retried')
+        expected = [self.aliases(v) for v in items]
+        end = time.monotonic()+3
+        while True:
+            position,total = self.queue_state()
+            queued = [t for start in range(0,total,100) for t in self.queue_slice(start,min(100,total-start))] if total==len(items) else []
+            if position==index and len(queued)==len(expected) and all(ids & self.aliases(t) for ids,t in zip(expected,queued)):
+                return dict(result, expected_ids=sorted(wanted))
+            if time.monotonic()>=end: raise OSError('Merged album queue order/index mismatch; not retried')
+            time.sleep(.05)
     def library(self,kind,offset,limit):
-        return self.request('/api/v1/amapi/run-v3',{'path':f'/v1/me/library/{kind}?limit={limit}&offset={offset}'+('&include=albums,catalog' if kind=='songs' else '')},timeout=3)
+        return self.request('/api/v1/amapi/run-v3',{'path':f'/v1/me/library/{kind}?limit={limit}&offset={offset}'+('&include=albums,catalog' if kind=='songs' else '&include=catalog' if kind=='albums' else '')},timeout=3)
 
     def library_path(self,path):
         catalog=re.fullmatch(r'/v1/catalog/[A-Za-z-]{2,16}/(?:albums|playlists)/[A-Za-z0-9][\w.:-]{0,127}/tracks(?:\?[^#]*)?',path)
@@ -541,6 +567,9 @@ class CiderPluginClient(Client):
 
     def loading_state(self):
         return self.playback().get('loading') is True
+
+    def refresh_snapshot(self):
+        return self.transport.refresh_snapshot(self.timeout)
 
 
 class Scheduler:
@@ -700,6 +729,7 @@ class Bridge:
         self.worker_errors=WorkerErrors()
         self.state=None;self.available=False;self.reason='Starting';self.state_seq=0;self.last_state=0
         self.opened=False;self.state_dirty=False;self.library_sent=0;self.wake=threading.Event();self.failures=0;self.templates={};self.generation=0;self.threads=[]
+        self.item_refresh=threading.Event();self.item_refresh_seq=0
         self.fill_cancel=threading.Event()
         self.index=Index(self.cache,self.client)
         self.library=Library(self.cache,self.client);self.volume=volume or SystemVolume()
@@ -934,6 +964,14 @@ class Bridge:
         if not isinstance(state,dict):return
         with self.lock:
             if epoch!=self.loading.epoch or not self.state:return
+            if state.get('id')!=self.state.get('id'):
+                # Identity and title/artwork must change together in _poll.
+                self.item_refresh_seq+=1;self.item_refresh.set();self.wake.set()
+                before=self.loading.value
+                if source_loading is not None:self.loading.value=source_loading
+                else:self.loading.sample(state,time.monotonic())
+                if before!=self.loading.value:self._state(True)
+                return
             self.state.update({k:v for k,v in state.items() if k!='ids'})
             before=self.loading.value
             if source_loading is not None:self.loading.value=source_loading
@@ -945,6 +983,12 @@ class Bridge:
                         'queueStatus.queueChanged','playbackStatus.loadingDidChange','playerStatus.volumeDidChange',
                         'playerStatus.shuffleModeDidChange','playerStatus.repeatModeDidChange','playbackStatus.nowPlayingStatusDidChange'):return
         with self.lock:self.loading.note('cider-event',stamp,type=kind)
+        if kind=='playbackStatus.nowPlayingItemDidChange':
+            with self.lock:
+                if not event.get('refreshed'):
+                    self.item_refresh_seq+=1;self.item_refresh.set()
+            self.wake.set()
+            return  # Do not block the WebSocket receiver with a request to itself.
         try:self._fast_sample()
         except (OSError,ValueError,TimeoutError):pass
         self.wake.set()
@@ -972,12 +1016,17 @@ class Bridge:
             if self.wake.is_set():self.wake.clear();next_poll=0
             if now<next_poll:self.stop.wait(min(.2,next_poll-now));continue
             try:
-                with self.lock:loading_epoch=self.loading.epoch
+                with self.lock:
+                    loading_epoch=self.loading.epoch
+                    item_refresh=self.item_refresh.is_set();hint_seq=self.item_refresh_seq
+                if item_refresh and getattr(self.client,'using_plugin',False) is True:
+                    self.client.refresh_snapshot()
                 state=self.client.snapshot()
                 source_loading=self.client.loading_state() if getattr(self.client,'using_plugin',False) is True else None
                 try:state['volume'],state['muted']=self.volume.read()
                 except OSError:state['volume'],state['muted']=0,False
                 with self.lock:
+                    if item_refresh and hint_seq==self.item_refresh_seq:self.item_refresh.clear()
                     loading_before=self.loading.value
                     if source_loading is not None:
                         self.loading.value=source_loading
@@ -988,11 +1037,13 @@ class Bridge:
                         for k in state.keys()|published.keys() if k not in ('position','template'))
                     predicted=published['position']+(now-anchor)*published['rate'] if published else 0
                     changed |= abs(state['position']-predicted)>2000 or now-self.last_state>=15
+                    item_changed=not self.state or state['id']!=self.state.get('id')
                     self.available=True;self.reason='';self.state=state;self.library.state=state
                     if state['template']:
                         self.templates[state['art']]=state['template']
                         if len(self.templates)>128:self.templates.pop(next(iter(self.templates)))
-                    if changed or transition:published=dict(state);anchor=now;self._state(transition)
+                    if changed or transition or item_refresh:
+                        published=dict(state);anchor=now;self._state(transition or item_refresh or item_changed)
                 target=self.client.ab_tick(state)
                 if target is not None:
                     try:
@@ -1067,9 +1118,9 @@ class Bridge:
                 with self.lock:
                     if not same and self._loading_begin(command,value):loading_epoch=self.loading.epoch
                 if same:pass
-                elif command=='native-play':
+                elif command in ('native-play','play-item'):
                     self.fill_cancel.set();self.fill_cancel=cancel=threading.Event()
-                    result=self.library.play(value)
+                    result=self.library.play(route)
                     expected=result.get('expected_ids',[]) if isinstance(result,dict) else []
                     if expected:
                         with self.lock:self.loading.expected(expected)

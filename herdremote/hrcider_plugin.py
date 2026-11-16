@@ -1,5 +1,6 @@
 """Authenticated renderer bridge. Metadata only; no Apple credentials or audio."""
 import json
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -81,6 +82,9 @@ class PluginTransport:
         self.state = None
         self.reason = ''
         self.pending = {}
+        self.snapshot_pending = set()
+        self.state_seq = 0
+        self.item_key = None
         self.serial = 0
         self.callbacks = []
         self.server = self.thread = None
@@ -129,14 +133,31 @@ class PluginTransport:
                     try: slot.put_nowait({'error': 'offline'})
                     except queue.Full: pass
 
-    def _emit(self, kind):
+    def _emit(self, kind, refreshed=False):
         with self.lock:
             callbacks = list(self.callbacks)
         for callback in callbacks:
             try:
-                callback({'type': kind}, time.monotonic())
+                callback({'type': kind, 'source':'plugin', 'refreshed':refreshed}, time.monotonic())
             except Exception as error:
                 self.worker_errors.note('plugin-events',error)
+
+    def _apply_state(self, state, reason=''):
+        """Called by the one receiver, so events and refresh replies keep wire order."""
+        from hrcider import Client, item_id
+        Client._playback_valid(state, True)
+        info=state.get('nowPlaying') or {};params=info.get('playParams') or {}
+        key=item_id(params.get('id')) or item_id(info.get('id'))
+        with self.lock:
+            self.state=state
+            self.reason=reason if reason in REASONS else ''
+            self.state_seq+=1
+            changed=key!=self.item_key
+            self.item_key=key
+            seq=self.state_seq
+        if changed:
+            log.info('Cider plugin item applied id_hash=%s seq=%d',hashlib.sha256(key.encode()).hexdigest()[:12],seq)
+        return changed
 
     def _connection(self, ws):
         # Server Origin checking prevents browser cross-site use. Authentication
@@ -156,8 +177,8 @@ class PluginTransport:
             with self.lock:
                 if self.ws is not None or self.closed:
                     ws.close(1013, 'already connected'); return
-                self.ws, self.state = ws, state
-                self.reason = hello.get('reason') if hello.get('reason') in REASONS else ''
+                self.ws = ws
+                self._apply_state(state,hello.get('reason',''))
             ws.send(json.dumps({'v': VERSION, 'type': 'hello', 'ok': True}))
             log.info('Cider plugin connected protocol=1')
             self._emit('playbackStatus.nowPlayingItemDidChange')
@@ -168,14 +189,17 @@ class PluginTransport:
                 if value.get('type') == 'reply':
                     with self.lock:
                         slot = self.pending.get(value.get('id'))
+                        refresh = value.get('id') in self.snapshot_pending
                     if slot:
+                        if refresh and not value.get('error'):
+                            payload=value.get('data',{}).get('data')
+                            if not isinstance(payload,dict):raise ValueError('Invalid snapshot reply')
+                            changed=self._apply_state(payload)
+                            if changed:self._emit('playbackStatus.nowPlayingItemDidChange',refreshed=True)
                         try: slot.put_nowait(value)
                         except queue.Full: pass
                 elif value.get('type') == 'event' and isinstance(value.get('state'), dict):
-                    Client._playback_valid(value['state'], True)
-                    with self.lock:
-                        self.state = value['state']
-                        self.reason = value.get('reason') if value.get('reason') in REASONS else ''
+                    self._apply_state(value['state'],value.get('reason',''))
                     self._emit(str(value.get('event', '')))
                 else:
                     ws.close(1008, 'protocol'); break
@@ -195,7 +219,9 @@ class PluginTransport:
                 log.info('Cider plugin disconnected')
                 self._emit('playbackStatus.playbackStateDidChange')
 
-    def request(self, path, body=None, timeout=.8, method=None):
+    def request(self, path, body=None, timeout=.8, method=None, apply_snapshot=False):
+        if apply_snapshot and (path!='/api/v2/playback' or body is not None or method not in (None,'GET')):
+            raise ValueError('Snapshot refresh must be read-only')
         deadline = time.monotonic() + max(.01, min(10, timeout))
         with self.lock:
             ws = self.ws
@@ -206,6 +232,7 @@ class PluginTransport:
             self.serial += 1
             key = str(self.serial)
             slot = self.pending[key] = queue.Queue(1)
+            if apply_snapshot:self.snapshot_pending.add(key)
         try:
             raw = json.dumps(dict(v=VERSION, type='request', id=key, path=path,
                                   body=body, method=method or ('GET' if body is None else 'POST'),
@@ -229,6 +256,12 @@ class PluginTransport:
         finally:
             with self.lock:
                 self.pending.pop(key, None)
+                self.snapshot_pending.discard(key)
+
+    def refresh_snapshot(self, timeout=.8):
+        # The receiver applies the reply before waking us. Never apply an older
+        # reply here, after a newer pushed item may already have arrived.
+        return self.request('/api/v2/playback',timeout=timeout,apply_snapshot=True)
 
     def playback(self):
         with self.lock:
@@ -304,11 +337,10 @@ class Backend:
         worker = None
         try:
             while not stop.wait(.1):
-                if self.using_plugin:
-                    if rpc_stop: rpc_stop.set()
-                elif self.mode == 'auto' and (worker is None or not worker.is_alive()):
+                if worker is None or not worker.is_alive():
                     rpc_stop = threading.Event()
-                    target = lambda active_stop=rpc_stop: playback_events(self.rpc,active_stop,callback)
+                    def rpc_event(event,stamp):callback(dict(event,source='rpc'),stamp)
+                    target = lambda active_stop=rpc_stop: playback_events(self.rpc,active_stop,rpc_event)
                     worker = threading.Thread(target=run_worker,
                                               args=(target,rpc_stop,'rpc-events',self.worker_errors), daemon=True)
                     worker.start()
