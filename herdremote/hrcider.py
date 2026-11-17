@@ -720,14 +720,16 @@ class Loading:
 
 
 class Bridge:
-    def __init__(self,client=None,cache=None,fetch=None,volume=None,realtime=None,rufin=None):
+    def __init__(self,client=None,cache=None,fetch=None,volume=None,realtime=None,rufin=None,jellyfin=None):
         self.realtime = client is None if realtime is None else realtime
         if client is None:
             from hrcider_plugin import make_clients
             client = make_clients(Client)
             if rufin is None and os.environ.get('RUFIN_DISABLE')!='1':
                 from hrrufin import RufinClient
+                from hrjellyfin import JellyfinClient
                 rufin = RufinClient()
+                if jellyfin is None:jellyfin = JellyfinClient(rufin.env)
         self.client=client
         # Remote-music backends (FU56): Cider is the default; a reachable,
         # authenticated Rufin takes over (see _select_remote).
@@ -745,8 +747,14 @@ class Bridge:
         self.library=Library(self.cache,self.client);self.volume=volume or SystemVolume()
         self.cider_library=self.library
         if rufin is not None:
-            from hrrufin import RufinLibrary
-            self.rufin_library=RufinLibrary(rufin);rufin.rpc_observer=self._rpc_event
+            if jellyfin is None:
+                from hrrufin import RufinLibrary
+                self.rufin_library=RufinLibrary(rufin)
+            else:
+                from hrjellyfin import JellyfinLibrary
+                self.rufin_library=JellyfinLibrary(rufin,jellyfin)
+            rufin.rpc_observer=self._rpc_event
+        self.jellyfin_library=self.rufin_library if jellyfin is not None else None
         self.volume_delta=0;self.pages=queue.Queue(1);self.page_token=0
         self.art_locks=[threading.RLock() for _ in range(32)]
         self.prefetch=queue.Queue(10)
@@ -1156,7 +1164,10 @@ class Bridge:
     @survive()
     def _index(self):
         while not self.stop.is_set():
-            self.index.step();self.stop.wait(.25)
+            self.index.step()
+            if self.jellyfin_library is not None and self._rufin_active():
+                self.jellyfin_library.refresh()
+            self.stop.wait(.25)
     @survive()
     def _pages(self):
         while not self.stop.is_set():
@@ -1279,6 +1290,11 @@ class Bridge:
         if raw is None:
             template=self.templates.get(key) or self.cache.template(key) or (self.rufin_library.template(key) if self.rufin_library else None)
             if not template:raise ValueError('Unknown artwork id')
+            if template.startswith('jellyfin:') and self.jellyfin_library is not None:
+                artwork,cacheable=self.jellyfin_library.artwork(template,SIZES[tier])
+                pixels=render(artwork,tier)
+                if cacheable:self.cache.put_art(key,tier,pixels)
+                return pixels
         if raw is None and template.startswith('rufin:'):
             if self.rufin is None:raise ValueError('Unknown artwork id')
             # Rufin's own cover endpoint on the verified loopback port.

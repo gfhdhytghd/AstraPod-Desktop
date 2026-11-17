@@ -917,6 +917,38 @@ Deploy `hrrufin.py` with the updated `hrcider.py`. `RUFIN_DISABLE=1` turns the
 backend off. Tests use only a loopback mock Rufin (`tests/test_rufin.py`) and
 never send requests to the real Rufin or Cider.
 
+### Jellyfin library for Rufin Remote (FU63)
+
+When Rufin is the active remote and its selected source is Jellyfin,
+HerdRemote can read the library directly from that server.
+
+1. Use the HTTPS Jellyfin server URL from Rufin settings. Set
+   `JELLYFIN_URL` if HerdRemote uses a different address for the same server.
+   Include the base path if Jellyfin is served below the root.
+2. Save a Jellyfin API key as the only line in
+   `~/.config/podbox-herdremote/jellyfin-token`. The file must be a regular
+   file owned by the HerdRemote user with mode `0600`. Set
+   `JELLYFIN_API_KEY` to override that file. A systemd user service can use
+   the file directly without an environment override.
+3. Deploy `hrjellyfin.py` and the updated `hrcider.py` together.
+
+The bridge uses the selected Rufin music folder when available. Jellyfin
+provides albums, album artists, artists, genres, years, composers, track
+lists, search and recently added albums. The album caption shows the
+available year and genres. Track rows show disc and track numbers and
+duration when supplied. Composer browsing depends on Jellyfin's indexed
+Composer credits. User Rating shows favorites, likes, dislikes and any
+numeric track ratings supplied by Jellyfin for a user token. An app API
+key has no user context.
+
+Album covers use Jellyfin's Primary image and the existing native art
+cache. Network requests use GET, verify the certificate, and send the key
+in the authorization header. The bridge does not follow redirects or read
+Rufin's encrypted credential. Missing credentials, authentication failure,
+or an unavailable server restore Rufin's library. INFO logs record changes
+between library sources. Rufin runs playback and queue operations and
+provides Now Playing and lyrics.
+
 ## FU44 IR fallback local API
 
 `hrfallback.py` extends the existing FU42 `hrdisk.py` private Unix socket.
