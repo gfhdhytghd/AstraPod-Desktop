@@ -28,6 +28,7 @@ from pathlib import Path
 from hrcider import Client, HTTPStatusError, clean
 from hrcider_cache import art_id
 from hrcider_library import ROOT, row as menu_row, route as make_route
+from hrlyrics import LyricsPages, lyrics_rows, millis
 
 log = logging.getLogger('herdremote.rufin')
 
@@ -513,6 +514,7 @@ class RufinLibrary:
         self.templates = collections.OrderedDict()   # art id -> template
         self.tokens = collections.OrderedDict()      # route hash -> page token JSON
         self.sources = (0., {})
+        self.lyrics = LyricsPages()
 
     # --- registries -----------------------------------------------------
     def template(self, key):
@@ -671,6 +673,9 @@ class RufinLibrary:
             name = ROOT.get(urllib.parse.unquote(name[5:]), 'empty')
         result = lambda items, total, first=offset: dict(generation=self.generation, offset=first, total=total,
                                                          stale=bool(stale), items=items)
+        if name == 'now/lyrics' and args.get('lrc') == '1':
+            items = self.lyrics.get(query, args.get('track', ''), offset, self.timed_lyrics, menu_row)
+            return dict(result(items[offset:offset + limit], len(items)), _lyrics_v1=True)
         if name.startswith('now/'):
             items = self.now(name)
             return result(items[offset:offset + limit], len(items))
@@ -728,6 +733,53 @@ class RufinLibrary:
             return result(rows, total, first)
         # Composer, year, letters, ratings, podcasts...: no Rufin equivalent.
         return result([], 0)
+
+    def timed_lyrics(self, track):
+        def playing():
+            playback = self.client.playback()
+            current = playback.get('current') or {}
+            item = current.get('track') or {}
+            return (current.get('media_uri') or item.get('uri'), current.get('run'),
+                    millis(playback.get('duration_ms')) or millis(item.get('duration_ms')) or 0)
+
+        uri, run, duration = playing()
+        if not isinstance(uri, str) or rufin_id(uri) != track:
+            return None
+        reply = self.client.get('/api/lyrics')
+        if playing()[:2] != (uri, run):
+            return None
+        if reply.get('state') == 'loading':
+            return None
+        if reply.get('state') != 'ready':
+            return lyrics_rows([], 0, duration, menu_row)
+        if reply.get('media_uri') != uri or (run is not None and reply.get('run') != run):
+            return None
+        document = reply.get('document') or {}
+        offset = document.get('offset_millis')
+        offset = offset if type(offset) is int else 0
+        lines = []
+        for line in document.get('lines') or []:
+            if not isinstance(line, dict) or not isinstance(line.get('text'), str):
+                continue
+            text = line['text']
+            start, end = millis(line.get('start_millis')), millis(line.get('end_millis'))
+            cues = []
+            for cue_line in line.get('cue_lines') or []:
+                if not isinstance(cue_line, dict) or cue_line.get('text') != text:
+                    continue
+                if start is None:
+                    start = millis(cue_line.get('start_millis'))
+                if end is None:
+                    end = millis(cue_line.get('end_millis'))
+                for cue in cue_line.get('cues') or []:
+                    if isinstance(cue, dict):
+                        begin = millis(cue.get('start_millis'))
+                        if begin is not None:
+                            cues.append((begin, millis(cue.get('end_millis')),
+                                         cue.get('byte_start'), cue.get('byte_end_exclusive')))
+                break
+            lines.append((text, start, end, cues))
+        return lyrics_rows(lines, offset, duration, menu_row)
 
     def now(self, name):
         client = self.client

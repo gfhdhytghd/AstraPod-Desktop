@@ -13,6 +13,7 @@ import urllib.parse
 from hrcider_cache import art_id
 from hrcider_featured import featured_guests
 from hrcider_albums import normalized, ordered_tracks, resource
+from hrlyrics import LyricsPages
 
 log = logging.getLogger('herdremote.cider')
 
@@ -94,6 +95,7 @@ class Library:
         self.state = {}
         self.context = None
         self.merged = {}
+        self.lyrics = LyricsPages()
 
     def _items(self, kind):
         if kind == 'albums': return self.cache.album_view().rows
@@ -181,6 +183,12 @@ class Library:
         parsed = urllib.parse.urlsplit(query)
         name = parsed.path
         args = dict(urllib.parse.parse_qsl(parsed.query))
+        if name == 'now/lyrics' and args.get('lrc') == '1':
+            from hrcider_context import timed_lyrics
+            items = self.lyrics.get(query, args.get('track', ''), offset,
+                                    lambda track: timed_lyrics(self.client, track), row)
+            return dict(generation=self.cache.generation, offset=offset, total=len(items),
+                        stale=stale, items=items[offset:offset+limit], _lyrics_v1=True)
         if name.startswith('now/'):
             from hrcider_context import page
             return page(self, name, offset, limit, stale)

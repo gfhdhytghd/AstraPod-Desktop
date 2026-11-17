@@ -139,6 +139,10 @@ class Rufin(BaseHTTPRequestHandler):
                 key = 'tracks'
             return self.reply(200, {key: rows[off:off + lim], 'total': len(rows), 'offset': off, 'limit': lim})
         if path == '/api/lyrics':
+            if hasattr(s, 'lyrics'):
+                if s.lyrics_hook:
+                    s.lyrics_hook()
+                return self.reply(200, s.lyrics)
             return self.reply(200, {'state': 'ready', 'document': {'lines': [{'text': 'la la'}, {'text': 'second'}]}})
         if path == '/api/artwork':
             from PIL import Image
@@ -342,6 +346,75 @@ class Mapping(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         self.e.close()
+
+    def lyrics_fixture(self, lines, offset=0):
+        self.server.state['current']['run'] = 17
+        self.server.lyrics = dict(state='ready', media_uri='local:track/1', run=17,
+                                 document=dict(lines=lines, offset_millis=offset))
+        self.server.lyrics_hook = None
+        return 'now/lyrics?lrc=1&track=' + hrrufin.rufin_id('local:track/1')
+
+    def test_timed_lyrics_offset_cjk_partial_and_legacy(self):
+        text = '星 光'
+        cues = [dict(byte_start=0, byte_end_exclusive=3, start_millis=1200, end_millis=1500),
+                dict(byte_start=4, byte_end_exclusive=7, start_millis=1800)]
+        lines = [dict(text=text, start_millis=1200, end_millis=2500,
+                      cue_lines=[dict(text=text, cues=cues)]),
+                 dict(text='Missing line start'),
+                 dict(text='No complete words', start_millis=5200,
+                      cue_lines=[dict(text='No complete words', cues=[
+                          dict(byte_start=0, byte_end_exclusive=2)])])]
+        q = self.lyrics_fixture(lines, 200)
+        result = self.library.page(q+'&nonce=1', 0, 50)['items']
+        self.assertEqual([r['title'] for r in result],
+                         ['[00:01.00]<00:01.00>星<00:01.30> <00:01.60>光<00:02.30>',
+                          '[00:03.00]Missing line start', '[00:05.00]No complete words'])
+        self.server.lyrics['document']['offset_millis'] = -500
+        self.assertIn('[00:01.70]<00:01.70>星', self.library.page(q+'&nonce=2', 0, 50)['items'][0]['title'])
+        cues[0]['byte_end_exclusive'] = 2
+        self.assertEqual(self.library.page(q+'&nonce=3', 0, 50)['items'][0]['title'], '[00:01.70]星 光')
+        legacy = self.library.page('now/lyrics?nonce=4', 0, 50)['items']
+        self.assertEqual([r['title'] for r in legacy], [line['text'] for line in lines])
+        self.assertTrue(all(r['id'] != 'lrc1' for r in legacy))
+
+    def test_timed_lyrics_size_and_frozen_fragments(self):
+        text = '星' * 40 + ' ' + '光' * 20
+        def line(n):
+            start = n*1000
+            cues = [dict(byte_start=i*3, byte_end_exclusive=(i+1)*3, start_millis=start+i*10)
+                    for i in range(40)]
+            cues.append(dict(byte_start=121, byte_end_exclusive=181, start_millis=start+400))
+            return dict(text=text, start_millis=start, cue_lines=[dict(text=text, cues=cues)])
+        q = self.lyrics_fixture([line(n) for n in range(40)])
+        first = self.library.page(q+'&nonce=1', 0, 1)
+        self.assertEqual(first['items'][0]['id'], 'lrc1+')
+        self.assertNotIn('<', first['items'][0]['title'])  # Word stamps over budget, line stamps fit.
+        self.server.lyrics['document']['lines'] = [dict(text='Changed', start_millis=10)]
+        second = self.library.page(q+'&nonce=1', 1, 1)
+        self.assertEqual(first['total'], second['total'])
+        self.assertEqual(first['items'][0]['title'] + second['items'][0]['title'], '[00:00.00]'+text)
+        self.assertEqual(self.library.page(q+'&nonce=2', 0, 1)['total'], 1)
+        self.server.lyrics['document']['lines'] = [line(n) for n in range(300)]
+        plain = self.library.page(q+'&nonce=3', 0, 50)
+        self.assertTrue(all(r['id'].isdigit() for r in plain['items']))
+        self.assertLess(plain['total'], 600)
+        self.assertEqual(self.server.posts, [])
+
+    def test_timed_lyrics_track_change_in_flight(self):
+        q = self.lyrics_fixture([dict(text='Old track!', start_millis=10)])
+        self.server.lyrics_hook = lambda: self.server.state['current'].update(
+            media_uri='local:track/2', track=track(2), run=18)
+        self.assertEqual(self.library.page(q+'&nonce=1', 0, 50)['items'][0]['id'], 'lyric-wait')
+        self.server.lyrics_hook = None
+        q = q.replace(hrrufin.rufin_id('local:track/1'), hrrufin.rufin_id('local:track/2'))
+        self.assertEqual(self.library.page(q+'&nonce=2', 0, 50)['items'][0]['id'], 'lyric-wait')
+        self.server.lyrics.update(media_uri='local:track/2', run=17)
+        self.assertEqual(self.library.page(q+'&nonce=3', 0, 50)['items'][0]['id'], 'lyric-wait')
+        self.server.lyrics.update(state='loading', run=18)
+        self.assertEqual(self.library.page(q+'&nonce=4', 0, 50)['items'][0]['id'], 'lyric-wait')
+        self.server.lyrics.update(state='ready', document={'lines': [dict(text='New track', start_millis=1500)]})
+        self.assertEqual(self.library.page(q+'&nonce=5', 0, 50)['items'][0]['title'], '[00:01.50]New track')
+        self.assertEqual(self.server.posts, [])
 
     def test_snapshot(self):
         s = self.client.snapshot()

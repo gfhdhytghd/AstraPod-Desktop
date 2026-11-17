@@ -57,6 +57,19 @@ test('injected bridge preserves strict errors, memberships, placeholders and spe
  await assert.rejects(adapter.read('/v1/me/library/songs'));
  await adapter.dispatch('/api/v2/playback/rate',{rate:1.25},'PATCH');assert.equal(adapter.snapshot().rate,1.25);
 });
+test('lyrics request uses Cider item type and exports only lyrics fields',async()=>{
+ const {app,system}=injected(), requests=[];
+ const ttml='<tt><p begin="1s"><span begin="1s">Timed</span></p></tt>';
+ app.lyrics.getLyrics=async query=>{
+  requests.push(query);
+  return {data:[{attributes:{ttml,token:'private'}}]};
+ };
+ const adapter=new CiderAdapter(hostBindings(app,system));
+ for(const id of ['123','i.library']) {
+  assert.deepEqual(await adapter.dispatch('/api/v1/lyrics/'+id,null),{data:[{ttml}]});
+ }
+ assert.deepEqual(requests,[{id:'123',type:'songs'},{id:'i.library',type:'library-songs'}]);
+});
 test('reactive subscriptions push time, item, queue, buffering and modes without polling',()=>{
  const fixture=injected(),bindings=hostBindings(fixture.app,fixture.system),adapter=new CiderAdapter(bindings),events=[];
  const stop=adapter.subscribe(name=>events.push(name));

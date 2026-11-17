@@ -20,6 +20,16 @@ export function errorCode(error) {
   return 'host-error';
 }
 const str = (v, n=2048) => typeof v === 'string' ? v.slice(0,n) : '';
+function lyricResult(value, depth=0) {
+  if (depth > 4) return null;
+  if (Array.isArray(value)) return value.slice(0,32).map(v=>lyricResult(v,depth+1)).filter(Boolean);
+  if (typeof value === 'string') return {text:str(value,65536)};
+  if (!value || typeof value !== 'object') return null;
+  for (const key of ['ttml','lyrics','text','content']) {
+    if (typeof value[key] === 'string' && value[key]) return {[key==='ttml'?'ttml':'text']:str(value[key],65536)};
+  }
+  return lyricResult(value.attributes ?? value.data,depth+1);
+}
 const number = (v, fallback=0) => Number.isFinite(Number(v)) ? Number(v) : fallback;
 function finite(v, low, high) {
   if (typeof v !== 'number' || !Number.isFinite(v) || v < low || v > high) throw new BridgeError('invalid-request');
@@ -139,7 +149,7 @@ export class CiderAdapter {
     if (route==='/api/v2/playback/audio-quality' && method==='GET') return {data:{flavorLabel:str(am.player?.flavorLabel || am.player?.flavor || 'Unknown',64)}};
     if (/^\/api\/v1\/lyrics\/[\w.-]{1,128}$/.test(route) && method==='GET') {
       const result=await this.lyrics(route.split('/').pop());
-      return {data:Array.isArray(result)?result.map(x=>({text:str(x?.text || x?.content,16384)})):{text:str(result?.text || result,65536)}};
+      return {data:lyricResult(result) ?? {text:''}};
     }
     if (route==='/api/v2/queue/position' && method==='GET') return {data:{position:am.queuePosition,total:am.queue.length}};
     if (route==='/api/v2/queue' && method==='GET') {

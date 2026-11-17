@@ -5,6 +5,8 @@ import json
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
+from decimal import Decimal
+from hrlyrics import lyrics_rows, millis
 
 
 def data(reply):
@@ -17,26 +19,100 @@ def text(value):
     return str(value or '')
 
 
-def lyrics_text(reply):
+def lyric_sources(reply):
     value = data(reply)
     if isinstance(value, list):
-        return '\n'.join(filter(None, (lyrics_text(v.get('attributes', v)) for v in value if isinstance(v, dict))))
-    if isinstance(value, dict):
+        for item in value:
+            yield from lyric_sources(item)
+    elif isinstance(value, dict):
         for key in ('ttml', 'lyrics', 'text', 'content'):
-            if key in value:
-                return lyrics_text(value[key])
-        if isinstance(value.get('data'), list):
-            return '\n'.join(filter(None, (lyrics_text(v.get('attributes', v)) for v in value['data'])))
-        return ''
-    if not isinstance(value, str):
-        return ''
-    if value.lstrip().startswith('<'):
+            if value.get(key):
+                yield from lyric_sources(value[key])
+                return
+        if isinstance(value.get('attributes'), dict):
+            yield from lyric_sources(value['attributes'])
+    elif isinstance(value, str):
+        yield value
+
+
+def ttml_time(value):
+    """Apple lyrics use absolute media times, with optional hour fields."""
+    if not value or len(value) > 20:
+        return None
+    clock = re.fullmatch(r'(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)(ms|s)?', value, re.ASCII)
+    if not clock:
+        return None
+    hours, minutes, seconds, unit = clock.groups()
+    if hours is not None and minutes is None:
+        hours, minutes = None, hours
+    if unit and minutes is not None:
+        return None
+    return int(Decimal(seconds) * (1 if unit == 'ms' else 1000)) + (
+        int(hours or 0) * 3600 + int(minutes or 0) * 60) * 1000
+
+
+def ttml_line(p):
+    parts, cues = [], []
+    pos = 0
+
+    def append(text):
+        nonlocal pos
+        if text:
+            parts.append(text)
+            pos += len(text.encode('utf-8'))
+
+    def inline(node, depth):
+        first = pos
+        append(node.text)
+        count = len(cues)
+        for child in node:
+            # Excess nesting has no effect on timing and stays plain text.
+            if depth < 16:
+                inline(child, depth + 1)
+            else:
+                append(''.join(child.itertext()))
+            append(child.tail)
+        begin = ttml_time(node.get('begin'))
+        if depth and begin is not None and pos > first and len(cues) == count:
+            cues.append((begin, ttml_time(node.get('end')), first, pos))
+
+    inline(p, 0)
+    return ''.join(parts), ttml_time(p.get('begin')), ttml_time(p.get('end')), cues
+
+
+def lyric_lines(reply):
+    for source in lyric_sources(reply):
+        if not source.lstrip().startswith('<'):
+            yield from ((line, None, None, []) for line in source.splitlines())
+            continue
+        if '<!DOCTYPE' in source or '<!ENTITY' in source:
+            continue
         try:
-            tree = ET.fromstring(value)
-            return '\n'.join(''.join(p.itertext()) for p in tree.iter() if p.tag.rsplit('}', 1)[-1] == 'p')
+            tree = ET.fromstring(source)
         except ET.ParseError:
-            return ''
-    return value
+            continue
+        for p in tree.iter():
+            if p.tag.rsplit('}', 1)[-1] == 'p':
+                yield ttml_line(p)
+
+
+def lyrics_text(reply):
+    return '\n'.join(line[0] for line in lyric_lines(reply))
+
+
+def timed_lyrics(client, expected):
+    from hrcider_library import row
+
+    def track(info):
+        return str((info.get('playParams') or {}).get('id') or info.get('id') or '')
+
+    before = client.now_playing()
+    if track(before) != expected:
+        return None
+    reply = client.request('/api/v1/lyrics/' + urllib.parse.quote(expected, safe=''))
+    if track(client.now_playing()) != expected:
+        return None
+    return lyrics_rows(lyric_lines(reply), 0, millis(before.get('durationInMillis')) or 0, row)
 
 
 def quality_text(quality):

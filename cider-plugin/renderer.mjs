@@ -107,5 +107,6 @@ export function hostBindings(app, system) {
   return {am,metadata,bus,
     // The pinned active frontend explicitly rethrows when this option is true.
     api:(path,args,options)=>app.v3(path,args,{...options,throwOnHTTPError:true}),
-    storefront:()=>'$STOREFRONT',lyrics:id=>app.lyrics.getLyrics(id)};
+    storefront:()=>'$STOREFRONT',
+    lyrics:id=>app.lyrics.getLyrics({id,type:id.startsWith('i.')?'library-songs':'songs'})};
 }

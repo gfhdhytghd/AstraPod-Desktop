@@ -3,7 +3,7 @@ import sys,unittest,tempfile
 from pathlib import Path
 from unittest.mock import Mock
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from hrcider import Client,Bridge
+from hrcider import Client,Bridge,native_page_frame
 from hrcider_library import Library
 from hrcider_cache import Cache
 from hrcider_context import lyrics_text
@@ -35,6 +35,31 @@ class Context(unittest.TestCase):
     def test_lyrics_exposed_rpc_and_ttml(self):
         self.assertEqual([v['title'] for v in self.library.page('now/lyrics',0,50)['items']],['First','Second'])
         self.assertEqual(lyrics_text({'data':[{'attributes':{'ttml':'<tt><p>A<span>B</span></p></tt>'}}]}),'AB')
+    def test_timed_cider_ttml_and_plain_fallback(self):
+        self.client.now_playing = Mock(return_value=self.info)
+        line = 'a'*96 + '  字'
+        ttml = ('<tt xmlns="http://www.w3.org/ns/ttml"><body><div>'
+                '<p begin="1.2s" end="4s"><span begin="00:01.200" end="2s">'
+                + line + '</span> <span begin="3s" end="3.5s">好</span></p>'
+                '<p>Missing stamp</p><p begin="00:00:07.000">Last</p></div></body></tt>')
+        self.client.request = Mock(return_value={'data':[{'attributes':{'ttml':ttml}}]})
+        q = 'now/lyrics?lrc=1&track=123'
+        page = self.library.page(q+'&nonce=1', 0, 50)
+        frame = native_page_frame(1, 2, page).decode().splitlines()
+        self.assertEqual(frame[1].split('\t')[0], 'lrc1+')
+        self.assertEqual(frame[1].split('\t')[1] + frame[2].split('\t')[1],
+                         '[00:01.20]<00:01.20>'+line+'<00:02.00> <00:03.00>好<00:03.50>')
+        self.assertEqual(frame[3].split('\t')[1], '[00:04.10]Missing stamp')
+        self.client.request.assert_called_once_with('/api/v1/lyrics/123')
+        self.client.request.return_value = {'text':'Plain\nSecond'}
+        plain = self.library.page(q+'&nonce=2', 0, 50)['items']
+        self.assertEqual([(r['id'],r['title']) for r in plain], [('0','Plain'),('1','Second')])
+    def test_timed_cider_track_change_in_flight(self):
+        self.client.request = Mock(return_value={'ttml':'<tt><p begin="1s">Wrong</p></tt>'})
+        self.client.now_playing = Mock(side_effect=[self.info,{'id':'other'}])
+        p = self.library.page('now/lyrics?lrc=1&track=123&nonce=1',0,50)
+        self.assertEqual(p['items'][0]['id'],'lyric-wait')
+        self.client.request.assert_called_once_with('/api/v1/lyrics/123')
     def test_navigation_uses_current_album_membership(self):
         self.cache.ingest('songs',[dict(id='123',type='library-songs',attributes=dict(name='Title',artistName='Artist',albumName='Album'),relationships={'albums':{'data':[{'id':'a1'}]}})],1)
         self.library._items=Mock(return_value=[{'id':'123','albums':['a1']}])

@@ -1120,7 +1120,9 @@ class Bridge:
                         state.get(k,missing)!=published.get(k,missing)
                         for k in state.keys()|published.keys() if k not in ('position','template'))
                     predicted=published['position']+(now-anchor)*published['rate'] if published else 0
-                    changed |= abs(state['position']-predicted)>2000 or now-self.last_state>=15
+                    # A paused clock cannot drift. Publish even a short paused seek.
+                    tolerance = 2000 if state['rate'] else 0
+                    changed |= abs(state['position']-predicted)>tolerance or now-self.last_state>=15
                     item_changed=not self.state or state['id']!=self.state.get('id')
                     self.available=True;self.reason='';self.state=state;self.library.state=state
                     if state['template']:
@@ -1170,7 +1172,8 @@ class Bridge:
                 if not isinstance(error,(ValueError,OSError,TimeoutError)):self.worker_errors.note('_pages',error)
                 raw=self.rufin_library.generation if rufin else self.cache.generation
                 page=dict(generation=raw,offset=offset,total=0,stale=True,items=[],_error=page_error(error))
-            path=urllib.parse.urlsplit(query).path
+            parsed=urllib.parse.urlsplit(query);path=parsed.path
+            lyric_args=dict(urllib.parse.parse_qsl(parsed.query)) if path=='now/lyrics' else {}
             kind=ROOT.get(urllib.parse.unquote(path[5:]),'unknown') if path.startswith('root/') else path.split('/',1)[0]
             if kind not in set(ROOT.values())|{'songs','albums','artists','playlists','album','playlist','now'}:kind='unknown'
             if page.get('_error'):
@@ -1178,6 +1181,8 @@ class Bridge:
             with self.lock:
                 if generation==self.generation and self.opened and token==self.page_token and library is self.library:
                     page=dict(page,generation=self.wire_library_generation(page['generation']))
+                    if lyric_args.get('lrc')=='1' and self.state and self.state['id']!=lyric_args.get('track'):
+                        page.update(total=offset+1,items=[{'id':'lyric-wait'}])
                     self.scheduler.push(2,2,native_page_frame(generation,req,page),req,bulk=True)
                     log.info('page ready gen=%d req=%d kind=%s offset=%d rows=%d stale=%s ms=%.1f',generation,req,kind,offset,len(page['items']),bool(page['stale']),1000*(time.monotonic()-started))
     @survive()
@@ -1240,6 +1245,12 @@ class Bridge:
                     if self._rufin_active():self.client.pause_if_playing()
                     elif self.client.request('/api/v1/playback/is-playing').get('is_playing'):self.client.control('toggle')
                 else:self.client.control(command,value)
+                if command=='seek':
+                    with self.lock:
+                        if epoch==self.remote_epoch:
+                            # Publish a fresh CN after the RPC even for a small seek
+                            # that falls below the running-clock drift tolerance.
+                            self.item_refresh_seq+=1;self.item_refresh.set()
                 self.loading.note('rpc-returned',ok=1)
                 log.info('control timeline gen=%d req=%d command=%s event=rpc-returned monotonic=%.6f',generation,req,command,time.monotonic())
                 ok=True;text='OK';self.wake.set()
@@ -1446,7 +1457,12 @@ def native_page_frame(generation,request,page):
     rows=[];size=0
     for item in page['items']:
         fields=[item.get(k,'') for k in ('id','title','subtitle','art','duration','count','kind','route','bg','year')]
-        line='\t'.join(clean(v,380 if i==7 else 120) for i,v in enumerate(fields))+'\n'
+        values=[clean(v,380 if i==7 else 120) for i,v in enumerate(fields)]
+        if fields[0] in ('lrc1', 'lrc1+') and page.get('_lyrics_v1'):
+            # A fragment boundary can fall on a space. Preserve it verbatim.
+            from hrlyrics import safe_text
+            values[1]=safe_text(fields[1]).encode()[:120].decode('utf-8','ignore')
+        line='\t'.join(values)+'\n'
         if size+len(line.encode())>15000:break
         rows.append(line);size+=len(line.encode())
     header=f"CL\t{generation}\t{request}\t{page['generation']}\t{page['offset']}\t{page['total']}\t{int(page['stale'])}\t{len(rows)}\n"

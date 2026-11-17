@@ -126,6 +126,43 @@ def test_refresh_failure_retains_pending_hint_until_success(tmp_path):
     assert b.state['id']=='new' and not b.item_refresh.is_set();b.close()
 
 
+def test_short_seek_reanchors_remote_clock(tmp_path):
+    client = Mock(using_plugin=False, explicit_loading=False)
+    raw = state('one')
+    raw['state'] = 'paused'
+    before = Client()._snapshot_data(raw)
+    after = dict(before, position=before['position']+200)
+    client.snapshot.side_effect = [before, after]
+    client.ab_tick.return_value = None
+    bridge = Bridge(client=client, cache=Cache(tmp_path), volume=Mock())
+    bridge.volume.read.return_value = (50, False)
+    assert bridge.command(b'ci\t1\t131072')
+    frames = []
+    push = bridge.scheduler.push
+
+    def record(priority, kind, payload, *args, **kwargs):
+        push(priority, kind, payload, *args, **kwargs)
+        if payload.startswith(b'CN\t'):
+            frames.append(int(payload.split(b'\t')[5]))
+            if len(frames) == 2:
+                bridge.stop.set()
+
+    bridge.scheduler.push = record
+    worker = threading.Thread(target=bridge._poll, daemon=True)
+    worker.start()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert frames == [1000, 1200]
+    bridge.stop.clear()
+    bridge._loading_begin = Mock(return_value=False)
+    client.control.side_effect = lambda *_: bridge.stop.set()
+    assert bridge.command(f'cc\t{bridge.generation}\t99\tseek\t1400'.encode())
+    bridge._control()
+    assert bridge.item_refresh.is_set()
+    client.control.assert_called_once_with('seek','1400')
+    bridge.close()
+
+
 @pytest.mark.parametrize('mode',['auto','plugin'])
 def test_rpc_item_hints_still_watched_while_plugin_is_selected(mode):
     rpc=Mock(base='http://127.0.0.1:1',token=None);plugin=Mock();plugin.transport.connected=True;plugin.transport.callbacks=[]
