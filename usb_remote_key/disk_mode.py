@@ -130,9 +130,16 @@ class DiskMode:
             self.job = self.request = None
         if now < self.next_poll:
             return
+        # EP0 status only while the Disk Mode volume exists: outside Disk Mode
+        # a 10 Hz vendor request competes with PodLink bulk traffic for nothing.
+        if not self.find_volume():
+            self.next_poll = now + .5
+            self.active = False
+            self.seen = None
+            return
         self.next_poll = now + .1
         status = self.remote.disk_status(now)
-        self.active = bool(status[1]) if status else bool(self.find_volume())
+        self.active = bool(status[1]) if status else True
         if status and status[2]:
             request = int.from_bytes(status[4:8], 'little')
             if request != self.seen:
