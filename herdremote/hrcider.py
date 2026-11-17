@@ -312,8 +312,7 @@ class Client:
         return None
     def _repeat5(self,number):
         if number not in range(5):raise ValueError('Invalid repeat value')
-        put=lambda mode:self.request('/api/v2/playback/repeat',{'mode':mode},method='PUT')
-        shuffle=lambda on:self.request('/api/v2/playback/shuffle',{'enabled':bool(on)},method='PUT')
+        put=self._put_repeat;shuffle=self._put_shuffle
         with self.mlock:
             leaving=self.virtual=='shuffle' and number!=3;restore=self.restore_shuffle;previous=self.virtual
             if number==3:
@@ -330,6 +329,10 @@ class Client:
         except BaseException:
             with self.mlock:self.virtual=None
             raise
+    def _put_repeat(self,mode):
+        return self.request('/api/v2/playback/repeat',{'mode':mode},method='PUT')
+    def _put_shuffle(self,on):
+        return self.request('/api/v2/playback/shuffle',{'enabled':bool(on)},method='PUT')
     def _ab_mark(self,ms):
         seek=None
         with self.mlock:
@@ -717,12 +720,19 @@ class Loading:
 
 
 class Bridge:
-    def __init__(self,client=None,cache=None,fetch=None,volume=None,realtime=None):
+    def __init__(self,client=None,cache=None,fetch=None,volume=None,realtime=None,rufin=None):
         self.realtime = client is None if realtime is None else realtime
         if client is None:
             from hrcider_plugin import make_clients
             client = make_clients(Client)
+            if rufin is None and os.environ.get('RUFIN_DISABLE')!='1':
+                from hrrufin import RufinClient
+                rufin = RufinClient()
         self.client=client
+        # Remote-music backends (FU56): Cider is the default; a reachable,
+        # authenticated Rufin takes over (see _select_remote).
+        self.cider_client=client;self.rufin=rufin;self.rufin_library=None
+        self.remote_epoch=0;self.remote_check_at=0.;self.home_entered=False;self.switch_deferred=False
         self.fetch=fetch or urllib.request.urlopen
         self.cache=cache or Cache();self.scheduler=Scheduler();self.lock=threading.RLock()
         self.stop=threading.Event();self.requests={};self.jobs=queue.PriorityQueue(32);self.controls=queue.Queue(16)
@@ -733,6 +743,10 @@ class Bridge:
         self.fill_cancel=threading.Event()
         self.index=Index(self.cache,self.client)
         self.library=Library(self.cache,self.client);self.volume=volume or SystemVolume()
+        self.cider_library=self.library
+        if rufin is not None:
+            from hrrufin import RufinLibrary
+            self.rufin_library=RufinLibrary(rufin);rufin.rpc_observer=self._rpc_event
         self.volume_delta=0;self.pages=queue.Queue(1);self.page_token=0
         self.art_locks=[threading.RLock() for _ in range(32)]
         self.prefetch=queue.Queue(10)
@@ -778,7 +792,7 @@ class Bridge:
                         return True
                     normalized=set(advertised)
                     if 'localdiag-live' in normalized:normalized.update(('localdiag','live'))
-                    self.capabilities=frozenset(normalized)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading','localdiag','live'}
+                    self.capabilities=frozenset(normalized)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading','localdiag','live','remote-name'}
                     window=int(fields[2]);self.volume_delta=0;self.generation=secrets.randbelow(0xfffffffe)+1;self.scheduler.reset(self.generation,window)
                     self.warm_window.clear();self.warm_queue.clear();self.warm_jobs.clear();self.neighbors=None
                     self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
@@ -791,6 +805,7 @@ class Bridge:
                         self.scheduler.push(1,2,f'CF\t{self.generation}\tlocalstore'.encode())
                         log.info('localstore CF queued gen=%d',self.generation)
                     if 'localdiag' in self.capabilities:self.scheduler.push(1,2,f'CF\t{self.generation}\tlocaldiag'.encode())
+                    self._announce_remote()
                     return True
                 if name=='cc' and len(fields)==5:log.info('control received gen=%s req=%s command=%s',fields[1],fields[2],fields[3])
                 if len(fields)<2 or int(fields[1])!=self.generation:
@@ -814,7 +829,12 @@ class Bridge:
                     if fields[3]=='volume-step':
                         self.volume_delta=max(-100,min(100,self.volume_delta+int(fields[4])))
                     elif fields[3]=='volume':raise ValueError('Cider volume disabled')
-                    else:self.controls.put_nowait((self.generation,req,fields[3],fields[4]))
+                    elif fields[3]=='remote-home':
+                        # The device entered the remote Home row: a deferred
+                        # Rufin switch may happen now (FU56).
+                        self.home_entered=True;self.remote_check_at=0.;self.wake.set()
+                        self.scheduler.push(0,2,f'CK\t{self.generation}\t{req}\t1\tOK'.encode())
+                    else:self.controls.put_nowait((self.generation,req,fields[3],fields[4],self.remote_epoch))
                 elif name=='cr' and len(fields) in (8,9):
                     req=int(fields[2]);key,tier=fields[3:5];offset,priority,distance=map(int,fields[5:8])
                     miss=fields[8] if len(fields)==9 else 'unknown'
@@ -925,6 +945,55 @@ class Bridge:
             self.jobs.queue=[v for v in self.jobs.queue if request is not None and v[4]!=request]
             heapq.heapify(self.jobs.queue)
 
+    def remote_name(self):
+        return 'Rufin' if self.rufin is not None and self.client is self.rufin else 'Cider'
+    def _announce_remote(self):
+        # Caller holds self.lock. Firmware that advertised remote-name shows it.
+        if self.opened and 'remote-name' in self.capabilities:
+            self.scheduler.push(1,2,f'CF\t{self.generation}\tremote\t{self.remote_name()}'.encode())
+    def wire_library_generation(self,raw=None):
+        """Library generation on the wire; every backend switch changes it."""
+        if raw is None:
+            raw=self.rufin_library.generation if self.remote_name()=='Rufin' else self.cache.generation
+        if not self.remote_epoch:return raw
+        return ((raw+(self.remote_epoch<<24))&0xffffffff) or 1
+    def _switch_remote(self,client,library,reason):
+        # Caller holds self.lock. Availability is not dropped here: the next
+        # poll publishes the new backend's state (no CA 0/1 blip).
+        before=self.remote_name()
+        self.client=client;self.library=library;self.remote_epoch+=1
+        self.switch_deferred=False;self.failures=0;self.neighbors=None;self.warm_queue.clear()
+        self.loading.cancel();self.fill_cancel.set()
+        self.page_token+=1
+        try:self.pages.get_nowait()
+        except queue.Empty:pass
+        self.scheduler.heap=[v for v in self.scheduler.heap if v[5][:3]!=b'CL\t'];heapq.heapify(self.scheduler.heap)
+        log.info('remote switch from=%s to=%s reason=%s epoch=%d',before,self.remote_name(),clean(reason,80),self.remote_epoch)
+        self._announce_remote();self.wake.set()
+    def _select_remote(self,now=None):
+        """Rufin first whenever reachable and authenticated; otherwise Cider."""
+        if self.rufin is None:return
+        now=time.monotonic() if now is None else now
+        with self.lock:
+            if now<self.remote_check_at:return
+            self.remote_check_at=now+1.
+        ok=self.rufin.ensure(now)        # network, outside the bridge lock
+        with self.lock:
+            active=self.client is self.rufin
+            home,self.home_entered=self.home_entered,False
+            if active and not ok:
+                self._switch_remote(self.cider_client,self.cider_library,'Rufin unavailable: '+(self.rufin.reason or 'error'))
+            elif not active and ok:
+                # Do not take over while Cider plays on the remote source;
+                # switch at the next stop/pause or Home row entry.
+                busy=self.opened and self.available and bool(self.state and self.state.get('rate'))
+                if busy and not home:
+                    if not self.switch_deferred:
+                        self.switch_deferred=True
+                        log.info('remote switch deferred: Rufin available while Cider plays')
+                else:self._switch_remote(self.rufin,self.rufin_library,'Home row entered' if home and busy else 'Rufin available')
+    def _rufin_active(self):
+        return self.rufin is not None and self.client is self.rufin
     def _state(self,force=False):
         self.state_dirty=True
         if not self.opened:return
@@ -956,7 +1025,8 @@ class Bridge:
             if event=='rpc-sent' and path=='/api/v2/queue/jump':self.loading.final_leg(time.monotonic())
     def _fast_sample(self):
         with self.lock:epoch=self.loading.epoch
-        if getattr(self.client, 'using_plugin', False) is True:
+        explicit=getattr(self.client,'using_plugin',False) is True or getattr(self.client,'explicit_loading',False) is True
+        if explicit:
             snapshot=self.client.snapshot()
             state={k:snapshot[k] for k in ('id','duration','position','rate')}
             source_loading=self.client.loading_state()
@@ -968,20 +1038,25 @@ class Bridge:
                 # Identity and title/artwork must change together in _poll.
                 self.item_refresh_seq+=1;self.item_refresh.set();self.wake.set()
                 before=self.loading.value
-                if source_loading is not None:self.loading.value=source_loading
-                else:self.loading.sample(state,time.monotonic())
+                self._loading_sample(state,source_loading)
                 if before!=self.loading.value:self._state(True)
                 return
             self.state.update({k:v for k,v in state.items() if k!='ids'})
             before=self.loading.value
-            if source_loading is not None:self.loading.value=source_loading
-            else:self.loading.sample(state,time.monotonic())
+            self._loading_sample(state,source_loading)
             if before!=self.loading.value:self._state(True)
+    def _loading_sample(self,state,source_loading):
+        rufin=getattr(self.client,'explicit_loading',False) is True
+        if source_loading is not None and not rufin:self.loading.value=source_loading
+        else:
+            self.loading.sample(state,time.monotonic())
+            if rufin and source_loading:self.loading.value=True
     def _on_event(self,event,stamp):
         kind=event.get('type','')
         if kind not in ('playbackStatus.nowPlayingItemDidChange','playbackStatus.playbackStateDidChange','playbackStatus.playbackTimeDidChange',
                         'queueStatus.queueChanged','playbackStatus.loadingDidChange','playerStatus.volumeDidChange',
                         'playerStatus.shuffleModeDidChange','playerStatus.repeatModeDidChange','playbackStatus.nowPlayingStatusDidChange'):return
+        if self._rufin_active():return
         with self.lock:self.loading.note('cider-event',stamp,type=kind)
         if kind=='playbackStatus.nowPlayingItemDidChange':
             with self.lock:
@@ -993,7 +1068,7 @@ class Bridge:
         except (OSError,ValueError,TimeoutError):pass
         self.wake.set()
     def _on_stream(self,state,stamp):
-        if getattr(self.client, 'using_plugin', False) is True: return
+        if getattr(self.client, 'using_plugin', False) is True or self._rufin_active(): return
         try:self._fast_sample()
         except (OSError,ValueError,TimeoutError):pass
         with self.lock:
@@ -1009,10 +1084,14 @@ class Bridge:
         AudioStream().watch(self.stop,self._on_stream)
     @survive()
     def _poll(self):
-        next_poll=0;published=None;anchor=0
+        next_poll=0;published=None;anchor=0;epoch=self.remote_epoch
         missing=object()
         while not self.stop.is_set():
             now=time.monotonic()
+            try:self._select_remote(now)
+            except Exception as error:self.worker_errors.note('_select_remote',error)
+            if epoch!=self.remote_epoch:
+                epoch=self.remote_epoch;published=None;next_poll=0
             if self.wake.is_set():self.wake.clear();next_poll=0
             if now<next_poll:self.stop.wait(min(.2,next_poll-now));continue
             try:
@@ -1022,15 +1101,20 @@ class Bridge:
                 if item_refresh and getattr(self.client,'using_plugin',False) is True:
                     self.client.refresh_snapshot()
                 state=self.client.snapshot()
-                source_loading=self.client.loading_state() if getattr(self.client,'using_plugin',False) is True else None
+                source_loading=self.client.loading_state() if (getattr(self.client,'using_plugin',False) is True or
+                                                               getattr(self.client,'explicit_loading',False) is True) else None
                 try:state['volume'],state['muted']=self.volume.read()
                 except OSError:state['volume'],state['muted']=0,False
                 with self.lock:
+                    if epoch!=self.remote_epoch:continue   # the backend changed during this read
                     if item_refresh and hint_seq==self.item_refresh_seq:self.item_refresh.clear()
                     loading_before=self.loading.value
-                    if source_loading is not None:
+                    rufin=getattr(self.client,'explicit_loading',False) is True
+                    if source_loading is not None and not rufin:
                         self.loading.value=source_loading
                     elif loading_epoch==self.loading.epoch:self.loading.sample(state,time.monotonic())
+                    # Rufin reports resolving/buffering itself; command inference still applies.
+                    if rufin and source_loading:self.loading.value=True
                     transition=loading_before!=self.loading.value
                     changed=not self.available or published is None or any(
                         state.get(k,missing)!=published.get(k,missing)
@@ -1053,15 +1137,19 @@ class Bridge:
                 self.failures=0;next_poll=now+.25
             except Exception as error:
                 expected=isinstance(error,(OSError,ValueError,TimeoutError))
-                reason=clean(str(error),80) if expected else 'Cider state worker failure'
+                reason=clean(str(error),80) if expected else self.remote_name()+' state worker failure'
                 if not expected:self.worker_errors.note('_poll',error)
                 with self.lock:
                     self.failures=min(8,self.failures+1)
                     # Preserve the last coherent state through isolated failures.
                     # Retry promptly during grace, then use the existing backoff.
+                    if self._rufin_active() and self.failures>=3:
+                        # Rufin went away: fall back to Cider at once.
+                        self.rufin.mark_failed('Rufin state unavailable')
+                        self.remote_check_at=0.;next_poll=0;continue
                     if self.failures>=3 and (self.available or self.reason=='Starting'):
                         self.available=False;self.loading.cancel();self.reason=reason or 'Cider unavailable';self._state(True)
-                if expected:log.warning('Cider poll failed consecutive=%d available=%s reason=%s',self.failures,self.available,reason)
+                if expected:log.warning('%s poll failed consecutive=%d available=%s reason=%s',self.remote_name(),self.failures,self.available,reason)
                 next_poll=time.monotonic()+(.25 if self.failures<3 else min(30,2**(self.failures-3)))
     @survive()
     def _index(self):
@@ -1076,17 +1164,20 @@ class Bridge:
             with self.lock:
                 if generation!=self.generation or not self.opened:continue
             started=time.monotonic()
-            try:page=self.library.page(query,offset,limit,stale=not self.available or self.index.initial)
+            with self.lock:library=self.library;rufin=self._rufin_active()
+            try:page=library.page(query,offset,limit,stale=not self.available or (not rufin and self.index.initial))
             except Exception as error:
                 if not isinstance(error,(ValueError,OSError,TimeoutError)):self.worker_errors.note('_pages',error)
-                page=dict(generation=self.cache.generation,offset=offset,total=0,stale=True,items=[],_error=page_error(error))
+                raw=self.rufin_library.generation if rufin else self.cache.generation
+                page=dict(generation=raw,offset=offset,total=0,stale=True,items=[],_error=page_error(error))
             path=urllib.parse.urlsplit(query).path
             kind=ROOT.get(urllib.parse.unquote(path[5:]),'unknown') if path.startswith('root/') else path.split('/',1)[0]
             if kind not in set(ROOT.values())|{'songs','albums','artists','playlists','album','playlist','now'}:kind='unknown'
             if page.get('_error'):
                 log.warning('page failed gen=%d req=%d kind=%s offset=%d reason=%s',generation,req,kind,offset,page['_error'])
             with self.lock:
-                if generation==self.generation and self.opened and token==self.page_token:
+                if generation==self.generation and self.opened and token==self.page_token and library is self.library:
+                    page=dict(page,generation=self.wire_library_generation(page['generation']))
                     self.scheduler.push(2,2,native_page_frame(generation,req,page),req,bulk=True)
                     log.info('page ready gen=%d req=%d kind=%s offset=%d rows=%d stale=%s ms=%.1f',generation,req,kind,offset,len(page['items']),bool(page['stale']),1000*(time.monotonic()-started))
     @survive()
@@ -1099,14 +1190,18 @@ class Bridge:
                 try:self.volume.step(delta);self.wake.set()
                 except OSError:log.warning('Host system volume unavailable')
                 self.stop.wait(.04)
-            try:generation,req,command,value=self.controls.get(timeout=.04)
+            try:item=self.controls.get(timeout=.04)
             except queue.Empty:continue
+            generation,req,command,value=item[:4]
             with self.lock:
                 if generation!=self.generation or not self.opened:continue
+                epoch=self.remote_epoch
             loading_epoch=None
             try:
                 log.info('control request gen=%d req=%d command=%s',generation,req,command)
-                if not self.available:raise OSError('Cider unavailable')
+                # A control aimed at the previous backend is refused, never redirected.
+                if len(item)>4 and item[4]!=epoch:raise OSError('Remote backend changed')
+                if not self.available:raise OSError(self.remote_name()+' unavailable')
                 log.info('control timeline gen=%d req=%d command=%s event=command-sent monotonic=%.6f',generation,req,command,time.monotonic())
                 route=value
                 if command=='play-item':
@@ -1129,18 +1224,21 @@ class Bridge:
                             live=self.client.transport_snapshot()
                             if live['ids'].intersection(expected):
                                 if isinstance(live,dict) and not live['rate']:
-                                    self.client.control('seek',0)
-                                    self.client.request('/api/v1/playback/play',{})
+                                    if self._rufin_active():self.client.resume_selected()
+                                    else:
+                                        self.client.control('seek',0)
+                                        self.client.request('/api/v1/playback/play',{})
                                 break
                             if self.stop.is_set() or time.monotonic()>=deadline:
-                                raise OSError('Cider did not select the requested song')
+                                raise OSError(self.remote_name()+' did not select the requested song')
                             self.stop.wait(.05)
                     fill=result.get('fill') if isinstance(result,dict) else None
                     if fill:threading.Thread(target=fill,args=(cancel,),daemon=True,name='cider-queue').start()
                 elif command=='native-context':
                     self.library.set_context(value)
                 elif command=='source-local':
-                    if self.client.request('/api/v1/playback/is-playing').get('is_playing'):self.client.control('toggle')
+                    if self._rufin_active():self.client.pause_if_playing()
+                    elif self.client.request('/api/v1/playback/is-playing').get('is_playing'):self.client.control('toggle')
                 else:self.client.control(command,value)
                 self.loading.note('rpc-returned',ok=1)
                 log.info('control timeline gen=%d req=%d command=%s event=rpc-returned monotonic=%.6f',generation,req,command,time.monotonic())
@@ -1168,8 +1266,17 @@ class Bridge:
         if cached is not None and len(cached)==12+SIZES[tier]**2*2 and cached[:12]==expected:return cached
         raw=self.cache.get_art(key,'original')
         if raw is None:
-            template=self.templates.get(key) or self.cache.template(key)
+            template=self.templates.get(key) or self.cache.template(key) or (self.rufin_library.template(key) if self.rufin_library else None)
             if not template:raise ValueError('Unknown artwork id')
+        if raw is None and template.startswith('rufin:'):
+            if self.rufin is None:raise ValueError('Unknown artwork id')
+            # Rufin's own cover endpoint on the verified loopback port.
+            raw=self.rufin.artwork(template[6:])
+            from PIL import Image
+            with Image.open(io.BytesIO(raw)) as image:
+                if image.width>240 or image.height>240:raise ValueError('Artwork exceeded cap')
+            self.cache.put_art(key,'original',raw)
+        elif raw is None:
             # Never send the RPC token to the CDN.
             with self.fetch(capped_url(template),timeout=2) as response:
                 raw=response.read(2*1024*1024+1)
@@ -1219,7 +1326,19 @@ class Bridge:
                 with self.lock:
                     current=self.state.get('id') if self.state else None
                     generation=self.generation;opened=self.opened
-                if current and opened and 'neighbors' in self.capabilities:
+                if current and opened and 'neighbors' in self.capabilities and self._rufin_active():
+                    keys,templates=self.client.neighbor_art(current)
+                    with self.lock:
+                        if generation==self.generation and self.opened and self.state and self.state.get('id')==current:
+                            self.templates.update(templates)
+                            while len(self.templates)>128:self.templates.pop(next(iter(self.templates)))
+                            self.warm_queue={(key,'L') for key in keys if key!='-'} if any(tier=='L' for _,tier in self.warm_window) else set()
+                            self._schedule_warm()
+                            signature=(generation,current,*keys)
+                            if signature!=self.neighbors:
+                                self.neighbors=signature
+                                self.scheduler.push(1,2,('CP\t'+'\t'.join(map(str,signature))).encode())
+                elif current and opened and 'neighbors' in self.capabilities:
                     rows=self.client.request('/api/v1/playback/queue',allow_list=True)
                     if isinstance(rows,dict):rows=rows.get('data',[])
                     if not isinstance(rows,list):raise ValueError('Invalid Cider queue')
@@ -1313,7 +1432,7 @@ class Bridge:
                 done,total,status,revision=self.planner.progress(initial=self.index.initial or self.index.force,capacity=self.store_capacity,with_generation=True)
                 self.scheduler.push(4,2,f'CB\t{self.generation}\t{revision}\t{done}\t{total}\t{status}'.encode())
                 log.info('localstore build progress gen=%d library=%d done=%d total=%d state=%d inventory_pages=%d',self.generation,revision,done,total,status,self.inventory_pages)
-            library=self.cache.generation
+            library=self.wire_library_generation()
             if library!=self.library_sent:
                 self.scheduler.push(1,2,f'CG\t{self.generation}\t{library}'.encode());self.library_sent=library
             for _ in range(4):

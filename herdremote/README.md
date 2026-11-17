@@ -546,6 +546,7 @@ focus/keys, opens a player, starts voice, or controls the deployed service.
 | `hrvoice.py` | Session-bus voice calls, hold ownership and independent stop watchdog |
 | `hrkeys.py` | Whitelisted desktop key taps, counted batches and bounded outstanding work |
 | `hrremotelog.py` | Bounded background writer for the player's remote diagnostics |
+| `hrrufin.py` | Rufin web-controller backend: discovery, token, state, lists, art (FU56) |
 | `tests/` | `python3 -m unittest discover -s tools/herdremote/tests` |
 
 ## Detail stability and diagnostics
@@ -852,6 +853,69 @@ MusicKit network state.
 ### Cider plugin backend (FU38)
 
 `CIDER_BACKEND=auto` now selects the authenticated PodBox renderer bridge when it is connected. `plugin` forces this backend; `rpc` preserves the original RPC backend. See [the plugin installation and protocol instructions](../cider-plugin/README.md). The prepared installer must be reviewed before running against a real Cider profile. First pairing pastes a PodBox-only secret from its 0600 file; Apple credentials stay inside Cider. Playback push events populate the host cache. RPC fallback retains its prior behavior. The device protocol and library cache schema are unchanged.
+
+### Rufin Remote (FU56)
+
+[Rufin](https://github.com/screwys/Rufin) is a second remote-music backend
+beside Cider. **Rufin comes first:** while Rufin's web controller is reachable
+and the token is accepted, the iPod's remote source is Rufin and the Home row,
+browser title, skin source name and play/answer splashes say "Rufin" (with the
+matching firmware). Otherwise Cider is used exactly as before. If Rufin goes
+away (three failed polls, refused token, stopped app) the daemon falls back to
+Cider at once. When Rufin comes back while Cider is playing, the switch waits
+for Cider to pause/stop or for the next entry to the remote Home row. Every
+switch is logged at INFO (`remote switch from=... to=... reason=...`); no token
+is logged.
+
+Setup:
+
+1. In Rufin, enable Settings > Web controller and pair: the pairing URL ends in
+   `#token=<hex>`.
+2. Store that token in `~/.config/podbox-herdremote/rufin-token` (one line,
+   mode 0600, owned by you), or set `RUFIN_TOKEN` in the service environment
+   (it overrides the file). The file is re-read when Rufin answers 401, so
+   re-pairing needs no restart. A missing, unreadable, group/world-readable or
+   rejected token makes Rufin count as unavailable (fixed reasons
+   `Rufin token missing`, `Rufin token file must be a 0600 file of this user`,
+   `Rufin token rejected`); Cider is then used. A rejected token is retried once
+   a minute, because Rufin refuses logins after 10 failures per minute.
+3. Port: `RUFIN_API_URL` (loopback HTTP only) if set; otherwise
+   `http://127.0.0.1:<web_controller.port>` from `~/.config/rufin/settings.json`
+   (default 1717), then that port + 1. Rufin itself moves to the next port when
+   its port is taken; **KDE Connect holds 1717 (it uses 1714-1764)**, so Rufin
+   often listens on 1718. Each candidate is verified by `GET /` showing Rufin's
+   `rufin-csrf` meta tag before anything else, including the token, is sent;
+   an unverified port receives only that one GET.
+
+API use: Bearer authentication on Rufin's documented `/api` (its `GET /api`
+help). Now Playing polls `GET /api/playback` every 250 ms; Rufin's own
+`resolving`/`buffering` state drives the loading spinner. Lists come live from
+`/api/albums`, `/api/albums/tracks`, `/api/tracks`, `/api/artists`,
+`/api/artists/tracks`, `/api/playlists`, `/api/playlists/entries`,
+`/api/smart-playlists/tracks`, `/api/genres/tracks` and `/api/page` (Genres,
+link pages) in the source and music folder Rufin has selected
+(`GET /api/sources`). There is no host library index for Rufin. Covers come
+from `/api/artwork?uri=...&size=240` (album URI where known), downscaled to
+240 px if larger, and share the existing art cache under their own keys.
+Playing a song inside a list queues that list from the song through
+`/api/queue/{album,playlist,artist,genre,smart-playlist,source}` or a page
+token with `anchor_uri` and the row index, as Rufin's own Play does; other
+songs play alone (`POST /api/queue`). Transport, seek, shuffle, repeat
+(including the virtual Rockbox Shuffle and A-B modes) and favourite map to
+`/api/playback/*`, `/api/favorite` and `/api/queue/activate`.
+
+Not mapped (unsupported, reported as a failed control or a native empty list,
+never faked): Composer, Year, First Letter, User Rating, Featured Artists,
+Audiobooks/Podcasts, numeric filters, add-to-library and playback speed. Track
+Info shows title/artist/album/duration/favourite; Rufin's playback state has
+no disc/track/year/genre/quality. Current Playlist shows the 100 tracks around
+the current one (Rufin's queue window); Playing Time is shown only when that
+window reaches the end of the queue. Volume stays the computer's sink volume
+(wpctl/pactl), never Rufin's volume endpoint.
+
+Deploy `hrrufin.py` with the updated `hrcider.py`. `RUFIN_DISABLE=1` turns the
+backend off. Tests use only a loopback mock Rufin (`tests/test_rufin.py`) and
+never send requests to the real Rufin or Cider.
 
 ## FU44 IR fallback local API
 
