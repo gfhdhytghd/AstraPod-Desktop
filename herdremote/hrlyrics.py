@@ -1,5 +1,6 @@
 """FU59 host-side lyrics normalization and bounded native-page rows."""
 import re
+import threading
 from itertools import groupby
 
 
@@ -128,17 +129,76 @@ def lyrics_rows(lines, offset, duration, row):
 
 
 class LyricsPages:
-    """Keep one document stable across all offsets of the same viewer query."""
+    """One converted track in memory and one stable nonce snapshot."""
     def __init__(self):
+        self._lock = threading.Lock()
+        self._identity = None
+        self._epoch = 0
+        self._fetching = None
+        self._ready = None
         self.query = None
         self.rows = []
+
+    def select(self, track, run=None):
+        """Only the current playback identity may publish a converted track."""
+        identity = track, run
+        with self._lock:
+            if self._identity == identity:
+                return False
+            self._identity = identity
+            self._epoch += 1
+            self._ready = None
+            self.query, self.rows = None, []
+            return bool(track)
+
+    def prefetch(self, track, fetch):
+        with self._lock:
+            epoch = self._epoch
+            if not self._identity or self._identity[0] != track:
+                return False
+            if self._ready is not None:
+                return True
+            if self._fetching == epoch:
+                return False
+            self._fetching = epoch
+        rows = None
+        try:
+            rows = fetch(track)
+        finally:
+            with self._lock:
+                if self._fetching == epoch:
+                    self._fetching = None
+                if self._epoch == epoch and rows is not None:
+                    self._ready = rows
+        return rows is not None and self._epoch == epoch
 
     def get(self, query, track, offset, fetch, row):
         if not re.fullmatch(r'[a-zA-Z0-9._-]{1,79}', track):
             return []
-        if offset == 0 and self.query != query:
-            self.query = None
+        wait = [row('', '', id='lyric-wait')]
+        with self._lock:
+            epoch = self._epoch
+            managed = self._identity is not None
+            if managed and self._identity[0] != track:
+                return wait
+            if self.query == query:
+                return self.rows
+            if offset:
+                return []
+            if managed and self._fetching == epoch:
+                return wait
+        # Older/standalone callers can start a query without bridge state.
+        if managed:
+            self.prefetch(track, fetch)
+            rows = None
+        else:
             rows = fetch(track)
-            self.rows = [row('', '', id='lyric-wait')] if rows is None else rows
-            self.query = query
-        return self.rows if self.query == query else []
+        with self._lock:
+            if self._epoch != epoch:
+                return wait
+            if managed:
+                rows = self._ready
+            if rows is None:
+                return wait
+            self.query, self.rows = query, rows
+            return rows

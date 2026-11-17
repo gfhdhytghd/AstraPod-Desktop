@@ -740,6 +740,7 @@ class Bridge:
         self.state=None;self.available=False;self.reason='Starting';self.state_seq=0;self.last_state=0
         self.opened=False;self.state_dirty=False;self.library_sent=0;self.wake=threading.Event();self.failures=0;self.templates={};self.generation=0;self.threads=[]
         self.item_refresh=threading.Event();self.item_refresh_seq=0
+        self.lyrics_wake=threading.Event()
         self.fill_cancel=threading.Event()
         self.index=Index(self.cache,self.client)
         self.library=Library(self.cache,self.client);self.volume=volume or SystemVolume()
@@ -758,7 +759,7 @@ class Bridge:
     def start(self):
         starter = getattr(self.client, 'start', None)
         if starter: starter()
-        for target,name in [(self._prefetch_worker,'cider-prefetch-'+str(i)) for i in range(4)]+[(self._poll,'cider-state'),(self._work,'cider-art'),(self._control,'cider-control'),(self._index,'cider-index'),(self._pages,'cider-pages'),(self._neighbors,'cider-neighbors')]:
+        for target,name in [(self._prefetch_worker,'cider-prefetch-'+str(i)) for i in range(4)]+[(self._poll,'cider-state'),(self._work,'cider-art'),(self._control,'cider-control'),(self._index,'cider-index'),(self._pages,'cider-pages'),(self._lyrics_prefetch,'cider-lyrics'),(self._neighbors,'cider-neighbors')]:
             t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
         if self.realtime:
             for target,name in [(self._event_worker,'cider-events'),(self._stream_worker,'cider-stream')]:
@@ -775,6 +776,7 @@ class Bridge:
             self.warm_window.clear();self.warm_queue.clear();self.neighbors=None;self.capabilities=frozenset()
             self.warm_jobs.clear();self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
             self.live_pending=None;self.live_next=0.;self.reopen_reason=None
+            self.library.lyrics.select('')
             self.opened=False;self.generation=0;self.requests.clear();self._drop_jobs();self.scheduler.reset(0);self.volume_delta=0
     def command(self,payload):
         try:
@@ -961,6 +963,8 @@ class Bridge:
         # Caller holds self.lock. Availability is not dropped here: the next
         # poll publishes the new backend's state (no CA 0/1 blip).
         before=self.remote_name()
+        self.library.lyrics.select('')
+        library.lyrics.select('')
         self.client=client;self.library=library;self.remote_epoch+=1
         self.switch_deferred=False;self.failures=0;self.neighbors=None;self.warm_queue.clear()
         self.loading.cancel();self.fill_cancel.set()
@@ -1125,6 +1129,8 @@ class Bridge:
                     changed |= abs(state['position']-predicted)>tolerance or now-self.last_state>=15
                     item_changed=not self.state or state['id']!=self.state.get('id')
                     self.available=True;self.reason='';self.state=state;self.library.state=state
+                    if self.opened and self.library.lyrics.select(state['id'], state.get('track_run')):
+                        self.lyrics_wake.set()
                     if state['template']:
                         self.templates[state['art']]=state['template']
                         if len(self.templates)>128:self.templates.pop(next(iter(self.templates)))
@@ -1157,6 +1163,24 @@ class Bridge:
     def _index(self):
         while not self.stop.is_set():
             self.index.step();self.stop.wait(.25)
+    @survive()
+    def _lyrics_prefetch(self):
+        while not self.stop.is_set():
+            if not self.lyrics_wake.wait(.25):
+                continue
+            self.lyrics_wake.clear()
+            with self.lock:
+                library, track = self.library, self.state.get('id', '') if self.state else ''
+            deadline = time.monotonic() + 5
+            while track and not self.stop.is_set() and time.monotonic() < deadline:
+                try:
+                    if library.lyrics.prefetch(track, library.timed_lyrics):
+                        break
+                except (OSError, ValueError, TimeoutError):
+                    break
+                if self.lyrics_wake.wait(.25):
+                    break
+
     @survive()
     def _pages(self):
         while not self.stop.is_set():

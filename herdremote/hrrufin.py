@@ -340,7 +340,7 @@ class RufinClient(Client):
                     duration=duration, position=position, rate=1000 if status == 'playing' else 0,
                     volume=volume, repeat=repeat, shuffle=shuffle, art=art_id(template),
                     template=template, bg='181818', favorite=bool(track.get('favorite')),
-                    loading=status in ('resolving', 'buffering'))
+                    loading=status in ('resolving', 'buffering'), track_run=current.get('run'))
 
     def loading_state(self):
         with self.state_lock:

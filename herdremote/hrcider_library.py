@@ -177,6 +177,10 @@ class Library:
             rows.append(item_row(item))
         return rows
 
+    def timed_lyrics(self, track):
+        from hrcider_context import timed_lyrics
+        return timed_lyrics(self.client, track)
+
     def page(self, query, offset, limit, stale=False):
         if len(query) > 380 or offset < 0 or not 1 <= limit <= 50:
             raise ValueError('Invalid native library query')
@@ -184,9 +188,7 @@ class Library:
         name = parsed.path
         args = dict(urllib.parse.parse_qsl(parsed.query))
         if name == 'now/lyrics' and args.get('lrc') == '1':
-            from hrcider_context import timed_lyrics
-            items = self.lyrics.get(query, args.get('track', ''), offset,
-                                    lambda track: timed_lyrics(self.client, track), row)
+            items = self.lyrics.get(query, args.get('track', ''), offset, self.timed_lyrics, row)
             return dict(generation=self.cache.generation, offset=offset, total=len(items),
                         stale=stale, items=items[offset:offset+limit], _lyrics_v1=True)
         if name.startswith('now/'):
