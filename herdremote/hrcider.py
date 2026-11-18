@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+import hrhandoff
 from hrcider_cache import Cache, Index, art_id, canonical_art_url
 from hrcider_volume import SystemVolume
 from hrcider_library import Library, ROOT, page_error
@@ -269,6 +270,60 @@ class Client:
                     position=position,rate=max(0,round(float(data['rate'])*1000)) if data['state']=='playing' else 0,
                     volume=max(0,min(100,round(float(data['volume'])*100))),repeat=repeat,shuffle=shuffle,
                     art=art_id(template),template=template,bg=background)
+    name = 'Cider'
+
+    def handoff_match(self, track):
+        query = urllib.parse.urlencode(dict(term=track[0], limit=25))
+        for prefix, kind in (('/v1/me/library', 'library-songs'),
+                             ('/v1/catalog/$STOREFRONT', 'songs')):
+            try:
+                reply = self.request('/api/v1/amapi/run-v3',
+                                     {'path': f'{prefix}/search?{query}&types={kind}'})
+            except HTTPStatusError as error:
+                if error.code in (400, 404):
+                    continue
+                raise
+            data = reply.get('data', reply)
+            results = data.get('results', {}).get(kind, {})
+            rows = []
+            for item in results.get('data', []):
+                fields = item.get('attributes', {})
+                key = item_id(item.get('id'))
+                if not re.fullmatch(r'[\w.:-]{1,128}', key):
+                    continue
+                href = f'{prefix}/songs/{urllib.parse.quote(key, safe="")}'
+                rows.append((fields.get('name', ''), fields.get('artistName', ''),
+                             fields.get('albumName', ''), fields.get('durationInMillis', 0),
+                             (key, href)))
+            matched = hrhandoff.match_track(track, rows)
+            if matched:
+                return matched
+        return None
+
+    def handoff_state(self):
+        state = self._playback_valid(self.request('/api/v2/playback')['data'])
+        item = state.get('nowPlaying') or {}
+        params = item.get('playParams') or {}
+        ids = {item_id(value) for value in (item.get('id'), params.get('id'),
+                                             params.get('catalogId'), params.get('libraryId'))}
+        timing = state['time']
+        return dict(ids=ids, position=round(float(timing.get('currentTime',
+                         timing.get('currentPlaybackTime'))) * 1000),
+                    playing=state['state'] == 'playing' and state.get('rate', 1) == 1,
+                    loading=bool(state.get('loading')), volume=float(state['volume']))
+
+    def handoff_volume(self, volume):
+        self.request('/api/v2/playback/volume', {'volume': volume}, method='PUT')
+
+    def handoff_play(self, matched):
+        self.request('/api/v2/playback/play-href', {'href': matched[1]})
+
+    def handoff_seek(self, position):
+        self.control('seek', position)
+
+    def handoff_pause(self):
+        self.control('pause')
+
     def loading_state(self):
         """Plugin-private buffering metadata; absent in the RPC snapshot."""
         return None
@@ -765,6 +820,7 @@ class Bridge:
         self.client.rpc_observer=self._rpc_event
         self.ledger=Ledger(self.cache);self.planner=Planner(self.cache,self.ledger);self.offer_pairs=set();self.art_times={};self.progress_at=0;self.store_capacity=1<<30;self.inventory_pages=0
         self.live_pending=None;self.live_next=0.;self.reopen_reason=None
+        self.handoff = hrhandoff.Controller(self._handoff_player, self._handoff_pin)
     def start(self):
         starter = getattr(self.client, 'start', None)
         if starter: starter()
@@ -774,6 +830,7 @@ class Bridge:
             for target,name in [(self._event_worker,'cider-events'),(self._stream_worker,'cider-stream')]:
                 t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
     def close(self):
+        self.handoff.close()
         self.stop.set()
         self.wake.set()
         self.fill_cancel.set()
@@ -782,6 +839,7 @@ class Bridge:
         for t in self.threads:t.join(timeout=3)
         if not any(t.is_alive() for t in self.threads):self.cache.close()
     def disconnect(self):
+        self.handoff.disconnect()
         with self.lock:
             self.warm_window.clear();self.warm_queue.clear();self.neighbors=None;self.capabilities=frozenset()
             self.warm_jobs.clear();self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
@@ -790,6 +848,8 @@ class Bridge:
             self.seek_refresh=None
             self.opened=False;self.generation=0;self.requests.clear();self._drop_jobs();self.scheduler.reset(0);self.volume_delta=0
     def command(self,payload):
+        if self.handoff.command(payload):
+            return True
         try:
             fields=payload.decode().split('\t');name=fields[0]
             if name not in ('ci','cg','cr','cx','cc','cp','ct','cb','cq','cw','ls','la','lw','lv','ld','lf','lr','ch'):return False
@@ -987,15 +1047,33 @@ class Bridge:
         self.scheduler.heap=[v for v in self.scheduler.heap if v[5][:3]!=b'CL\t'];heapq.heapify(self.scheduler.heap)
         log.info('remote switch from=%s to=%s reason=%s epoch=%d',before,self.remote_name(),clean(reason,80),self.remote_epoch)
         self._announce_remote();self.wake.set()
+    def _handoff_player(self):
+        if self.rufin is not None and self.rufin.ensure():
+            try:
+                self.rufin.handoff_state()
+                return self.rufin
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        self.cider_client.handoff_state()
+        return self.cider_client
+
+    def _handoff_pin(self, player):
+        with self.lock:
+            if self.client is not player:
+                library = self.rufin_library if player is self.rufin else self.cider_library
+                self._switch_remote(player, library, 'continuity handoff')
+
     def _select_remote(self,now=None):
         """Rufin first whenever reachable and authenticated; otherwise Cider."""
         if self.rufin is None:return
         now=time.monotonic() if now is None else now
         with self.lock:
+            if self.handoff.proposal and self.handoff.proposal.running: return
             if now<self.remote_check_at:return
             self.remote_check_at=now+1.
         ok=self.rufin.ensure(now)        # network, outside the bridge lock
         with self.lock:
+            if self.handoff.proposal and self.handoff.proposal.running: return
             active=self.client is self.rufin
             home,self.home_entered=self.home_entered,False
             if active and not ok:
@@ -1490,6 +1568,7 @@ class Bridge:
                 raise SessionExpired('Cider application liveness timeout gen='+str(self.generation))
 
     def poll(self,send):
+        self.handoff.poll(lambda payload: send(2, payload))
         with self.lock:
             self.check_liveness()
             if not self.opened:return

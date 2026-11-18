@@ -42,6 +42,7 @@ import hrsession  # noqa: E402
 import hrappserver  # noqa: E402
 import hrremotelog  # noqa: E402
 import hrcider  # noqa: E402
+import hrhandoff  # noqa: E402
 
 VERSION = "herdremote-1"
 DEVICE = dict(vid=0x05AC, pid=0x1261, manufacturer="PodBox",
@@ -471,6 +472,7 @@ class Daemon:
         log.info("PodLink session open on %s", device)
         self.reset_session()
         self.send(hrproto.hello(VERSION))
+        self.send(hrhandoff.CAPABILITY)
         self.clock_sync.poll(self.send)
         return True
 
@@ -584,7 +586,7 @@ class Daemon:
             return
         if self._ir_owns_desktop() and payload.startswith(b"cc\t"):
             return  # Dock input must not also mutate Cider during IR ownership.
-        if payload.startswith(b"ci\t1\t") and self.cider is None:
+        if self.cider is None and payload.startswith((b"ci\t1\t", b"hf\t1\tq\t")):
             self.cider = hrcider.Bridge()
             self.cider.start()
         if self.cider is not None and self.cider.command(payload):

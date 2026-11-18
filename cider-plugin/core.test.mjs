@@ -50,6 +50,13 @@ test('library pages and all current routes use in-process API',async()=>{
     const result=await host.dispatch('/api/v1/amapi/run-v3',{path},'POST');assert(result.data || result.results,path);
   }
 });
+test('catalog handoff search resolves the host storefront in-process', async () => {
+  const {host} = makeHost();
+  const result = await host.dispatch('/api/v1/amapi/run-v3', {
+    path: '/v1/catalog/$STOREFRONT/search?term=Song&types=songs&limit=25'
+  }, 'POST');
+  assert.ok(result.data || result.results);
+});
 test('status, timing, lyrics, quality and direct song queue',async()=>{
   const {host,calls}=makeHost();
   for(const path of ['/api/v2/playback','/api/v2/playback/time','/api/v2/playback/rate',

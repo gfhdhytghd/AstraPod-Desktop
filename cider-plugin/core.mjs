@@ -126,7 +126,7 @@ export class CiderAdapter {
     path=path.replace('$STOREFRONT',this.storefront());
     const parsed=new URL(path,'https://amp-api.music.apple.com');
     if (parsed.origin!=='https://amp-api.music.apple.com' ||
-      !/^\/v1\/(?:me\/(?:library(?:\/(?:songs|albums|artists|playlists)(?:\/[\w.:-]+(?:\/(?:tracks|catalog))?)?|\/(?:search|recently-added))?|ratings\/songs|recent\/played(?:\/tracks)?)|catalog\/(?:[A-Za-z-]{2,16}|\$STOREFRONT)\/(?:songs|albums|playlists)(?:\/[\w.:-]+(?:\/(?:tracks|library))?)?)$/.test(parsed.pathname)) throw new BridgeError('invalid-request');
+      !/^\/v1\/(?:me\/(?:library(?:\/(?:songs|albums|artists|playlists)(?:\/[\w.:-]+(?:\/(?:tracks|catalog))?)?|\/(?:search|recently-added))?|ratings\/songs|recent\/played(?:\/tracks)?)|catalog\/(?:[A-Za-z-]{2,16}|\$STOREFRONT)\/(?:search|(?:songs|albums|playlists)(?:\/[\w.:-]+(?:\/(?:tracks|library))?)?))$/.test(parsed.pathname)) throw new BridgeError('invalid-request');
     for (const key of ['offset','limit']) if (parsed.searchParams.has(key)) {
       const n=Number(parsed.searchParams.get(key)); index(n,key==='limit'?1000:1000000);
       if (key==='limit' && !n) throw new BridgeError('invalid-request');

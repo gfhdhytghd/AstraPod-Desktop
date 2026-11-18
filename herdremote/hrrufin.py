@@ -23,6 +23,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import hrhandoff
 from pathlib import Path
 
 from hrcider import Client, HTTPStatusError, clean
@@ -432,6 +434,41 @@ class RufinClient(Client):
             self.post('/api/queue', {'uris': [uri], 'mode': 'replace'})
             return {'status': 'ok', 'expected_ids': [key]}
         raise ValueError(UNSUPPORTED)
+
+    def handoff_match(self, track):
+        # Search the currently selected library through the controller.
+        scope = RufinLibrary(self).scope()
+        body = self.get('/api/tracks', q=track[0], limit=100, total='true', **scope)
+        rows = RufinLibrary._rows(body)
+        if body.get('total', len(rows)) > len(rows):
+            return None
+        found = hrhandoff.match_track(track, [
+            (row.get('title', ''), row.get('artist', ''), row.get('album', ''),
+             row.get('duration_ms', 0), row.get('uri', ''))
+            for row in rows if isinstance(row, dict)
+        ])
+        return (found,) if found else None
+
+    def handoff_state(self):
+        data = self._playback_raw()
+        item = data.get('current') or {}
+        uri = (item.get('track') or {}).get('uri') or item.get('media_uri')
+        return dict(ids={uri}, position=int(data.get('position_ms') or 0),
+                    loading=bool(data.get('refilling')),
+                    playing=data.get('state') == 'playing' and data.get('can_seek') is True,
+                    volume=float(data['volume']))
+
+    def handoff_volume(self, volume):
+        self.post('/api/playback/volume', {'volume': volume, 'persist': False})
+
+    def handoff_play(self, matched):
+        self.post('/api/queue', {'uris': [matched[0]], 'mode': 'replace'})
+
+    def handoff_seek(self, position):
+        self.control('seek', position)
+
+    def handoff_pause(self):
+        self.control('pause')
 
     # --- queue ----------------------------------------------------------
     def queue_window(self, limit=100):
