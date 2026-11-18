@@ -89,7 +89,7 @@ class SimulatedProposal(handoff.Proposal):
     def wait(self, event, deadline):
         self.check(deadline)
         if event == 'p':
-            _, seq = self.events[-1]
+            _, seq = next(row for row in reversed(self.events) if row[0] == 'ping')
             sent = self.now
             self.now += 20
             device = (sent + 1000 + 10) // 10
@@ -128,7 +128,7 @@ class SlowPodLinkProposal(SimulatedProposal):
     def wait(self, event, deadline):
         if event == 'p':
             self.check(deadline)
-            _, seq = self.events[-1]
+            _, seq = next(row for row in reversed(self.events) if row[0] == 'ping')
             sent = self.now
             delay = (120, 103, 118, 110, 117)[seq]
             self.now += delay
@@ -179,8 +179,8 @@ def test_muted_prepare_corrects_latency_and_fades_to_prior_volume(target):
     proposal = SimulatedProposal(target)
     proposal.run()
     names = [event[0] for event in proposal.events]
-    assert names == ['offer', *(['ping'] * 5), 'go', 'at', 'end']
-    assert proposal.events[0] == ('offer', target, 1)
+    assert names == ['ping', 'offer', *(['ping'] * 4), 'go', 'at', 'end']
+    assert proposal.events[1] == ('offer', target, 1)
     _, scheduled, offset, rtt, error, startup, uncertainty = proposal.events[6]
     assert scheduled * 10 - offset < 105000
     assert rtt == 20 and abs(error) <= 50
@@ -204,9 +204,54 @@ def test_no_match_does_not_touch_player():
     proposal = SimulatedProposal('Cider')
     proposal.player.handoff_match = lambda track: None
     proposal.run()
-    assert proposal.events == [('offer', 'Cider', 0)]
+    assert proposal.events == [('ping', 0), ('offer', 'Cider', 0)]
     assert not proposal.player.commands
 
+
+
+def test_presync_expires_old_low_rtt_and_refreshes_without_playing():
+    proposal = SimulatedProposal('Rufin')
+    first = proposal.request_ping(0)
+    wait = proposal.wait
+    attempts = 0
+
+    def late_accept(event, deadline):
+        nonlocal attempts
+        assert not proposal.player.commands
+        if event == 'a':
+            attempts += 1
+            if attempts < 5:
+                proposal.now = deadline
+                proposal.check(deadline)
+        elif attempts:
+            proposal.now += 110
+        return wait(event, deadline)
+
+    proposal.wait = late_accept
+    clock, deadline = proposal.presync(first)
+    assert deadline == proposal.accepted_at + handoff.START_MS
+    assert clock.sample.t0 > first + handoff.SYNC_FRESH_MS
+    assert len(proposal.events) == 9
+
+
+def test_select_during_lost_legacy_probe_restarts_sync_before_mutation():
+    proposal = SimulatedProposal('Cider')
+    first = proposal.request_ping(0)
+    wait = proposal.wait
+
+    def late_reply(event, deadline):
+        assert not proposal.player.commands
+        if proposal.accepted_at is None:
+            proposal.accepted_at = first + 40
+            proposal.now = deadline
+            proposal.check(deadline)
+        return wait(event, deadline)
+
+    proposal.wait = late_reply
+    clock, deadline = proposal.presync(first)
+    assert deadline == first + 40 + handoff.START_MS
+    assert clock.rtt == 20
+    assert proposal.events == [('ping', 0), *(('ping', i) for i in range(5))]
 
 def test_cider_library_and_catalog_search(monkeypatch):
     from hrcider import Client

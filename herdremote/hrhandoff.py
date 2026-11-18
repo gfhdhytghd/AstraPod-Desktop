@@ -12,7 +12,10 @@ TICK_MS = 10
 FADE_MS = 3000
 START_MS = 8000
 ALIGN_MS = 50
-GO_LEAD_MS = 1000
+GO_LEAD_MS = 400
+SYNC_FRESH_MS = 5000
+SYNC_REFRESH_MS = 1500
+PING_TIMEOUT_MS = 1200
 COARSE_MS = 300
 ALIGN_LIMIT_MS = 1000
 log = logging.getLogger('herdremote.handoff')
@@ -64,7 +67,8 @@ def estimate_clock(samples):
                for s in samples if s.sent >= s.received and s.t3 >= s.t0]
     if not samples:
         raise HandoffError('clock')
-    rtt, sample = min(samples, key=lambda v: max(0, v[0]))
+    rtt, sample = min(samples, key=lambda v: (
+        (v[1].sent - v[1].received) * TICK_MS > 50, max(0, v[0]), -v[1].t3))
     offset = ((sample.sent + sample.received) * TICK_MS - sample.t0 - sample.t3) // 2
     return Clock(sample, offset, max(rtt, 0))
 
@@ -82,6 +86,7 @@ class Proposal:
         self.cancelled = threading.Event()
         self.running = False
         self.finished = False
+        self.accepted_at = None
         self.phase = 'match'
         self.phase_started = self.clock()
 
@@ -104,14 +109,18 @@ class Proposal:
             raise HandoffError('timeout')
 
     def wait(self, command, deadline):
-        while True:
-            self.check(deadline)
+        while not self.cancelled.is_set():
             try:
-                stamp, event, *args = self.inbox.get(timeout=.025)
-                if event == command:
-                    return stamp, args
+                remaining = max(0, deadline - self.clock()) / 1000
+                stamp, event, *args = self.inbox.get(timeout=min(.025, remaining))
             except queue.Empty:
-                pass
+                self.check(deadline)
+                continue
+            if event == 'a' and self.accepted_at is None:
+                self.accepted_at = stamp
+            if event == command and stamp < deadline:
+                return stamp, args
+        raise HandoffError('cancelled')
 
     def sleep_until(self, when):
         delay = (when - self.clock()) / 1000
@@ -120,24 +129,63 @@ class Proposal:
         if self.cancelled.is_set():
             raise HandoffError('cancelled')
 
-    def sync(self, deadline):
-        samples = []
-        for seq in range(5):
-            self.send('ping', seq)
-            stamp, args = self.wait('p', deadline)
-            sent, sequence, received, transmitted, elapsed = map(int, args)
-            if (seq != sequence or not self.phase_started <= sent <= stamp
-                    or not 0 <= received <= transmitted < 2**32
+    def request_ping(self, seq):
+        requested = self.clock()
+        self.send('ping', seq)
+        return requested
+
+    def ping(self, seq, deadline, requested=None):
+        if requested is None:
+            requested = self.request_ping(seq)
+        while True:
+            stamp, args = self.wait('p', min(deadline, requested + PING_TIMEOUT_MS))
+            sent, sequence, received, transmitted, elapsed = args
+            if sequence != seq or sent < requested:
+                continue  # A reply from an expired round.
+            if (not sent <= stamp or not 0 <= received <= transmitted < 2**32
                     or not 0 <= elapsed < self.track[3]):
                 raise HandoffError('clock')
             sample = ClockSample(sent, received, transmitted, stamp, elapsed)
-            samples.append(sample)
-            network_rtt = stamp - sent - (transmitted - received) * TICK_MS
             self.report('seq=%d rtt_ms=%d rx_tick=%d tx_tick=%d local_position_ms=%d',
-                        seq, max(0, network_rtt), received, transmitted, elapsed)
-        clock = estimate_clock(samples)
-        self.report('offset_ms=%d rtt_ms=%d', clock.offset, clock.rtt)
-        return clock
+                        seq, estimate_clock([sample]).rtt, received, transmitted, elapsed)
+            return sample
+
+    def presync(self, first):
+        samples = []
+        for seq in range(5):
+            try:
+                samples.append(self.ping(seq, float('inf'), first if seq == 0 else None))
+            except HandoffError as err:
+                if str(err) != 'timeout':
+                    raise
+                break
+        seq = 0
+        while self.accepted_at is None:
+            try:
+                self.accepted_at, _ = self.wait('a', self.clock() + SYNC_REFRESH_MS)
+                break
+            except HandoffError as err:
+                if str(err) != 'timeout':
+                    raise
+            try:
+                samples.append(self.ping(seq, float('inf')))
+            except HandoffError as err:
+                if str(err) != 'timeout':
+                    raise
+            seq = (seq + 1) % 5
+            samples = [s for s in samples if self.clock() - s.t3 < SYNC_FRESH_MS]
+
+        deadline = self.accepted_at + START_MS
+        samples = [s for s in samples if self.clock() - s.t3 < SYNC_FRESH_MS]
+        clock = estimate_clock(samples) if samples else None
+        if (clock is None or clock.rtt > 250 or
+                estimate_clock(samples[-1:]).rtt > max(250, 2 * clock.rtt)):
+            # Old firmware starts answering after acceptance. An expired
+            # estimate or degraded link also gets a fresh round.
+            clock = estimate_clock([self.ping(i, deadline) for i in range(5)])
+        self.report('offset_ms=%d rtt_ms=%d sample_age_ms=%d',
+                    clock.offset, clock.rtt, self.clock() - clock.sample.t3)
+        return clock, deadline
 
     def read_player(self, player):
         before = self.clock()
@@ -223,8 +271,7 @@ class Proposal:
         alignment = ('fine' if abs(error) <= ALIGN_MS else
                      'coarse' if abs(error) <= COARSE_MS else 'degraded')
 
-        # The iPod acks GO from its UI loop (~350 ms on the device); keep T well past it.
-        tick = clock.device_tick(self.clock() + max(GO_LEAD_MS, clock.rtt * 6))
+        tick = clock.device_tick(self.clock() + max(GO_LEAD_MS, 4 * clock.rtt + 100))
         start = tick * TICK_MS - clock.offset
         if start >= deadline or clock.position(start + FADE_MS) >= self.track[3]:
             raise HandoffError('end-of-track')
@@ -232,24 +279,28 @@ class Proposal:
         uncertainty = (clock.rtt + rtt + TICK_MS) // 2
         self.report('T_tick=%d lead_ms=%d error_ms=%d uncertainty_ms=%d aligned=%s',
                     tick & 0xffffffff, start - self.clock(), error, uncertainty, alignment)
+        sent = self.clock()
         self.send('go', tick & 0xffffffff, clock.offset % (1 << 32),
                   clock.rtt, error, startup, uncertainty)
-        self.wait('g', start)
-        self.report('event=ack')
-        return start, position + start - stamp
+        verify_deadline = start + max(500, 3 * clock.rtt)
+        ack, _ = self.wait('g', verify_deadline)
+        self.report('event=ack ack_latency_ms=%d', ack - sent)
+        # Give the device the projected position before T so its resident
+        # service can verify as soon as the PCM tick publishes the sample.
+        at_sent = self.clock()
+        position_at_start = position + start - stamp
+        self.send('at', position_at_start)
+        return start, position_at_start, verify_deadline, at_sent
 
-    def fade(self, player, matched, volume, start, position_at_start):
+    def fade(self, player, matched, volume, start, position_at_start, verify_deadline, at_sent):
         self.sleep_until(start)
         state = player.handoff_state()
         if not self.ready(state, matched):
             raise HandoffError('player-changed')
-        # Project the last measured host sample to the agreed PCM boundary.
-        # The iPod compares that with its local clock sampled on that boundary.
-        self.send('at', position_at_start)
-        stamp, _ = self.wait('v', start + 250)
+        stamp, _ = self.wait('v', verify_deadline)
         self.enter('fade')
-        self.report('position_ms=%d verify_latency_ms=%d duration_ms=%d',
-                    position_at_start, stamp - start, FADE_MS)
+        self.report('position_ms=%d verify_latency_ms=%d at_to_verify_ms=%d duration_ms=%d',
+                    position_at_start, stamp - start, stamp - at_sent, FADE_MS)
         end = start + FADE_MS
         for step in range(1, 61):
             self.sleep_until(start + step * 50)
@@ -270,18 +321,17 @@ class Proposal:
         self.play_issued = False
         try:
             self.enter('match')
+            first = self.request_ping(0)
             player = self.select()
             matched = player.handoff_match(self.track) if player else None
             self.report('matched=%d', bool(matched))
             self.send('offer', player.name if player else 'Cider', int(bool(matched)))
             if not matched:
                 return
-            self.wait('a', float('inf'))
-            deadline = self.clock() + START_MS
+            self.enter('sync')
+            clock, deadline = self.presync(first)
             self.running = True
             self.pin(player)
-            self.enter('sync')
-            clock = self.sync(deadline)
             self.enter('prepare')
             checkpoint = getattr(player, 'handoff_checkpoint', player.handoff_state)
             before = checkpoint()
@@ -291,8 +341,8 @@ class Proposal:
             self.check(deadline)
             mutated = True
             player.handoff_volume(0)
-            start, position_at_start = self.schedule(player, matched, clock, deadline, before)
-            self.fade(player, matched, volume, start, position_at_start)
+            timing = self.schedule(player, matched, clock, deadline, before)
+            self.fade(player, matched, volume, *timing)
             committed = True
             self.enter('done')
             self.report('outcome=accepted')
