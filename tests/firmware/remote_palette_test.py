@@ -16,60 +16,41 @@ sys.path.insert(0, str(ROOT / 'tools/herdremote'))
 import hrcider
 
 
-SKIN = 'apps-ipod/skin/skin_albumart_color.c'
-text = (ROOT / SKIN).read_text()
+PALETTE = 'apps-ipod/metadata/album_palette.c'
+text = (ROOT / PALETTE).read_text()
 
 
 def between(start, end):
     return text[text.index(start):text.index(end, text.index(start))]
 
 
-WPS = 'apps-ipod/screens/playback/cider_wps.c'
-wps_text = (ROOT / WPS).read_text()
-supports_palette = 'cider_wps_art_generation' in wps_text
-palette_funcs = (
-    between('#define PALETTE_MAX_DIM', '/* Shared by screen')
-    + function(SKIN, 'palette_from_remote')
-    if supports_palette else ''
-)
-filter_config = '#define SKINNABLE_SCREENS_COUNT 3\n'
 (OUT / 'extractor.inc').write_text(
-    between('#define AA_SETTLE_TICKS', '/* Change to a new pair')
-    + between('static void apply_colors', '/* ---------------------------------------------------------------------- *\n * The palette\'s own source')
-    + filter_config
-    + between('#define AA_FILTER_SLOTS', 'static struct skin_albumart *lyrics_skin_blur')
-    + function(SKIN, 'art_filtered')
-    + function(SKIN, 'remember_filtered')
-    + function(SKIN, 'skin_albumart_art_opened')
-    + function(SKIN, 'palette_from_slot')
-    + palette_funcs
-    + function(SKIN, 'dynamic_colors_check_extraction')
-    + function(SKIN, 'skin_albumart_filter'))
-wps_funcs = ['cider_wps_enter', 'cider_wps_update', 'wps_art_handle',
-             'wps_art_bitmap', 'wps_art_pin']
-if supports_palette:
-    wps_funcs += ['cider_wps_art_generation', 'cider_wps_art_key']
-(OUT / 'wps.inc').write_text(
-    wps_text[wps_text.index('static struct mp3entry id3;'):wps_text.index('void cider_wps_enter')]
-    + ''.join(function(WPS, name) for name in wps_funcs))
+    between('#define PALETTE_MAX_DIM', 'void album_palette_alloc(')
+    .replace('static struct mutex palette_lock;\n', '')
+    + function(PALETTE, 'album_palette_alloc')
+    + between('static int compute_luminance', '/* Palettes worked out ahead')
+    + 'static unsigned palette_miss;\n'
+    + ''.join(function(PALETTE, name) for name in (
+        'remote_key_changed', 'palette_from_remote', 'album_art_current', 'palette_from_bitmap',
+        'album_palette_refresh', 'rgb888', 'album_palette_snapshot',
+        'album_palette_generation', 'album_art_render_background')))
 (OUT / 'copy_art.inc').write_text(
-    function('apps-ipod/screens/playback/cider.c', 'cider_copy_art'))
+    function('apps-ipod/screens/playback/cider.c', 'cider_copy_art')
+    + function('apps-ipod/screens/playback/cider.c', 'cider_current_art'))
 
 probe = OUT / 'remote-palette'
 objects = compile_sources(['apps-ipod/draw/color.c', 'apps-ipod/draw/img_filter.c',
                            'firmware/common/strlcpy.c', 'firmware/common/strmemccpy.c',
                            'lib/fixedpoint/fixedpoint.c',
                            'apps-ipod/screens/playback/cider_model.c'])
-extra = ['-DTEST_PALETTE_TIER'] if supports_palette else []
-run([CC, *FLAGS, *extra, '-I' + str(OUT), TOOLS / 'tests/albumart/remote_palette_probe.c',
+run([CC, *FLAGS, '-I' + str(OUT), TOOLS / 'tests/albumart/remote_palette_probe.c',
      *objects, '-Wl,--gc-sections', '-o', probe], 'link-palette')
 
 native = OUT / 'native'
 subprocess.run([sys.executable, TOOLS / 'herdremote/build-cover-thumb.py', native],
                check=True)
 native = native / 'cover-thumb'
-if supports_palette:
-    hrcider.COVER_THUMB = native
+hrcider.COVER_THUMB = native
 files = OUT / 'fixtures'
 files.mkdir(exist_ok=True)
 
@@ -120,8 +101,7 @@ def to_local(raw, label):
 a = files / 'a.aat'
 a.write_bytes(hrcider.render(red, 'L'))
 a_palette = files / 'a.P.aat'
-if supports_palette:
-    a_palette.write_bytes(hrcider.render(red, 'P'))
+a_palette.write_bytes(hrcider.render(red, 'P'))
 failed = []
 for name, raw in covers.items():
     local = files / (name + '.rgb565')
@@ -131,24 +111,23 @@ for name, raw in covers.items():
     local.write_bytes(to_local(full if name == 'original-copy' else raw, name))
     b.write_bytes(hrcider.render(raw, 'L'))
     medium.write_bytes(hrcider.render(raw, 'M'))
-    if supports_palette:
-        if name == 'original-copy':
-            bridge = hrcider.Bridge.__new__(hrcider.Bridge)
-            bridge.rufin, bridge.rufin_library = client, None
-            bridge.jellyfin_library = None
-            key = 'b' * 64
-            bridge.templates = {key: 'rufin:fixture'}
-            with_cache = hrcider.Cache(files / 'rufin-cache')
-            try:
-                bridge.cache = with_cache
-                bridge.cache.put_art(key, 'original', raw)
-                p.write_bytes(bridge._artwork(key, 'P'))
-                assert bridge.cache.get_art(key, 'P1') == p.read_bytes()
-            finally:
-                with_cache.close()
-        else:
-            p.write_bytes(hrcider.render(raw, 'P'))
-        assert p.read_bytes()[12:] == local.read_bytes()
+    if name == 'original-copy':
+        bridge = hrcider.Bridge.__new__(hrcider.Bridge)
+        bridge.rufin, bridge.rufin_library = client, None
+        bridge.jellyfin_library = None
+        key = 'b' * 64
+        bridge.templates = {key: 'rufin:fixture'}
+        with_cache = hrcider.Cache(files / 'rufin-cache')
+        try:
+            bridge.cache = with_cache
+            bridge.cache.put_art(key, 'original', raw)
+            p.write_bytes(bridge._artwork(key, 'P'))
+            assert bridge.cache.get_art(key, 'P1') == p.read_bytes()
+        finally:
+            with_cache.close()
+    else:
+        p.write_bytes(hrcider.render(raw, 'P'))
+    assert p.read_bytes()[12:] == local.read_bytes()
     print(name, 'local', hashlib.sha256(local.read_bytes()).hexdigest(),
           'wire L', hashlib.sha256(b.read_bytes()).hexdigest(), flush=True)
     result = run([probe, local, a, b, p, a_palette, medium], name, check=False)

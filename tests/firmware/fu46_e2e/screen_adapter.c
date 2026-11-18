@@ -51,7 +51,7 @@ void gui_synclist_draw(struct gui_synclist*l){char buf[256];CHECK(l->callback_ge
  if(l->callback_get_item_description){s=l->callback_get_item_description(i,l->data,buf,sizeof buf);if(s)(void)strlen(s);}
  if(l->callback_draw_status)l->callback_draw_status(i,l->data,&screens[0],&test_vp);
  }if(l->callback_speak_item&&l->nb_items)l->callback_speak_item(l->selected_item,l->data);}
-int skinlist_redraw_status(struct screen*d,struct gui_synclist*l){(void)d;gui_synclist_draw(l);return l->nb_items;}
+void gui_synclist_draw_status(struct gui_synclist*l){gui_synclist_draw(l);}
 #ifndef FU46_REAL_ACTION
 int get_action(int context,int timeout){(void)context;(void)timeout;return bridge_action(&raw_button,&held_button);}
 int get_action_statuscode(int *raw){if(raw)*raw=raw_button;return (raw_button&BUTTON_REPEAT)?ACTION_REPEAT:0;}

@@ -9,17 +9,11 @@
 #include "draw/color.h"
 #include "draw/img_filter.h"
 #include "screens/playback/cider_model.h"
+#include "ui/native_theme.h"
 
 #define HZ 100
-#define DYNAMIC_BG_LIGHT 1
-#define DYNAMIC_BG_DARK 2
-#define COLOR_WORDS_MAX 64
-#define CIDER_ART_HANDLE 0x7ffffffe
 #define HAVE_USB_PODLINK
-#define WPS 1
-#define ACTIVITY_WPS 1
-#define ACTIVITY_LYRICS 2
-#define AUDIO_STATUS_PAUSE 2
+#define COVER_HANDLE 1
 
 void panicf(const char *fmt, ...)
 {
@@ -31,26 +25,47 @@ void panicf(const char *fmt, ...)
 }
 
 static long current_tick;
-static struct { unsigned resume_art_hash; long last_volume_change; } global_status;
-static struct {
-    bool dynamic_colors;
-    int dynamic_colors_background;
-    unsigned fg_color;
-} global_settings = {true, 0, 0};
-
-static bool remote;
-static struct cider_state incoming;
+static struct { unsigned resume_art_hash; } global_status;
+static bool remote, local_available;
+static struct cider_state state;
 static struct cider_cache art_cache;
-static int palette_requests;
-static unsigned int palette_reads;
+static unsigned int palette_reads, palette_requests;
 static const char a_key[] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 static const char b_key[] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+struct mp3entry { char path[256]; };
+static struct bitmap local_bmp, remote_bmp;
+static fb_data local_px[128 * 128], remote_px[240 * 240];
+static bool cover_pinned;
+
+static int core_alloc_free_space(size_t size);
+static void *core_get_data_pinned(int handle);
+static void core_put_data_pinned(void *data);
+struct found_palette;
+static bool palette_from_cache(struct found_palette *out, unsigned *hash);
 static bool cider_active(void) { return remote; }
 static bool cider_palette_supported(void) { return true; }
-static bool wps_art_pin(int handle, bool pin);
-static bool wps_art_bitmap(int handle, struct bitmap **out);
-static int wps_art_handle(int slot);
-static bool palette_from_cache(void);
+static bool cider_available(void) { return remote; }
+static unsigned cider_wps_art_generation(void) { return 0; }
+static int native_wps_art_slot(void) { return 3; }
+static int wps_art_handle(int slot)
+{
+    assert(slot == 3);
+    return local_available || remote ? COVER_HANDLE : -1;
+}
+static bool wps_art_pin(int handle, bool pin)
+{
+    assert(handle == COVER_HANDLE && cover_pinned != pin);
+    cover_pinned = pin;
+    return true;
+}
+static bool wps_art_bitmap(int handle, struct bitmap **out)
+{
+    assert(handle == COVER_HANDLE && cover_pinned);
+    *out = remote ? &remote_bmp : &local_bmp;
+    return (*out)->data != NULL;
+}
+static int audio_status(void) { return 1; }
 
 static bool cider_has_art(const char *key, const char *tier)
 {
@@ -59,11 +74,8 @@ static bool cider_has_art(const char *key, const char *tier)
 
 static void cider_request_art(const char *key, const char *tier)
 {
-    if (!strcmp(tier, "P"))
-    {
-        assert(!strcmp(key, incoming.art));
-        palette_requests++;
-    }
+    assert(!strcmp(tier, "P") && !strcmp(key, state.art));
+    ++palette_requests;
 }
 
 static int palette_lock;
@@ -81,64 +93,42 @@ static void *copy_art_bytes(void *dst, const void *src, size_t bytes)
 
 #define memcpy copy_art_bytes
 #include "copy_art.inc"
-
 #undef memcpy
 #undef cache
 #undef cider_mutex
 
-static struct mp3entry {
-    char *title, *artist, *albumartist, *album, *composer;
-    char path[256];
-    unsigned long length, elapsed;
-} local_id3;
-struct wps_state { struct mp3entry *id3, *nid3; bool paused; };
-static struct mp3entry *audio_current_track(void) { return &local_id3; }
-static struct mp3entry *audio_next_track(void) { return NULL; }
-static int audio_status(void) { return 0; }
-static int playback_current_aa_hid(int slot) { (void)slot; return -1; }
-static bool buf_pin_handle(int h, bool pin) { (void)h; (void)pin; return false; }
-static int bufgetdata(int h, int off, void **p) { (void)h; (void)off; (void)p; return -1; }
-static int get_current_activity(void) { return ACTIVITY_WPS; }
-static void cider_snapshot(struct cider_state *state) { *state = incoming; }
-static void skin_request_full_update(int screen) { (void)screen; }
-static void lyrics_remote_cancel(void) {}
-static void lyrics_remote_track(const char *id, uint32_t generation, uint32_t library,
-                                unsigned long duration)
-{
-    (void)id; (void)generation; (void)library; (void)duration;
-}
-static void cider_warm_art(const char *const *keys, unsigned int count, const char *tier)
-{
-    (void)keys; (void)count; (void)tier;
-}
-#define cider_retain_art cider_warm_art
-#define cider_prefetch_art cider_request_art
-void skin_albumart_art_opened(int handle);
-struct skin_albumart {
-    struct img_filter filter;
-    int filtered_art, filter_avoid;
-    unsigned filtered_gen;
-};
-static unsigned dynamic_colors_resolve(unsigned colour) { return colour; }
-static void render_filtered(struct skin_albumart *aa, int handle, struct bitmap *bmp)
-{
-    (void)aa; (void)handle; (void)bmp;
-    abort(); /* This probe uses the real in-place filter path. */
-}
-
-#include "wps.inc"
 #include "extractor.inc"
 
-static struct bitmap local_bmp;
-static fb_data local_px[128 * 128];
+static struct palette_workspace work;
+static bool workspace_pinned;
+static bool workspace_available = true;
 
-static bool palette_from_cache(void)
+static int core_alloc_free_space(size_t size)
 {
-    struct found_palette out = {0};
-    if (!compute_palette(&local_bmp, &out))
+    assert(size == sizeof(work));
+    return workspace_available ? 1 : -1;
+}
+
+static void *core_get_data_pinned(int handle)
+{
+    assert(handle == 1 && !workspace_pinned);
+    workspace_pinned = true;
+    return &work;
+}
+
+static void core_put_data_pinned(void *data)
+{
+    assert(workspace_pinned && data == &work);
+    workspace_pinned = false;
+}
+
+static bool palette_from_cache(struct found_palette *out, unsigned *hash)
+{
+    /* Emulate the on-disk reader returning the local 128px fixture. */
+    if (!local_available)
         return false;
-    apply_found(&out);
-    return true;
+    *hash = 42;
+    return compute_palette(&work, &local_bmp, out);
 }
 
 static void read_exact(const char *path, void *out, size_t size)
@@ -169,10 +159,14 @@ static void print_palette(const char *name, const struct found_palette *out)
 
 static struct found_palette applied(const char *name)
 {
-    struct found_palette out = {cache.found_accent, cache.found_dominant,
-                                cache.vivid, cache.has_vivid};
-    print_palette(name, &out);
-    return out;
+    struct ui_album_palette snapshot;
+    assert(album_palette_snapshot(&snapshot));
+    assert(snapshot.has_dominant && snapshot.has_accent);
+    assert(snapshot.dominant == rgb888(current.dominant));
+    assert(snapshot.accent == rgb888(current.accent));
+    assert(snapshot.has_vivid == current.has_vivid);
+    print_palette(name, &current);
+    return current;
 }
 
 static bool same(struct found_palette a, struct found_palette b)
@@ -181,92 +175,115 @@ static bool same(struct found_palette a, struct found_palette b)
            a.has_vivid == b.has_vivid && (!a.has_vivid || a.vivid == b.vivid);
 }
 
-static void filter_l(struct skin_albumart *aa)
+static void check_background(void)
 {
-    skin_albumart_filter(0, aa);
-    assert(art_filtered(CIDER_ART_HANDLE));
+    /* Center cropping a 4x4 cover into 4x2 must omit both outer rows. Use
+     * dark text to keep the adaptive filter from altering the colors. */
+    fb_data source[16] = {
+        LCD_BLACK, LCD_BLACK, LCD_BLACK, LCD_BLACK,
+        LCD_WHITE, LCD_WHITE, LCD_WHITE, LCD_WHITE,
+        LCD_WHITE, LCD_WHITE, LCD_WHITE, LCD_WHITE,
+        LCD_BLACK, LCD_BLACK, LCD_BLACK, LCD_BLACK,
+    };
+    struct bitmap saved = remote_bmp;
+    remote_bmp.width = remote_bmp.height = 4;
+    remote_bmp.data = (unsigned char *)source;
+    fb_data out[8];
+    for (int blur = 0; blur < 2; ++blur)
+    {
+        assert(album_art_render_background(out, 4, 2, COVER_HANDLE, blur, LCD_BLACK));
+        for (size_t i = 0; i < ARRAYLEN(out); ++i)
+            assert(out[i] == LCD_WHITE);
+        assert(source[0] == LCD_BLACK && source[4] == LCD_WHITE);
+    }
+
+    /* A portrait output crops both outer columns and keeps the source stride. */
+    for (size_t i = 0; i < ARRAYLEN(source); ++i)
+        source[i] = (i % 4 == 0 || i % 4 == 3) ? LCD_BLACK : LCD_WHITE;
+    assert(album_art_render_background(out, 2, 4, COVER_HANDLE, true, LCD_BLACK));
+    for (size_t i = 0; i < ARRAYLEN(out); ++i)
+        assert(out[i] == LCD_WHITE);
+    assert(!cover_pinned && !workspace_pinned && !palette_lock);
+    remote_bmp = saved;
 }
 
 int main(int argc, char **argv)
 {
     assert(argc == 7);
     setvbuf(stdout, NULL, _IONBF, 0);
-    read_exact(argv[1], local_px, sizeof local_px);
+    workspace_available = false;
+    album_palette_alloc();
+    struct ui_album_palette empty = { .has_accent = true };
+    album_palette_refresh();
+    assert(!album_palette_snapshot(&empty) && !empty.has_accent);
+    workspace_available = true;
+    album_palette_alloc();
+
+    read_exact(argv[1], local_px, sizeof(local_px));
     local_bmp = (struct bitmap){.width = 128, .height = 128,
-                              .data = (unsigned char *)local_px};
+                                .data = (unsigned char *)local_px};
     current_tick = 10;
-    needs_extraction = true;
-    dynamic_colors_check_extraction(-1);
+    local_available = true;
+    ++track_serial;
+    album_palette_refresh();
     struct found_palette local = applied("local");
-    /* M uses the same host scaler and dither as L at the local sample size. */
+    assert(global_status.resume_art_hash == 42);
+
     FILE *medium = fopen(argv[6], "rb");
     assert(medium && fseek(medium, 12, SEEK_SET) == 0 &&
-           fread(local_px, 1, sizeof local_px, medium) == sizeof local_px);
+           fread(local_px, 1, sizeof(local_px), medium) == sizeof(local_px));
     fclose(medium);
     struct found_palette host_128 = {0};
-    assert(compute_palette(&local_bmp, &host_128));
+    assert(compute_palette(&work, &local_bmp, &host_128));
     print_palette("B host 128", &host_128);
 
-
-    struct skin_albumart aa = {0};
-    assert(img_filter_compile("invert", IMG_CLASS_LEVELS, &aa.filter));
-    struct wps_state wps = {0};
     remote = true;
-    incoming.available = true;
-    strcpy(incoming.art, a_key);
+    strlcpy(state.art, a_key, sizeof(state.art));
     publish_art(a_key, "L", argv[2]);
-#ifdef TEST_PALETTE_TIER
     publish_art(a_key, "P", argv[5]);
-#endif
-    cider_wps_update(&wps);
-    dynamic_colors_check_extraction(0);
+    album_palette_refresh();
     struct found_palette a = applied("A applied");
-    filter_l(&aa);
 
-    strcpy(incoming.art, b_key);
+    strlcpy(state.art, b_key, sizeof(state.art));
     current_tick += 10;
-    cider_wps_update(&wps);
-    dynamic_colors_check_extraction(0);
-    publish_art(b_key, "L", argv[3]);
-    cider_wps_update(&wps);
-    assert(wps_art_handle(0) == CIDER_ART_HANDLE);
-    assert(!art_filtered(CIDER_ART_HANDLE));
-    struct bitmap *surface;
-    assert(wps_art_bitmap(CIDER_ART_HANDLE, &surface));
-    struct found_palette raw_l = {0};
-    assert(compute_palette(surface, &raw_l));
-    print_palette("B raw L", &raw_l);
-    dynamic_colors_check_extraction(0);
-#ifdef TEST_PALETTE_TIER
+    album_palette_refresh();
     assert(palette_requests && same(a, applied("B waiting")));
-#endif
+    publish_art(b_key, "L", argv[3]);
+    assert(cider_copy_art(b_key, "L", remote_px, sizeof(remote_px)));
+    remote_bmp = (struct bitmap){.width = 240, .height = 240,
+                                 .data = (unsigned char *)remote_px};
+    check_background();
 
-    filter_l(&aa);
+    struct found_palette raw_l = {0};
+    assert(compute_palette(&work, &remote_bmp, &raw_l));
+    print_palette("B raw L", &raw_l);
+
+    /* Increasing the contrast of L must never affect the P-tier palette. */
+    struct img_filter invert;
+    assert(img_filter_compile("invert", IMG_CLASS_LEVELS, &invert));
+    img_filter_apply(remote_px, 240, 240, &invert);
     struct found_palette filtered_l = {0};
-    assert(compute_palette(surface, &filtered_l));
+    assert(compute_palette(&work, &remote_bmp, &filtered_l));
     print_palette("B filtered L", &filtered_l);
     assert(!same(raw_l, filtered_l));
 
-#ifdef TEST_PALETTE_TIER
-    /* Re-send A while B's original thumbnail is still pending. */
     publish_art(a_key, "P", argv[5]);
-    dynamic_colors_check_extraction(0);
+    album_palette_refresh();
     assert(same(a, applied("B waiting (late A)")));
     publish_art(b_key, "P", argv[4]);
     current_tick += 2 * HZ;
-#else
-    (void)a;
-    ++current_tick;
-#endif
-    dynamic_colors_check_extraction(0);
+    album_palette_refresh();
     struct found_palette chosen = applied("B applied");
     assert(same(local, chosen) && "local and remote palettes diverged");
-#ifdef TEST_PALETTE_TIER
-    unsigned int reads = palette_reads;
-    strcpy(incoming.title, "Another track sharing B artwork");
-    cider_wps_update(&wps);
-    dynamic_colors_check_extraction(0);
-    assert(reads == 2 && palette_reads == reads);
-#endif
+    unsigned generation = album_palette_generation();
+    album_palette_refresh();
+    assert(palette_reads == 2 && generation == album_palette_generation());
+
+    state.art[0] = '\0';
+    album_palette_refresh();
+    current_tick += 2 * HZ;
+    album_palette_refresh();
+    assert(!album_palette_snapshot(&empty));
+    assert(!cover_pinned && !workspace_pinned && !palette_lock);
     return 0;
 }
