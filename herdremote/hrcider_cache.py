@@ -242,7 +242,7 @@ class Cache:
             return sorted(k for k in keys if k>after)[:limit]
 
     def put_art(self, key, tier, raw):
-        if len(key) != 64 or any(c not in '0123456789abcdef' for c in key) or tier not in ('original','L','M','S','XS'):
+        if len(key) != 64 or any(c not in '0123456789abcdef' for c in key) or tier not in ('original','L','M','S','XS','P1'):
             raise ValueError('Invalid art key')
         if tier=='original':
             from PIL import Image
@@ -250,7 +250,7 @@ class Cache:
             with Image.open(io.BytesIO(raw)) as image:
                 if image.width>240 or image.height>240:raise ValueError('Capped original exceeds 240 pixels')
         else:
-            dim={'L':240,'M':128,'S':56,'XS':32}[tier]
+            dim={'L':240,'M':128,'S':56,'XS':32,'P1':128}[tier]
             header=struct.pack('<6H',0x5441,8,dim,dim,int(tier=='M'),0)
             if len(raw)!=12+2*dim*dim or raw[:12]!=header:raise ValueError('Invalid native artwork')
         name = key+'-'+tier+('.img' if tier=='original' else '.aat')

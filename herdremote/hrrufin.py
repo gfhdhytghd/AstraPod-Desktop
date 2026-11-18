@@ -578,14 +578,14 @@ class RufinClient(Client):
             keys.append('-')
         return keys, templates
 
-    def artwork(self, uri):
-        """PNG cover from Rufin, at most 240 px; read is bounded to 2 MiB."""
-        data = self._raw('/api/artwork?' + urllib.parse.urlencode({'uri': uri, 'size': 240}))
+    def artwork(self, uri, size=240):
+        """Fetch Rufin cover bytes and bound the dimensions to the requested size."""
+        data = self._raw('/api/artwork?' + urllib.parse.urlencode({'uri': uri, 'size': size}))
         from PIL import Image, ImageOps
         with Image.open(io.BytesIO(data)) as image:
-            if image.width <= 240 and image.height <= 240:
+            if image.width <= size and image.height <= size:
                 return data
-            small = ImageOps.contain(image.convert('RGB'), (240, 240))
+            small = ImageOps.contain(image.convert('RGB'), (size, size))
         out = io.BytesIO()
         small.save(out, 'PNG')
         return out.getvalue()

@@ -5,10 +5,13 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import queue
 import re
 import secrets
 import struct
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -26,6 +29,9 @@ from hrcider_workers import WorkerErrors, survive
 
 log = logging.getLogger('herdremote.cider')
 SIZES = {'L':240,'M':128,'S':56,'XS':32}
+WIRE_SIZES = {**SIZES, 'P': 128}
+COVER_THUMB = Path(__file__).resolve().with_name('cover-thumb')
+PALETTE_SOURCE_LIMIT = 512
 CHUNK = 12 * 1024
 CHUNK_HEADER = struct.Struct('<4s6I')
 AAT = struct.Struct('<6H')
@@ -79,7 +85,23 @@ _BLUE=[bytes(max(0,min(255,v+(d-8)//2))>>3 for v in range(256)) for d in _BAYER]
 
 def render(raw,tier):
     from PIL import Image,ImageOps
-    dim=SIZES[tier]
+    dim=WIRE_SIZES[tier]
+    if tier == 'P':
+        # The native decoder needs a seekable input to probe the dimensions
+        # and to restart a read. Keep it bounded by the normal artwork cap.
+        with Image.open(io.BytesIO(raw)) as source:
+            if (len(raw) > 2 * 1024 * 1024 or max(source.size) > PALETTE_SOURCE_LIMIT):
+                raise ValueError('Artwork exceeded 240px cap')
+        with tempfile.TemporaryFile() as source:
+            source.write(raw)
+            source.seek(0)
+            try:
+                pixels = subprocess.check_output([COVER_THUMB], stdin=source, timeout=2)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise ValueError('Native palette artwork unavailable') from error
+        if len(pixels) != 2 * dim * dim:
+            raise ValueError('Invalid native palette artwork')
+        return AAT.pack(0x5441, 8, dim, dim, 0, 0) + pixels
     with Image.open(io.BytesIO(raw)) as source:
         if source.width>240 or source.height>240:raise ValueError('CDN exceeded 240px cap')
         image=ImageOps.fit(source.convert('RGB'),(dim,dim),method=Image.Resampling.LANCZOS)
@@ -903,6 +925,10 @@ class Bridge:
                     if 'localdiag' in self.capabilities:self.scheduler.push(1,2,f'CF\t{self.generation}\tlocaldiag'.encode())
                     if hrspectrum.CAPABILITY in self.capabilities:
                         self.scheduler.push(1,2,f'CF\t{self.generation}\t{hrspectrum.CAPABILITY}'.encode())
+                    # Older firmware ignores this CF record; its ci list
+                    # stays within the eight-item limit of older hosts.
+                    if os.access(COVER_THUMB, os.X_OK):
+                        self.scheduler.push(1, 2, f'CF\t{self.generation}\tpalette1'.encode())
                     self._announce_remote()
                     return True
                 if name=='cc' and len(fields)==5:log.info('control received gen=%s req=%s command=%s',fields[1],fields[2],fields[3])
@@ -949,7 +975,11 @@ class Bridge:
                     miss=fields[8] if len(fields)==9 else 'unknown'
                     if miss not in ('0','1','unknown'):raise ValueError('Invalid store miss flag')
                     if not 0<req<=0xffffffff:raise ValueError('Invalid request id')
-                    if not re.fullmatch('[0-9a-f]{64}',key) or tier not in SIZES or not 0<=offset<12+SIZES[tier]**2*2 or priority not in (3,4) or not 0<=distance<=10000:raise ValueError('Invalid art request')
+                    if (not re.fullmatch('[0-9a-f]{64}',key) or tier not in WIRE_SIZES or
+                            not 0 <= offset < 12 + WIRE_SIZES[tier]**2 * 2 or
+                            priority not in (3, 4) or not 0 <= distance <= 10000 or
+                            (tier == 'P' and (priority != 3 or not os.access(COVER_THUMB, os.X_OK)))):
+                        raise ValueError('Invalid art request')
                     if (req in self.requests and self.art_times.get(req,())[1:3]==(key,tier)):
                         # A device retry must not invalidate a slow in-flight
                         # download every three seconds.
@@ -1522,32 +1552,43 @@ class Bridge:
             return self._artwork(key,tier)
         finally:lock.release()
     def _artwork(self,key,tier):
-        cached=self.cache.get_art(key,tier)
-        expected=AAT.pack(0x5441,8,SIZES[tier],SIZES[tier],int(tier=='M'),0)
-        if cached is not None and len(cached)==12+SIZES[tier]**2*2 and cached[:12]==expected:return cached
+        dim=WIRE_SIZES[tier]
+        cache_tier='P1' if tier=='P' else tier
+        cached=self.cache.get_art(key,cache_tier)
+        expected=AAT.pack(0x5441,8,dim,dim,int(tier=='M'),0)
+        if cached is not None and len(cached)==12+dim**2*2 and cached[:12]==expected:return cached
         raw=self.cache.get_art(key,'original')
-        if raw is None:
-            if tier=='XS':
-                # A warm M cover already contains the whole image. Its native
-                # pixels are column-major, so undo the transpose before resizing.
-                medium=self.cache.get_art(key,'M')
-                if medium is not None and len(medium)==32780 and medium[:12]==AAT.pack(0x5441,8,128,128,1,0):
-                    from PIL import Image
-                    image=Image.frombytes('RGB',(128,128),medium[12:],'raw','BGR;16')
-                    png=io.BytesIO()
-                    image.transpose(Image.Transpose.TRANSPOSE).save(png,'PNG')
-                    result=render(png.getvalue(),tier)
-                    self.cache.put_art(key,tier,result)
-                    return result
+        if raw is None and tier=='XS':
+            # A warm M cover already contains the whole image. Its native
+            # pixels are column-major, so undo the transpose before resizing.
+            medium=self.cache.get_art(key,'M')
+            if medium is not None and len(medium)==32780 and medium[:12]==AAT.pack(0x5441,8,128,128,1,0):
+                from PIL import Image
+                image=Image.frombytes('RGB',(128,128),medium[12:],'raw','BGR;16')
+                png=io.BytesIO()
+                image.transpose(Image.Transpose.TRANSPOSE).save(png,'PNG')
+                result=render(png.getvalue(),tier)
+                self.cache.put_art(key,tier,result)
+                return result
+        rufin_uri = None
+        if raw is None or tier=='P':
             template=self.templates.get(key) or self.cache.template(key) or (self.rufin_library.template(key) if self.rufin_library else None)
-            if not template:raise ValueError('Unknown artwork id')
-            if template.startswith('jellyfin:'):
+            if raw is None and not template:raise ValueError('Unknown artwork id')
+            if template and template.startswith('jellyfin:'):
                 if self.jellyfin_library is None:raise ValueError('Jellyfin artwork source unavailable')
-                artwork,cacheable=self.jellyfin_library.artwork(template,SIZES[tier])
+                artwork,cacheable=self.jellyfin_library.artwork(
+                    template, PALETTE_SOURCE_LIMIT if tier=='P' else dim)
                 pixels=render(artwork,tier)
-                if cacheable:self.cache.put_art(key,tier,pixels)
+                if cacheable:self.cache.put_art(key,cache_tier,pixels)
                 return pixels
-        rufin_uri = self._rufin_art_uri(template) if raw is None else None
+            if template:
+                rufin_uri=self._rufin_art_uri(template)
+        if tier=='P' and rufin_uri is not None:
+            if self.rufin is None:raise ValueError('Unknown artwork id')
+            raw=self.rufin.artwork(rufin_uri, size=PALETTE_SOURCE_LIMIT)
+            pixels=render(raw,tier)
+            self.cache.put_art(key,cache_tier,pixels)
+            return pixels
         if rufin_uri is not None:
             if self.rufin is None:raise ValueError('Unknown artwork id')
             # Rufin's own cover endpoint on the verified loopback port.
@@ -1565,7 +1606,7 @@ class Bridge:
             with Image.open(io.BytesIO(raw)) as image:
                 if image.width>240 or image.height>240:raise ValueError('CDN exceeded cap')
             self.cache.put_art(key,'original',raw)
-        result=render(raw,tier);self.cache.put_art(key,tier,result)
+        result=render(raw,tier);self.cache.put_art(key,cache_tier,result)
         return result
 
     @staticmethod
