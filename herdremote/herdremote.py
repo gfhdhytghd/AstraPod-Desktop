@@ -796,7 +796,7 @@ class Daemon:
                 self.pump_reads()
                 self.push()
                 if self.cider is not None:
-                    self.cider.poll(self.link.send)
+                    self.cider.poll(self.link.send, self.link.best_effort_delay)
             except (podlink.LinkClosed, hrcider.SessionExpired) as error:
                 log.info("PodLink closed (%s): %s", error.code, error.reason)
                 self.link.opened = False

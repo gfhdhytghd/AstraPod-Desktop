@@ -106,6 +106,7 @@ class Link:
         self.keepalive_interval, self.keepalive_timeout = 5.0, 15.0
         self.nonce_keepalive = False
         self.keepalive_payload = b""
+        self.keepalive_rtt = .020
         self.last_probe = self.last_rx
         self.foreground = None
         self.write_lock = threading.Lock()
@@ -151,6 +152,7 @@ class Link:
                 if (frame.type == PONG and self.keepalive and
                         frame.seq == self.keepalive[0] and
                         frame.payload == self.keepalive_payload):
+                    self.keepalive_rtt = self.last_rx - self.keepalive[1]
                     self.keepalive = None
                     continue
                 if frame.type == CLOSE:
@@ -235,6 +237,12 @@ class Link:
                 raise
             return
         raise TimeoutError("CLOSE handshake timeout")
+
+    def best_effort_delay(self):
+        """Estimate one-way latency, or skip low-priority work behind serial writes."""
+        if getattr(self.port, 'out_waiting', 0):
+            return None
+        return self.keepalive_rtt / 2
 
     def expected(self, kind, payload=None):
         deadline = time.monotonic() + self.timeout

@@ -16,6 +16,7 @@ import urllib.parse
 import urllib.request
 import zlib
 import hrhandoff
+import hrspectrum
 from hrcider_cache import Cache, Index, art_id, canonical_art_url
 from hrcider_volume import MonitorVolume
 from hrcider_library import Library, ROOT, page_error
@@ -823,6 +824,7 @@ class Bridge:
         self.ledger=Ledger(self.cache);self.planner=Planner(self.cache,self.ledger);self.offer_pairs=set();self.art_times={};self.progress_at=0;self.store_capacity=1<<30;self.inventory_pages=0
         self.live_pending=None;self.live_next=0.;self.reopen_reason=None
         self.handoff = hrhandoff.Controller(self._handoff_player, self._handoff_pin)
+        self.spectrum = hrspectrum.Spectrum()
     def start(self):
         starter = getattr(self.client, 'start', None)
         if starter: starter()
@@ -833,6 +835,7 @@ class Bridge:
                 t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
     def close(self):
         self.handoff.close()
+        self.spectrum.close()
         self.stop.set()
         self.wake.set()
         self.volume_wake.set()
@@ -844,6 +847,8 @@ class Bridge:
     def disconnect(self):
         self.handoff.disconnect()
         with self.lock:
+            self.spectrum.reset(time.monotonic())
+            self.spectrum.close()
             self.warm_window.clear();self.warm_queue.clear();self.neighbors=None;self.capabilities=frozenset()
             self.warm_jobs.clear();self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
             self.live_pending=None;self.live_next=0.;self.reopen_reason=None
@@ -855,7 +860,7 @@ class Bridge:
             return True
         try:
             fields=payload.decode().split('\t');name=fields[0]
-            if name not in ('ci','cg','cr','cx','cc','cp','ct','cb','cq','cw','ls','la','lw','lv','ld','lf','lr','ch'):return False
+            if name not in ('ci','cg','cr','cx','cc','cp','ct','cb','cq','cw','ls','la','lw','lv','ld','lf','lr','ch','cs'):return False
             if name=='lv':fields=payload.decode().split('\n',1)[0].split('\t')
             with self.lock:
                 if name=='ci':
@@ -868,7 +873,8 @@ class Bridge:
                         return True
                     normalized=set(advertised)
                     if 'localdiag-live' in normalized:normalized.update(('localdiag','live'))
-                    self.capabilities=frozenset(normalized)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading','localdiag','live','remote-name'}
+                    self.capabilities=frozenset(normalized)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading','localdiag','live','remote-name',hrspectrum.CAPABILITY}
+                    self.spectrum.reset(time.monotonic())
                     window=int(fields[2]);self.volume_delta=0;self.volume_set=None;self.generation=secrets.randbelow(0xfffffffe)+1;self.scheduler.reset(self.generation,window)
                     self.seek_refresh=None
                     self.warm_window.clear();self.warm_queue.clear();self.warm_jobs.clear();self.neighbors=None
@@ -882,13 +888,20 @@ class Bridge:
                         self.scheduler.push(1,2,f'CF\t{self.generation}\tlocalstore'.encode())
                         log.info('localstore CF queued gen=%d',self.generation)
                     if 'localdiag' in self.capabilities:self.scheduler.push(1,2,f'CF\t{self.generation}\tlocaldiag'.encode())
+                    if hrspectrum.CAPABILITY in self.capabilities:
+                        self.scheduler.push(1,2,f'CF\t{self.generation}\t{hrspectrum.CAPABILITY}'.encode())
                     self._announce_remote()
                     return True
                 if name=='cc' and len(fields)==5:log.info('control received gen=%s req=%s command=%s',fields[1],fields[2],fields[3])
                 if len(fields)<2 or int(fields[1])!=self.generation:
                     if name=='cc':log.warning('control dropped: stale generation current=%d received=%s',self.generation,fields[1] if len(fields)>1 else '-')
                     return True
-                if name=='ch' and len(fields)==3:
+                if name=='cs':
+                    if (hrspectrum.CAPABILITY not in self.capabilities or len(fields)!=3 or
+                            not re.fullmatch('[0-9]{1,5}', fields[2]) or int(fields[2])>65535):
+                        raise ValueError('Invalid spectrum lease')
+                    self.spectrum.subscribe(int(fields[2]),time.monotonic())
+                elif name=='ch' and len(fields)==3:
                     if ('live' in self.capabilities and self.live_pending and
                             fields[2]==self.live_pending[0]):
                         log.debug('Cider liveness ACK gen=%d rtt_ms=%.1f',self.generation,
@@ -1595,7 +1608,7 @@ class Bridge:
                     time.monotonic()-self.live_pending[1]>=3.0):
                 raise SessionExpired('Cider application liveness timeout gen='+str(self.generation))
 
-    def poll(self,send):
+    def poll(self,send,spectrum_delay=lambda: .010):
         self.handoff.poll(lambda payload: send(2, payload))
         with self.lock:
             self.check_liveness()
@@ -1615,11 +1628,19 @@ class Bridge:
             library=self.wire_library_generation()
             if library!=self.library_sent:
                 self.scheduler.push(1,2,f'CG\t{self.generation}\t{library}'.encode());self.library_sent=library
+            sent = False
             for _ in range(4):
                 frame=self.scheduler.next_frame()
                 if not frame:break
                 if frame[0]==2 and frame[1].startswith(b'CP\t') and 'neighbors' not in self.capabilities:continue
                 send(*frame)
+                sent = True
+            if hrspectrum.CAPABILITY in self.capabilities or self.spectrum.process is not None:
+                playing = self.available and bool(self.state and self.state.get('rate'))
+                frame = self.spectrum.poll(time.monotonic(), self.generation, playing,
+                                           not sent and not self.scheduler.heap, spectrum_delay)
+                if frame is not None:
+                    send(3, frame)
 
 
 def native_page_frame(generation,request,page):
