@@ -12,6 +12,7 @@ TICK_MS = 10
 FADE_MS = 3000
 START_MS = 8000
 ALIGN_MS = 50
+GO_LEAD_MS = 1000
 COARSE_MS = 300
 ALIGN_LIMIT_MS = 1000
 log = logging.getLogger('herdremote.handoff')
@@ -222,7 +223,8 @@ class Proposal:
         alignment = ('fine' if abs(error) <= ALIGN_MS else
                      'coarse' if abs(error) <= COARSE_MS else 'degraded')
 
-        tick = clock.device_tick(self.clock() + max(300, clock.rtt * 3))
+        # The iPod acks GO from its UI loop (~350 ms on the device); keep T well past it.
+        tick = clock.device_tick(self.clock() + max(GO_LEAD_MS, clock.rtt * 6))
         start = tick * TICK_MS - clock.offset
         if start >= deadline or clock.position(start + FADE_MS) >= self.track[3]:
             raise HandoffError('end-of-track')
