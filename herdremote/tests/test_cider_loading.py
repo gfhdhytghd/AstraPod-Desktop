@@ -96,7 +96,7 @@ def test_mock_poll_transitions_and_quarter_second_schedule(monkeypatch):
             if len(polls)==len(snapshots):b.stop.set()
             return dict(v)
         client.snapshot.side_effect=snapshot
-        b.stop.wait=lambda seconds:clock.__setitem__(0,round(clock[0]+seconds,6))
+        b.wake.wait=lambda seconds:clock.__setitem__(0,round(clock[0]+seconds,6))
         b.command(b'ci\t1\t131072\tloading')
         published=[]
         original=b._state

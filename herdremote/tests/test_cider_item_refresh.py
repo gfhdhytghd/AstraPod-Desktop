@@ -163,6 +163,57 @@ def test_short_seek_reanchors_remote_clock(tmp_path):
     bridge.close()
 
 
+@pytest.mark.parametrize('plugin', [False, True])
+def test_seek_publishes_the_landing_after_a_stale_snapshot(tmp_path, plugin):
+    client = Mock(using_plugin=plugin, explicit_loading=False)
+    client.ab_tick.return_value = None
+    client.loading_state.return_value = False
+    before = Client()._snapshot_data(state('one'))
+    target = before['position'] + 600
+    bridge = Bridge(client=client, cache=Cache(tmp_path), volume=Mock())
+    bridge.volume.read.return_value = (50, False)
+    bridge.command(b'ci\t1\t131072')
+    bridge.state, bridge.available = before, True
+
+    # A completed RPC can precede the new position. With the running
+    # clock's usual 2s tolerance this seek could go unpublished.
+    client.control.side_effect = lambda *_: bridge.stop.set()
+    bridge.command(f'cc\t{bridge.generation}\t99\tseek\t{target}'.encode())
+    bridge._control()
+    client.control.assert_called_once_with('seek', str(target))
+    bridge.stop.clear()
+    times = []
+    sent = []
+    publish = bridge.scheduler.push
+
+    def snapshot():
+        times.append(time.monotonic())
+        if len(times) == 1:
+            return dict(before)
+        return dict(before, position=target)
+
+    def push(priority, kind, payload, *args, **kwargs):
+        publish(priority, kind, payload, *args, **kwargs)
+        if payload.startswith(b'CN\t'):
+            sent.append(int(payload.split(b'\t')[5]))
+            if sent[-1] == target:
+                bridge.stop.set()
+
+    client.snapshot.side_effect = snapshot
+    bridge.scheduler.push = push
+    thread = threading.Thread(target=bridge._poll, daemon=True)
+    thread.start()
+    try:
+        thread.join(1)
+        assert sent == [before['position'], target]
+        assert len(times) == 2
+        assert times[1] - times[0] < .22
+        assert client.refresh_snapshot.call_count == (2 if plugin else 0)
+    finally:
+        bridge.close()
+        thread.join(1)
+
+
 @pytest.mark.parametrize('mode',['auto','plugin'])
 def test_rpc_item_hints_still_watched_while_plugin_is_selected(mode):
     rpc=Mock(base='http://127.0.0.1:1',token=None);plugin=Mock();plugin.transport.connected=True;plugin.transport.callbacks=[]

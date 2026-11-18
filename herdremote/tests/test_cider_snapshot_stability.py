@@ -101,7 +101,8 @@ def run_polls(outcomes):
         if isinstance(value,Exception):raise value
         return dict(state)
     c.snapshot.side_effect=sample
-    b.stop=types.SimpleNamespace(is_set=lambda:stopped[0],wait=lambda seconds:clock.__setitem__(0,clock[0]+seconds),set=lambda:stopped.__setitem__(0,True))
+    b.stop=types.SimpleNamespace(is_set=lambda:stopped[0],set=lambda:stopped.__setitem__(0,True))
+    b.wake.wait=lambda seconds:clock.__setitem__(0,clock[0]+seconds)
     b._state=lambda *args:publications.append((b.available,b.reason,b.state.copy()))
     with patch.object(hrcider.time,'monotonic',side_effect=lambda:clock[0]):b._poll()
     result=(seen,publications,b.available,b.failures,b.state.copy(),state)

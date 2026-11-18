@@ -742,6 +742,7 @@ class Bridge:
         self.state=None;self.available=False;self.reason='Starting';self.state_seq=0;self.last_state=0
         self.opened=False;self.state_dirty=False;self.library_sent=0;self.wake=threading.Event();self.failures=0;self.templates={};self.generation=0;self.threads=[]
         self.item_refresh=threading.Event();self.item_refresh_seq=0
+        self.seek_refresh=None
         self.lyrics_wake=threading.Event()
         self.fill_cancel=threading.Event()
         self.index=Index(self.cache,self.client)
@@ -774,6 +775,7 @@ class Bridge:
                 t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
     def close(self):
         self.stop.set()
+        self.wake.set()
         self.fill_cancel.set()
         closer = getattr(self.client, 'close', None)
         if closer: closer()
@@ -785,6 +787,7 @@ class Bridge:
             self.warm_jobs.clear();self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
             self.live_pending=None;self.live_next=0.;self.reopen_reason=None
             self.library.lyrics.select('')
+            self.seek_refresh=None
             self.opened=False;self.generation=0;self.requests.clear();self._drop_jobs();self.scheduler.reset(0);self.volume_delta=0
     def command(self,payload):
         try:
@@ -804,6 +807,7 @@ class Bridge:
                     if 'localdiag-live' in normalized:normalized.update(('localdiag','live'))
                     self.capabilities=frozenset(normalized)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading','localdiag','live','remote-name'}
                     window=int(fields[2]);self.volume_delta=0;self.generation=secrets.randbelow(0xfffffffe)+1;self.scheduler.reset(self.generation,window)
+                    self.seek_refresh=None
                     self.warm_window.clear();self.warm_queue.clear();self.warm_jobs.clear();self.neighbors=None
                     self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
                     self.requests.clear();self._drop_jobs();self.opened=True;self.library_sent=0;self.last_state=0;self._state(True)
@@ -974,6 +978,7 @@ class Bridge:
         self.library.lyrics.select('')
         library.lyrics.select('')
         self.client=client;self.library=library;self.remote_epoch+=1
+        self.seek_refresh=None
         self.switch_deferred=False;self.failures=0;self.neighbors=None;self.warm_queue.clear()
         self.loading.cancel();self.fill_cancel.set()
         self.page_token+=1
@@ -1105,12 +1110,13 @@ class Bridge:
             if epoch!=self.remote_epoch:
                 epoch=self.remote_epoch;published=None;next_poll=0
             if self.wake.is_set():self.wake.clear();next_poll=0
-            if now<next_poll:self.stop.wait(min(.2,next_poll-now));continue
+            if now<next_poll:self.wake.wait(min(.2,next_poll-now));continue
             try:
                 with self.lock:
                     loading_epoch=self.loading.epoch
                     item_refresh=self.item_refresh.is_set();hint_seq=self.item_refresh_seq
-                if item_refresh and getattr(self.client,'using_plugin',False) is True:
+                    seek=self.seek_refresh
+                if (item_refresh or seek) and getattr(self.client,'using_plugin',False) is True:
                     self.client.refresh_snapshot()
                 state=self.client.snapshot()
                 source_loading=self.client.loading_state() if (getattr(self.client,'using_plugin',False) is True or
@@ -1135,6 +1141,15 @@ class Bridge:
                     # A paused clock cannot drift. Publish even a short paused seek.
                     tolerance = 2000 if state['rate'] else 0
                     changed |= abs(state['position']-predicted)>tolerance or now-self.last_state>=15
+                    seek_arrived=False
+                    if seek is not None and seek is self.seek_refresh:
+                        track,target,origin,rate,started=seek
+                        old=origin+(now-started)*rate
+                        pos=state['position']
+                        seek_arrived=(state['id']==track and target-250<=pos<=target+750 and
+                                      abs(pos-target)<abs(pos-old))
+                        if seek_arrived or state['id']!=track or now-started>=3:
+                            self.seek_refresh=None
                     item_changed=not self.state or state['id']!=self.state.get('id')
                     self.available=True;self.reason='';self.state=state;self.library.state=state
                     if self.opened and self.library.lyrics.select(state['id'], state.get('track_run')):
@@ -1142,15 +1157,17 @@ class Bridge:
                     if state['template']:
                         self.templates[state['art']]=state['template']
                         if len(self.templates)>128:self.templates.pop(next(iter(self.templates)))
-                    if changed or transition or item_refresh:
-                        published=dict(state);anchor=now;self._state(transition or item_refresh or item_changed)
+                    if changed or transition or item_refresh or seek_arrived:
+                        published=dict(state);anchor=now
+                        self._state(transition or item_refresh or item_changed or seek_arrived)
+                    seeking=self.seek_refresh is not None
                 target=self.client.ab_tick(state)
                 if target is not None:
                     try:
                         with self.lock:self._loading_begin('seek',target)
                         self.client.control('seek',target);self.wake.set()
                     except (OSError,ValueError,TimeoutError):pass
-                self.failures=0;next_poll=now+.25
+                self.failures=0;next_poll=now+(.1 if seeking else .25)
             except Exception as error:
                 expected=isinstance(error,(OSError,ValueError,TimeoutError))
                 reason=clean(str(error),80) if expected else self.remote_name()+' state worker failure'
@@ -1229,7 +1246,6 @@ class Bridge:
                 # One aggregated relative command per worker turn; no stale absolute target.
                 try:self.volume.step(delta);self.wake.set()
                 except OSError:log.warning('Host system volume unavailable')
-                self.stop.wait(.04)
             try:item=self.controls.get(timeout=.04)
             except queue.Empty:continue
             generation,req,command,value=item[:4]
@@ -1251,6 +1267,9 @@ class Bridge:
                     self.library.context=None
                     self.loading.note('same-song-open',track=self.state.get('id','') if self.state else '')
                 with self.lock:
+                    if command in Loading.COMMANDS or command in ('resume','pause','toggle'):
+                        self.seek_refresh=None
+                    seek_state=dict(self.state) if command=='seek' and self.state else None
                     if not same and self._loading_begin(command,value):loading_epoch=self.loading.epoch
                 if same:pass
                 elif command in ('native-play','play-item'):
@@ -1282,10 +1301,13 @@ class Bridge:
                 else:self.client.control(command,value)
                 if command=='seek':
                     with self.lock:
-                        if epoch==self.remote_epoch:
+                        if epoch==self.remote_epoch and generation==self.generation and self.opened:
                             # Publish a fresh CN after the RPC even for a small seek
                             # that falls below the running-clock drift tolerance.
                             self.item_refresh_seq+=1;self.item_refresh.set()
+                            if seek_state and seek_state['id']:
+                                self.seek_refresh=(seek_state['id'],max(0,int(value)),
+                                                   seek_state['position'],seek_state['rate'],self.loading.started)
                 self.loading.note('rpc-returned',ok=1)
                 log.info('control timeline gen=%d req=%d command=%s event=rpc-returned monotonic=%.6f',generation,req,command,time.monotonic())
                 ok=True;text='OK';self.wake.set()
