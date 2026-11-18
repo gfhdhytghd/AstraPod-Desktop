@@ -88,7 +88,7 @@ def lyrics_rows(lines, offset, duration, row):
     starts = [start if start is not None else (cues[0][0] if cues else None)
               for _, start, _, cues in lines]
     anchors = [value for value in starts if value is not None]
-    if (not anchors or anchors != sorted(anchors) or shift(anchors[-1]) > MAX_TIME
+    if (not anchors or shift(max(anchors)) > MAX_TIME
             or any(LITERAL_STAMP.search(text) for text in texts)):
         return plain_rows(texts, row)
     # Place missing line starts between real anchors without dropping text.
@@ -99,12 +99,16 @@ def lyrics_rows(lines, offset, duration, row):
         first, last = indices[0], indices[-1]
         before = shift(starts[first - 1]) if first else 0
         after = shift(starts[last + 1]) if last + 1 < len(starts) else min(MAX_TIME, max(before, duration))
+        after = max(before, after)
         for n, i in enumerate(indices, 1):
             starts[i] = before + (after - before) * n // (len(indices) + 1) + offset
 
+    # LRC file order need not match playback order. Keep simultaneous
+    # lines in file order and paginate by playback time.
+    timed_lines = sorted(zip(lines, starts), key=lambda entry: entry[1])
     for enhanced in (True, False):
         encoded, used = [], 0
-        for (text, _, end, cues), start in zip(lines, starts):
+        for (text, _, end, cues), start in timed_lines:
             start = shift(start)
             end = min(MAX_TIME, shift(end)) if end is not None else None
             body, words = text, 1

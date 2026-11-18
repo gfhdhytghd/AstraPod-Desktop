@@ -164,6 +164,37 @@ def test_short_seek_reanchors_remote_clock(tmp_path):
 
 
 @pytest.mark.parametrize('plugin', [False, True])
+def test_playing_external_seek_publishes_clock(tmp_path, plugin):
+    client = Mock(using_plugin=plugin, explicit_loading=False)
+    before = Client()._snapshot_data(state('one'))
+    after = dict(before, position=before['position'] - 650)
+    bridge = Bridge(client=client, cache=Cache(tmp_path), volume=Mock())
+    bridge.volume.read.return_value = (50, False)
+    bridge.command(b'ci\t1\t131072')
+    positions = []
+    push = bridge.scheduler.push
+
+    def record(priority, kind, payload, *args, **kwargs):
+        push(priority, kind, payload, *args, **kwargs)
+        if payload.startswith(b'CN\t'):
+            positions.append(int(payload.split(b'\t')[5]))
+
+    client.loading_state.return_value = False
+
+    def tick(snapshot):
+        if snapshot is after:
+            bridge.stop.set()
+
+    client.snapshot.side_effect = [before, after]
+    client.ab_tick.side_effect = tick
+    bridge.scheduler.push = record
+    bridge._poll()
+    assert positions == [1000, 350]
+    client.control.assert_not_called()
+    bridge.close()
+
+
+@pytest.mark.parametrize('plugin', [False, True])
 def test_seek_publishes_the_landing_after_a_stale_snapshot(tmp_path, plugin):
     client = Mock(using_plugin=plugin, explicit_loading=False)
     client.ab_tick.return_value = None

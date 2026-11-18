@@ -400,6 +400,17 @@ class Mapping(unittest.TestCase):
         self.assertLess(plain['total'], 600)
         self.assertEqual(self.server.posts, [])
 
+    def test_timed_lyrics_keeps_nonchronological_lrc_timed(self):
+        # An LRC can list verse timestamps out of order.
+        q = self.lyrics_fixture([dict(text='Refrain', start_millis=4100),
+                                 dict(text='Verse', start_millis=1230),
+                                 dict(text='Before refrain', start_millis=3007)], 200)
+        result = self.library.page(q+'&nonce=1', 0, 50)['items']
+        self.assertEqual([r['id'] for r in result], ['lrc1'] * 3)
+        self.assertEqual([r['title'] for r in result],
+                         ['[00:01.03]Verse', '[00:02.80]Before refrain', '[00:03.90]Refrain'])
+        self.assertEqual(self.server.posts, [])
+
     def test_timed_lyrics_track_change_in_flight(self):
         q = self.lyrics_fixture([dict(text='Old track!', start_millis=10)])
         self.server.lyrics_hook = lambda: self.server.state['current'].update(

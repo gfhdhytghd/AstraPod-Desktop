@@ -1337,9 +1337,10 @@ class Bridge:
                     changed=not self.available or published is None or any(
                         state.get(k,missing)!=published.get(k,missing)
                         for k in state.keys()|published.keys() if k not in ('position','template'))
-                    predicted=published['position']+(now-anchor)*published['rate'] if published else 0
+                    predicted=min(published['duration'], published['position']+
+                                  (now-anchor)*published['rate']) if published else 0
                     # A paused clock cannot drift. Publish even a short paused seek.
-                    tolerance = 2000 if state['rate'] else 0
+                    tolerance = 500 if state['rate'] else 0
                     changed |= abs(state['position']-predicted)>tolerance or now-self.last_state>=15
                     seek_arrived=False
                     if seek is not None and seek is self.seek_refresh:
