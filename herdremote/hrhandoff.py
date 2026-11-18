@@ -79,6 +79,17 @@ class Proposal:
         self.cancelled = threading.Event()
         self.running = False
         self.finished = False
+        self.phase = 'match'
+        self.phase_started = self.clock()
+
+    def enter(self, phase):
+        self.phase = phase
+        self.phase_started = self.clock()
+        self.report('event=start')
+
+    def report(self, message, *args):
+        log.info('handoff id=%d phase=%s elapsed_ms=%d ' + message,
+                 self.ident, self.phase, self.clock() - self.phase_started, *args)
 
     def send(self, command, *args):
         self.outbox.put_nowait('\t'.join(map(str, ('HF', 1, self.ident, command, *args))).encode())
@@ -112,10 +123,18 @@ class Proposal:
             self.send('ping', seq)
             stamp, args = self.wait('p', deadline)
             sent, sequence, received, transmitted, elapsed = map(int, args)
-            if seq != sequence or not 0 <= elapsed < self.track[3]:
+            if (seq != sequence or not self.phase_started <= sent <= stamp
+                    or not 0 <= received <= transmitted < 2**32
+                    or not 0 <= elapsed < self.track[3]):
                 raise HandoffError('clock')
-            samples.append(ClockSample(sent, received, transmitted, stamp, elapsed))
-        return estimate_clock(samples)
+            sample = ClockSample(sent, received, transmitted, stamp, elapsed)
+            samples.append(sample)
+            network_rtt = stamp - sent - (transmitted - received) * TICK_MS
+            self.report('seq=%d rtt_ms=%d rx_tick=%d tx_tick=%d local_position_ms=%d',
+                        seq, max(0, network_rtt), received, transmitted, elapsed)
+        clock = estimate_clock(samples)
+        self.report('offset_ms=%d rtt_ms=%d', clock.offset, clock.rtt)
+        return clock
 
     def read_player(self, player):
         before = self.clock()
@@ -150,19 +169,26 @@ class Proposal:
         launch = self.clock()
         self.play_issued = True
         player.handoff_play(matched)
-        self.measure(player, matched, deadline)
+        position, stamp, rtt = self.measure(player, matched, deadline)
         startup = self.clock() - launch
+        self.report('startup_ms=%d position_ms=%d sample_ms=%d state_rtt_ms=%d',
+                    startup, position, stamp, rtt)
 
+        self.enter('seek')
         desired = max(0, clock.position(self.clock()))
         player.handoff_seek(desired)
         position, stamp, rtt = self.measure(player, matched, deadline, desired)
         error = position - clock.position(stamp)
+        self.report('requested_ms=%d position_ms=%d sample_ms=%d state_rtt_ms=%d error_ms=%d',
+                    desired, position, stamp, rtt, error)
         if abs(error) > ALIGN_MS:
             # Use one correction for a late or early seek, while still muted.
             desired = max(0, clock.position(self.clock()) - error)
             player.handoff_seek(desired)
             position, stamp, rtt = self.measure(player, matched, deadline, desired)
             error = position - clock.position(stamp)
+            self.report('requested_ms=%d position_ms=%d sample_ms=%d state_rtt_ms=%d error_ms=%d',
+                        desired, position, stamp, rtt, error)
         self.check(deadline)
         if abs(error) > ALIGN_MS:
             raise HandoffError('alignment')
@@ -171,9 +197,14 @@ class Proposal:
         start = tick * TICK_MS - clock.offset
         if start >= deadline or clock.position(start + FADE_MS) >= self.track[3]:
             raise HandoffError('end-of-track')
+        self.enter('go')
+        uncertainty = (clock.rtt + rtt + TICK_MS) // 2
+        self.report('T_tick=%d lead_ms=%d error_ms=%d uncertainty_ms=%d',
+                    tick & 0xffffffff, start - self.clock(), error, uncertainty)
         self.send('go', tick & 0xffffffff, clock.offset % (1 << 32),
-                  clock.rtt, error, startup, (clock.rtt + rtt + TICK_MS) // 2)
+                  clock.rtt, error, startup, uncertainty)
         self.wait('g', start)
+        self.report('event=ack')
         return start, position + start - stamp
 
     def fade(self, player, matched, volume, start, position_at_start):
@@ -184,7 +215,10 @@ class Proposal:
         # Project the last measured host sample to the agreed PCM boundary.
         # The iPod compares that with its local clock sampled on that boundary.
         self.send('at', position_at_start)
-        self.wait('v', start + 250)
+        stamp, _ = self.wait('v', start + 250)
+        self.enter('fade')
+        self.report('position_ms=%d verify_latency_ms=%d duration_ms=%d',
+                    position_at_start, stamp - start, FADE_MS)
         end = start + FADE_MS
         for step in range(1, 61):
             self.sleep_until(start + step * 50)
@@ -196,6 +230,7 @@ class Proposal:
         if not self.ready(player.handoff_state(), matched):
             raise HandoffError('player-changed')
         self.send('end')
+        self.report('event=end latency_ms=%d', self.clock() - end)
         self.wait('d', end + 2300)
 
     def run(self):
@@ -203,8 +238,10 @@ class Proposal:
         mutated, committed = False, False
         self.play_issued = False
         try:
+            self.enter('match')
             player = self.select()
             matched = player.handoff_match(self.track) if player else None
+            self.report('matched=%d', bool(matched))
             self.send('offer', player.name if player else 'Cider', int(bool(matched)))
             if not matched:
                 return
@@ -212,7 +249,9 @@ class Proposal:
             deadline = self.clock() + START_MS
             self.running = True
             self.pin(player)
+            self.enter('sync')
             clock = self.sync(deadline)
+            self.enter('prepare')
             before = player.handoff_state()
             volume = before['volume']
             if not math.isfinite(volume) or not 0 <= volume <= 1:
@@ -223,10 +262,12 @@ class Proposal:
             start, position_at_start = self.schedule(player, matched, clock, deadline)
             self.fade(player, matched, volume, start, position_at_start)
             committed = True
+            self.enter('done')
+            self.report('outcome=accepted')
         except (OSError, ValueError, TypeError, KeyError, OverflowError,
                 HandoffError, queue.Full) as error:
             reason = str(error) if isinstance(error, HandoffError) else 'host'
-            log.info('handoff id=%d outcome=%s', self.ident, reason)
+            self.report('outcome=%s', reason)
             if not self.cancelled.is_set():
                 try:
                     self.send('fail', reason)
@@ -298,9 +339,9 @@ class Controller:
                 proposal.thread = threading.Thread(target=run, args=(proposal,), daemon=True)
                 proposal.thread.start()
             elif self.proposal and self.proposal.ident == ident:
-                if event == 'x':
+                if event == 'x' and not args:
                     self.proposal.cancelled.set()
-                elif event == 'p' and len(args) == 4:
+                elif event == 'p' and len(args) == 5:
                     self.proposal.inbox.put_nowait((millis(), event, *map(int, args)))
                 elif event in ('a', 'g', 'v', 'd') and not args:
                     self.proposal.inbox.put_nowait((millis(), event))
