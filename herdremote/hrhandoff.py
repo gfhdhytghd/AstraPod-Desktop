@@ -10,8 +10,10 @@ import unicodedata
 CAPABILITY = b'HF\t1'
 TICK_MS = 10
 FADE_MS = 3000
-START_MS = 5000
+START_MS = 8000
 ALIGN_MS = 50
+COARSE_MS = 300
+ALIGN_LIMIT_MS = 1000
 log = logging.getLogger('herdremote.handoff')
 
 
@@ -146,8 +148,10 @@ class Proposal:
     def ready(state, matched):
         return matched[0] in state['ids'] and state['playing'] and not state['loading']
 
-    def measure(self, player, matched, deadline, seek=None):
+    def measure(self, player, matched, deadline, seek=None, issued=None):
+        period = getattr(player, 'handoff_position_period_ms', None)
         previous = None
+        edge = None
         while True:
             self.check(deadline)
             state, stamp, rtt = self.read_player(player)
@@ -155,43 +159,68 @@ class Proposal:
                 position = state['position']
                 if seek is None:
                     return position, stamp, rtt
-                # Rufin v0.17.1 publishes position every 500 ms. Use the
-                # change edge, not the time of a read of an unchanged value.
-                if previous and position > previous[0] and position >= seek - ALIGN_MS:
-                    position_stamp = (previous[1] + stamp) // 2
-                    return position, position_stamp, rtt + stamp - previous[1]
-                previous = (position, stamp)
+                if previous and position > previous[0]:
+                    stamp_at_edge = (previous[1] + stamp) // 2
+                    width = max(previous[2], rtt) + stamp - previous[1]
+                    if not period and position >= seek - ALIGN_MS:
+                        return position, stamp_at_edge, width
+                    # Rufin publishes a seek target and then real playhead
+                    # updates. Fit a 1x line to two advancing edges, with
+                    # the preceding and following GETs bracketing each edge.
+                    if period and seek < position <= seek + stamp - issued + ALIGN_MS:
+                        if edge:
+                            distance = position - edge[0]
+                            interval = stamp_at_edge - edge[1]
+                            if (interval >= period // 2 and
+                                    abs(distance - interval) <= ALIGN_MS + (width + edge[2]) // 2):
+                                estimate = (stamp_at_edge + edge[1] + distance) // 2
+                                return position, estimate, max(width, edge[2]) + 2 * abs(estimate - stamp_at_edge)
+                            if interval < period // 2:
+                                previous = (position, stamp, rtt)
+                                self.sleep_until(self.clock() + 25)
+                                continue
+                        edge = (position, stamp_at_edge, width)
+                    else:
+                        edge = None
+                elif previous and position < previous[0]:
+                    edge = None
+                previous = (position, stamp, rtt)
             else:
                 previous = None
+                edge = None
             self.sleep_until(self.clock() + 25)
 
-    def schedule(self, player, matched, clock, deadline):
+    def schedule(self, player, matched, clock, deadline, before):
         launch = self.clock()
         self.play_issued = True
-        player.handoff_play(matched)
+        prepare = getattr(player, 'handoff_prepare', None)
+        if prepare:
+            prepare(matched, before, lambda: self.check(deadline))
+        else:
+            player.handoff_play(matched)
         position, stamp, rtt = self.measure(player, matched, deadline)
         startup = self.clock() - launch
         self.report('startup_ms=%d position_ms=%d sample_ms=%d state_rtt_ms=%d',
                     startup, position, stamp, rtt)
 
         self.enter('seek')
-        desired = max(0, clock.position(self.clock()))
-        player.handoff_seek(desired)
-        position, stamp, rtt = self.measure(player, matched, deadline, desired)
-        error = position - clock.position(stamp)
-        self.report('requested_ms=%d position_ms=%d sample_ms=%d state_rtt_ms=%d error_ms=%d',
-                    desired, position, stamp, rtt, error)
-        if abs(error) > ALIGN_MS:
-            # Use one correction for a late or early seek, while still muted.
-            desired = max(0, clock.position(self.clock()) - error)
+        correction = 0
+        for attempt in range(3):
+            issued = self.clock()
+            desired = max(0, clock.position(issued) + correction)
             player.handoff_seek(desired)
-            position, stamp, rtt = self.measure(player, matched, deadline, desired)
+            position, stamp, rtt = self.measure(player, matched, deadline, desired, issued)
             error = position - clock.position(stamp)
-            self.report('requested_ms=%d position_ms=%d sample_ms=%d state_rtt_ms=%d error_ms=%d',
-                        desired, position, stamp, rtt, error)
+            self.report('attempt=%d requested_ms=%d position_ms=%d sample_ms=%d state_rtt_ms=%d error_ms=%d',
+                        attempt + 1, desired, position, stamp, rtt, error)
+            if abs(error) <= ALIGN_MS:
+                break
+            correction -= error
         self.check(deadline)
-        if abs(error) > ALIGN_MS:
+        if abs(error) > ALIGN_LIMIT_MS:
             raise HandoffError('alignment')
+        alignment = ('fine' if abs(error) <= ALIGN_MS else
+                     'coarse' if abs(error) <= COARSE_MS else 'degraded')
 
         tick = clock.device_tick(self.clock() + max(300, clock.rtt * 3))
         start = tick * TICK_MS - clock.offset
@@ -199,8 +228,8 @@ class Proposal:
             raise HandoffError('end-of-track')
         self.enter('go')
         uncertainty = (clock.rtt + rtt + TICK_MS) // 2
-        self.report('T_tick=%d lead_ms=%d error_ms=%d uncertainty_ms=%d',
-                    tick & 0xffffffff, start - self.clock(), error, uncertainty)
+        self.report('T_tick=%d lead_ms=%d error_ms=%d uncertainty_ms=%d aligned=%s',
+                    tick & 0xffffffff, start - self.clock(), error, uncertainty, alignment)
         self.send('go', tick & 0xffffffff, clock.offset % (1 << 32),
                   clock.rtt, error, startup, uncertainty)
         self.wait('g', start)
@@ -252,14 +281,15 @@ class Proposal:
             self.enter('sync')
             clock = self.sync(deadline)
             self.enter('prepare')
-            before = player.handoff_state()
+            checkpoint = getattr(player, 'handoff_checkpoint', player.handoff_state)
+            before = checkpoint()
             volume = before['volume']
             if not math.isfinite(volume) or not 0 <= volume <= 1:
                 raise HandoffError('volume')
             self.check(deadline)
             mutated = True
             player.handoff_volume(0)
-            start, position_at_start = self.schedule(player, matched, clock, deadline)
+            start, position_at_start = self.schedule(player, matched, clock, deadline, before)
             self.fade(player, matched, volume, start, position_at_start)
             committed = True
             self.enter('done')
@@ -275,13 +305,20 @@ class Proposal:
                     pass
         finally:
             if mutated and not committed:
-                # Pause before restoring the user's previous setting. Restore
-                # even after an ambiguous volume RPC timeout.
                 try:
                     if self.play_issued:
-                        player.handoff_pause()
+                        player.handoff_volume(0)
                 except (OSError, ValueError):
-                    log.warning('handoff player pause failed')
+                    log.warning('handoff player rollback mute failed')
+                try:
+                    if self.play_issued:
+                        restore = getattr(player, 'handoff_restore', None)
+                        if restore:
+                            restore(before)
+                        else:
+                            player.handoff_pause()
+                except (OSError, ValueError, TypeError, KeyError, HandoffError):
+                    log.warning('handoff player restore failed')
                 try:
                     player.handoff_volume(volume)
                 except (OSError, ValueError):

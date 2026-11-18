@@ -1,24 +1,44 @@
-"""FU23 native-source providers and system volume; all mutations are mocked."""
+"""Native-source providers and monitor volume; all mutations are mocked."""
 from pathlib import Path
-import sys,unittest,tempfile,subprocess
+import json,socket,sys,threading,unittest,tempfile,subprocess
 from unittest.mock import Mock
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from hrcider_volume import SystemVolume
+from hrcider_volume import MonitorVolume
 from hrcider_library import Library
 from hrcider_cache import Cache
 
 class Native(unittest.TestCase):
-    def test_wpctl_relative_cap_and_mute(self):
-        run=Mock(return_value=subprocess.CompletedProcess([],0,'Volume: 0.42 [MUTED]\n',''))
-        v=SystemVolume(run=run,which=lambda x:'/mock/wpctl' if x=='wpctl' else None)
-        self.assertEqual(v.read(),(42,True))
-        v.step(7);self.assertEqual(run.call_args.args[0],['/mock/wpctl','set-volume','-l','1.0','@DEFAULT_AUDIO_SINK@','7%+'])
-        v.step(-2);self.assertEqual(run.call_args.args[0][-1],'2%-')
-    def test_pactl_fallback(self):
-        run=Mock(side_effect=[subprocess.CompletedProcess([],0,'Volume: front-left: 32768 / 50% / -18dB\n',''),subprocess.CompletedProcess([],0,'Mute: no\n',''),subprocess.CompletedProcess([],0,'Volume: front-left: 32768 / 50% / -18dB\n',''),subprocess.CompletedProcess([],0,'Mute: no\n',''),subprocess.CompletedProcess([],0,'','')])
-        v=SystemVolume(run=run,which=lambda x:'/mock/pactl' if x=='pactl' else None)
-        self.assertEqual(v.read(),(50,False));v.step(90)
-        self.assertEqual(run.call_args.args[0],['/mock/pactl','set-sink-volume','@DEFAULT_SINK@','100%'])
+    def test_monitor_socket_and_confirmed_state(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as d, socket.socket(socket.AF_UNIX) as server:
+            run=Mock();volume=MonitorVolume(env={'HOME':d,'XDG_RUNTIME_DIR':d},run=run)
+            volume.state.parent.mkdir(parents=True)
+            volume.state.write_text(json.dumps(dict(volume_percent=42,muted=False,confirmed=True)))
+            server.bind(str(volume.socket));server.listen();server.settimeout(2)
+            requests=[]
+
+            def serve():
+                with server.accept()[0] as client, client.makefile('rb') as stream:
+                    requests.append(json.loads(stream.readline()))
+                    client.sendall(b'{"volume_percent":49,"muted":false,"confirmed":false}\n')
+
+            worker=threading.Thread(target=serve);worker.start()
+            self.assertEqual(volume.read(),(42,False));volume.step(7);worker.join(2)
+            self.assertEqual(requests,[dict(action='set',value=49)])
+            self.assertEqual(volume.read(),(49,False));run.assert_not_called()
+            confirmed=volume.state.with_suffix('.new')
+            confirmed.write_text(json.dumps(dict(volume_percent=0,muted=True,confirmed=True)))
+            confirmed.replace(volume.state)
+            self.assertEqual(volume.read(),(0,True))
+
+    def test_monitor_cli_fallback_only(self):
+        with tempfile.TemporaryDirectory(dir='/tmp') as d:
+            run=Mock(return_value=subprocess.CompletedProcess([],0,b'{"hardware":false}\n',b''))
+            volume=MonitorVolume(env={'HOME':d,'XDG_RUNTIME_DIR':d},run=run)
+            volume.step(2);volume.set(55)
+            self.assertEqual([c.args[0] for c in run.call_args_list],
+                             [['python3',str(volume.helper),'inc']]*2 +
+                             [['python3',str(volume.helper),'set','55']])
+            self.assertEqual(volume.read(),(55,False))
     def test_provider_tree_facets_tracks_and_generation(self):
         with tempfile.TemporaryDirectory() as d:
             c=Cache(d);client=Mock();lib=Library(c,client)
@@ -46,12 +66,28 @@ class NativeWorkers(unittest.TestCase):
             bridge.command(b'ci\t1\t131072');bridge.available=True
             gen=bridge.generation
             for i in range(25):bridge.command(f'cc\t{gen}\t{i+1}\tvolume-step\t1'.encode())
-            t=threading.Thread(target=bridge._control);t.start()
+            t=threading.Thread(target=bridge._volume_worker);t.start()
             end=time.monotonic()+1
             while not volume.step.called and time.monotonic()<end:time.sleep(.005)
             bridge.stop.set();t.join(1)
             volume.step.assert_called_once_with(25);client.control.assert_not_called()
             cache.close()
+    def test_absolute_and_relative_coalesce_for_every_backend(self):
+        import hrcider,time
+        for backend in ('Cider','Rufin','Jellyfin'):
+            with tempfile.TemporaryDirectory(dir='/tmp') as d:
+                client=Mock(name=backend);volume=Mock();cache=Cache(d)
+                bridge=hrcider.Bridge(client=client,cache=cache,volume=volume)
+                bridge.command(b'ci\t1\t131072');gen=bridge.generation
+                bridge.command(f'cc\t{gen}\t1\tvolume\t50'.encode())
+                bridge.command(f'cc\t{gen}\t2\tvolume-step\t-1'.encode())
+                worker=threading.Thread(target=bridge._volume_worker);worker.start()
+                end=time.monotonic()+1
+                while not volume.set.called and time.monotonic()<end:time.sleep(.005)
+                bridge.stop.set();worker.join(1)
+                volume.set.assert_called_once_with(49)
+                volume.step.assert_not_called();client.control.assert_not_called()
+                cache.close()
     def test_source_local_checks_live_state_once_and_never_starts_local(self):
         import hrcider,threading,time
         for playing in (False,True):

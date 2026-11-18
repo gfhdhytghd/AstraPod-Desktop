@@ -98,14 +98,34 @@ class Rufin:
         self.playing = False
 
 
+class SlowRufin(Rufin):
+    handoff_position_period_ms = 500
+
+    def handoff_seek(self, position):
+        self.prior = super().handoff_state()['position']
+        self.echo_at = hrhandoff.millis() + (65 if self.anchor else 300)
+        self.anchor = hrhandoff.millis() + 300
+        self.position = position
+
+    def handoff_state(self):
+        state = super().handoff_state()
+        if self.anchor:
+            now = hrhandoff.millis()
+            state['position'] = self.prior if now < self.echo_at else (
+                self.position + max(0, now // 500 * 500 - self.anchor))
+        return state
+
+
 class Cable:
-    def __init__(self, lib):
+    def __init__(self, lib, slow=False):
         self.firmware = ctypes.CDLL(str(lib))
         self.firmware.device_clock.argtypes = [ctypes.c_long, ctypes.c_ulong]
         self.firmware.device_log.restype = ctypes.c_char_p
         self.firmware.device_receive.argtypes = [ctypes.c_char_p, ctypes.c_uint]
         self.origin = hrhandoff.millis()
-        self.player = Rufin()
+        self.player = SlowRufin() if slow else Rufin()
+        self.slow = slow
+        self.flight = []
         self.host = hrhandoff.Controller(lambda: self.player, lambda player: None)
         self.rx = [podlink.Decoder(), podlink.Decoder()]
         self.words = [[], []]
@@ -121,6 +141,14 @@ class Cable:
 
     def send(self, side, payload):
         self.words[side].append(payload)
+        if self.slow and payload != hrhandoff.CAPABILITY:
+            key = sum(len(words) for words in self.words)
+            delay = (50, 54, 59)[key % 3]
+            self.flight.append((hrhandoff.millis() + delay, side, payload))
+        else:
+            self.deliver(side, payload)
+
+    def deliver(self, side, payload):
         packet = podlink.encode(podlink.TEXT, len(self.words[side]), payload)
         for start in range(0, len(packet), 17):
             for frame in self.rx[side].feed(packet[start:start + 17]):
@@ -132,6 +160,9 @@ class Cable:
 
     def step(self, drop=None):
         self.clock()
+        while self.flight and self.flight[0][0] <= hrhandoff.millis():
+            _, side, payload = self.flight.pop(0)
+            self.deliver(side, payload)
         self.host.poll(lambda msg: self.send(0, msg))
         result = self.firmware.device_step()
         size = self.firmware.device_send(self.out, len(self.out))
@@ -153,7 +184,7 @@ class Cable:
 
 
 def scenario(lib, mode):
-    cable = Cable(lib)
+    cable = Cable(lib, slow=mode == 'latency')
     fw, player, host = cable.firmware, cable.player, cable.host
     try:
         if mode == 'decline':
@@ -163,7 +194,7 @@ def scenario(lib, mode):
             assert fw.device_state() == 1 and player.volumes == []
             assert [p.split(b'\t')[2] for p in cable.words[1]] == [b'q', b'x']
         elif mode == 'timeout':
-            cable.until(lambda: b'outcome=timeout' in fw.device_log(), drop=b'hf\t1\tp\t')
+            cable.until(lambda: b'outcome=timeout' in fw.device_log(), drop=b'hf\t1\tp\t', timeout=10)
             assert fw.device_state() == 1 and player.volumes == []
         elif mode == 'host-fail':
             player.fail_seek = True
@@ -179,7 +210,7 @@ def scenario(lib, mode):
             assert b'outcome=unplug' in fw.device_log()
             assert fw.device_state() == 1 and player.pauses == 1 and player.volume == .72
         else:
-            cable.until(lambda: host.proposal is not None and host.proposal.finished)
+            cable.until(lambda: host.proposal is not None and host.proposal.finished, timeout=10)
             expected = [b'q', b'a', *([b'p'] * 5), b'g', b'v', b'd']
             assert [p.split(b'\t')[2] for p in cable.words[1]] == expected, (
                 f'expected accept/sync/go/fade/done, got {cable.words[1]}; '
@@ -201,7 +232,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format='%(message)s')
     lib = compile_firmware(SOURCE, out)
-    for mode in ('success', 'decline', 'timeout', 'unplug', 'host-fail'):
+    for mode in ('success', 'latency', 'decline', 'timeout', 'unplug', 'host-fail'):
         # A new device instance for each virtual cable. dlopen coalesces by
         # path, so give each fixture an independent copy of the same build.
         fresh = out / f'{mode}.so'

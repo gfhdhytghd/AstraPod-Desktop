@@ -128,6 +128,8 @@ class RufinClient(Client):
     name = 'Rufin'
     using_plugin = False
     explicit_loading = True
+    # Rufin 0.17.1 uses the same untimestamped projection for REST and SSE.
+    handoff_position_period_ms = 500
 
     def __init__(self, env=None, timeout=.8, opener=None, verify_timeout=1.0):
         super().__init__('http://127.0.0.1:9', None, timeout, opener)
@@ -461,8 +463,84 @@ class RufinClient(Client):
     def handoff_volume(self, volume):
         self.post('/api/playback/volume', {'volume': volume, 'persist': False})
 
-    def handoff_play(self, matched):
-        self.post('/api/queue', {'uris': [matched[0]], 'mode': 'replace'})
+    def handoff_checkpoint(self):
+        state = self._playback_raw()
+        queue, _ = self.queue_window(1)
+        if state.get('queue_total') != queue['total']:
+            raise hrhandoff.HandoffError('queue-changed')
+        status = state['state']
+        if status in ('buffering', 'resolving'):
+            status = 'playing'
+        return dict(volume=float(state['volume']), status=status,
+                    position=int(state.get('position_ms') or 0),
+                    index=queue.get('current_index'), total=queue['total'])
+
+    def _handoff_wait(self, observe, check):
+        while True:
+            check()
+            if observe():
+                return
+            time.sleep(.025)
+
+    def _handoff_queue_slot(self, before):
+        queue, window = self.queue_window()
+        if queue['total'] == before['total']:
+            return False
+        if queue['total'] != before['total'] + 1:
+            raise hrhandoff.HandoffError('queue-changed')
+        slot = before['added_index']
+        if any(row['position'] == slot and row['track'].get('uri') == before['added_uri']
+               for row in window):
+            return True
+        if not queue.get('loading'):
+            raise hrhandoff.HandoffError('queue-changed')
+        return False
+
+    def _handoff_at(self, index):
+        state = self._playback_raw()
+        return (state.get('current') or {}).get('position') == index and (
+            state.get('can_seek') is True and not state.get('refilling'))
+
+    def handoff_prepare(self, matched, before, check):
+        # Insert next to the selected track so the whole original queue stays
+        # in Rufin, including entries outside the controller's queue window.
+        index = before['index']
+        slot = before['total'] if index is None else index + 1
+        before.update(added_index=slot, added_uri=matched[0])
+        self.post('/api/queue', {'uris': [matched[0]], 'mode': 'next'})
+        self._handoff_wait(lambda: self._handoff_queue_slot(before), check)
+        before['activate_issued'] = True
+        self.post('/api/queue/activate', {'position': slot})
+        self._handoff_wait(lambda: self._handoff_at(slot), check)
+
+    def handoff_restore(self, before):
+        if 'added_index' not in before:
+            return
+        deadline = time.monotonic() + 4
+
+        def check():
+            if time.monotonic() >= deadline:
+                raise hrhandoff.HandoffError('rollback-timeout')
+
+        self._handoff_wait(lambda: self._handoff_queue_slot(before), check)
+        index = before['index']
+        status = before['status'] if before['status'] in ('playing', 'paused') else 'stopped'
+        try:
+            if before.get('activate_issued'):
+                if index is None:
+                    self.post('/api/playback/stop')
+                else:
+                    self.post('/api/queue/activate', {'position': index})
+                    self._handoff_wait(lambda: self._handoff_at(index), check)
+                    if status == 'paused':
+                        self.handoff_pause()
+                    elif status == 'stopped':
+                        self.post('/api/playback/stop')
+                    self.handoff_seek(before['position'])
+                self._handoff_wait(lambda: self._playback_raw()['state'] == status, check)
+        finally:
+            self.post('/api/queue/item', {'position': before['added_index']})
+        self._handoff_wait(lambda: self.queue_state()[1] == before['total'], check)
 
     def handoff_seek(self, position):
         self.control('seek', position)

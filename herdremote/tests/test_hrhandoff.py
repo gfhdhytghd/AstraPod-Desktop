@@ -100,6 +100,80 @@ class SimulatedProposal(handoff.Proposal):
         return self.now, ()
 
 
+class PublishingRufin(Player):
+    handoff_position_period_ms = 500
+
+    def handoff_seek(self, position):
+        self.position_before_seek = self.handoff_state()['position']
+        requested_at = self.proposal.now
+        echo_delay = 65 if hasattr(self, 'echo_at') else 300
+        self.echo_at = requested_at + echo_delay
+        self.anchor = requested_at + self.lag
+        self.position = position
+        self.commands.append(('seek', position))
+
+    def handoff_state(self):
+        state = super().handoff_state()
+        if hasattr(self, 'echo_at'):
+            now = self.proposal.now
+            if now < self.echo_at:
+                state['position'] = self.position_before_seek
+            else:
+                published = now // 500 * 500
+                state['position'] = self.position + max(0, published - self.anchor)
+        return state
+
+
+class SlowPodLinkProposal(SimulatedProposal):
+    def wait(self, event, deadline):
+        if event == 'p':
+            self.check(deadline)
+            _, seq = self.events[-1]
+            sent = self.now
+            delay = (120, 103, 118, 110, 117)[seq]
+            self.now += delay
+            received = (sent + 1000 + delay // 2) // 10
+            return self.now, (sent, seq, received, received, received * 10 - 96000)
+        return super().wait(event, deadline)
+
+
+def test_rufin_alignment_ignores_target_echo(caplog):
+    caplog.set_level('INFO', logger='herdremote.handoff')
+    proposal = SlowPodLinkProposal('Rufin')
+    proposal.player = PublishingRufin(proposal, lag=300)
+    proposal.run()
+    assert proposal.events[-1] == ('end',), caplog.text
+    assert proposal.events[6][3] == 103
+    assert abs(proposal.events[6][4]) <= 50
+    assert proposal.player.volume == .72
+
+
+@pytest.mark.parametrize(('lags', 'expected'), [
+    ((300, 500, 300), 'coarse'), ((300, 700, 300), 'degraded'),
+    ((300, 500, 1800), 'alignment'),
+])
+def test_rufin_alignment_thresholds(caplog, lags, expected):
+    caplog.set_level('INFO', logger='herdremote.handoff')
+    proposal = SlowPodLinkProposal('Rufin')
+    player = proposal.player = PublishingRufin(proposal)
+    seek = player.handoff_seek
+    delays = iter(lags)
+
+    def variable_seek(position):
+        player.lag = next(delays)
+        seek(position)
+
+    player.handoff_seek = variable_seek
+    proposal.run()
+    if expected == 'alignment':
+        assert proposal.events[-1] == ('fail', 'alignment'), caplog.text
+    else:
+        assert proposal.events[-1] == ('end',), caplog.text
+        assert f'aligned={expected}' in caplog.text
+    assert len([name for name, *_ in player.commands if name == 'seek']) == 3
+    assert player.volume == .72
+
+
 @pytest.mark.parametrize('target', ['Rufin', 'Cider'])
 def test_muted_prepare_corrects_latency_and_fades_to_prior_volume(target):
     proposal = SimulatedProposal(target)
@@ -178,11 +252,68 @@ def test_rufin_search_and_transient_controls(monkeypatch):
     assert requests[1][1]['source'] == 'jellyfin'
     assert requests[1][1]['folder'] == 'music'
     player.handoff_volume(0)
-    player.handoff_play(matched)
     player.handoff_seek(1234)
-    assert requests[-3:] == [('/api/playback/volume', {'volume': 0, 'persist': False}),
-                             ('/api/queue', {'uris': ['jellyfin:track'], 'mode': 'replace'}),
+    assert requests[-2:] == [('/api/playback/volume', {'volume': 0, 'persist': False}),
                              ('/api/playback/seek', {'position_ms': 1234})]
+
+
+@pytest.mark.parametrize('status', ['playing', 'paused', 'stopped', 'empty'])
+def test_rufin_abort_restores_prior_queue_and_position(monkeypatch, status):
+    from hrrufin import RufinClient
+
+    proposal = SlowPodLinkProposal('Rufin')
+    player = proposal.player = RufinClient(env={})
+    queue = ['before', 'old', 'after'] if status != 'empty' else []
+    previous = tuple(queue)
+    index, position, volume = (1, 23456, .83) if queue else (None, 0, .83)
+    mode = 'stopped' if status == 'empty' else status
+
+    def playback():
+        current = dict(position=index, media_uri=queue[index]) if index is not None else None
+        return dict(state=mode, position_ms=position, volume=volume, current=current,
+                    queue_total=len(queue), can_seek=bool(queue))
+
+    def get(path, **params):
+        assert path == '/api/queue'
+        return dict(total=len(queue), current_index=index, loading=False,
+                    window=[dict(position=i, track=dict(uri=uri)) for i, uri in enumerate(queue)])
+
+    def post(path, body=None):
+        nonlocal index, mode, position, volume
+        if path == '/api/playback/volume':
+            assert body['persist'] is False
+            volume = body['volume']
+        else:
+            assert volume == 0
+            if path == '/api/queue':
+                assert body == dict(uris=['new'], mode='next')
+                queue.insert(index + 1 if index is not None else len(queue), 'new')
+            elif path == '/api/queue/activate':
+                index, mode, position = body['position'], 'playing', 0
+            elif path == '/api/playback/seek':
+                if queue[index] == 'new':
+                    raise OSError('synthetic failed seek')
+                position = body['position_ms']
+            elif path == '/api/playback/pause':
+                mode = 'paused'
+            elif path == '/api/playback/stop':
+                mode, position = 'stopped', 0
+            elif path == '/api/queue/item':
+                assert queue.pop(body['position']) == 'new'
+                if not queue:
+                    index = None
+            else:
+                raise AssertionError(path)
+
+    monkeypatch.setattr(player, '_playback_raw', playback)
+    monkeypatch.setattr(player, 'handoff_match', lambda track: ('new',))
+    monkeypatch.setattr(player, 'get', get)
+    monkeypatch.setattr(player, 'post', post)
+    proposal.run()
+    assert proposal.events[-1] == ('fail', 'host')
+    assert tuple(queue) == previous
+    assert (index, position, volume, mode) == (
+        (1, 23456, .83, status) if previous else (None, 0, .83, 'stopped'))
 
 
 def test_rufin_preference_and_cider_fallback():

@@ -753,10 +753,11 @@ Cache schema 4 preserves the FU23 library index and native artwork while
 normalizing artwork keys across template and fixed-size CDN URLs. Older schemas
 rebuild the index in the background.
 
-Cider Remote volume controls the computer's default audio sink with `wpctl`,
-or `pactl` if wpctl is missing. Neither reads nor writes Cider's volume RPC.
-Rapid 1% steps are combined; the maximum is 100%. Host volume/mute changes
-are published with playback state. No sudo or audio-service restart is needed.
+Remote volume uses the HyprV monitor-volume service for every playback backend.
+HerdRemote sends coalesced 1% steps and absolute settings to its Unix control
+socket. It uses the monitor-volume helper when the socket is unavailable or
+the service asks for fallback. The helper owns fallback for non-HDMI sinks.
+HerdRemote publishes the service's volume and mute state to the iPod.
 A matching firmware and all five Cider modules are required. No deployment or
 real playback-control test is performed by the offline regression suite.
 
@@ -910,8 +911,8 @@ Audiobooks/Podcasts, numeric filters, add-to-library and playback speed. Track
 Info shows title/artist/album/duration/favourite; Rufin's playback state has
 no disc/track/year/genre/quality. Current Playlist shows the 100 tracks around
 the current one (Rufin's queue window); Playing Time is shown only when that
-window reaches the end of the queue. Volume stays the computer's sink volume
-(wpctl/pactl), never Rufin's volume endpoint.
+window reaches the end of the queue. Remote volume uses the same monitor
+service as Cider Remote.
 
 Deploy `hrrufin.py` with the updated `hrcider.py`. `RUFIN_DISABLE=1` turns the
 backend off. Tests use only a loopback mock Rufin (`tests/test_rufin.py`) and

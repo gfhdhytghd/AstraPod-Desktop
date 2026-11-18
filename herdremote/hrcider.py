@@ -17,7 +17,7 @@ import urllib.request
 import zlib
 import hrhandoff
 from hrcider_cache import Cache, Index, art_id, canonical_art_url
-from hrcider_volume import SystemVolume
+from hrcider_volume import MonitorVolume
 from hrcider_library import Library, ROOT, page_error
 from hrcider_store import Ledger, Planner, offer_records, parse_rows
 from hrcider_workers import WorkerErrors, survive
@@ -801,7 +801,7 @@ class Bridge:
         self.lyrics_wake=threading.Event()
         self.fill_cancel=threading.Event()
         self.index=Index(self.cache,self.client)
-        self.library=Library(self.cache,self.client);self.volume=volume or SystemVolume()
+        self.library=Library(self.cache,self.client);self.volume=volume or MonitorVolume()
         self.cider_library=self.library
         if rufin is not None:
             if jellyfin is None:
@@ -812,7 +812,9 @@ class Bridge:
                 self.rufin_library=JellyfinLibrary(rufin,jellyfin)
             rufin.rpc_observer=self._rpc_event
         self.jellyfin_library=self.rufin_library if jellyfin is not None else None
-        self.volume_delta=0;self.pages=queue.Queue(1);self.page_token=0
+        self.volume_delta=0;self.volume_set=None;self.volume_wake=threading.Event()
+        self.volume_refresh=False
+        self.pages=queue.Queue(1);self.page_token=0
         self.art_locks=[threading.RLock() for _ in range(32)]
         self.prefetch=queue.Queue(10)
         self.warm_window=set();self.warm_queue=set();self.warm_jobs={};self.neighbors=None
@@ -824,7 +826,7 @@ class Bridge:
     def start(self):
         starter = getattr(self.client, 'start', None)
         if starter: starter()
-        for target,name in [(self._prefetch_worker,'cider-prefetch-'+str(i)) for i in range(4)]+[(self._poll,'cider-state'),(self._work,'cider-art'),(self._control,'cider-control'),(self._index,'cider-index'),(self._pages,'cider-pages'),(self._lyrics_prefetch,'cider-lyrics'),(self._neighbors,'cider-neighbors')]:
+        for target,name in [(self._prefetch_worker,'cider-prefetch-'+str(i)) for i in range(4)]+[(self._poll,'cider-state'),(self._work,'cider-art'),(self._control,'cider-control'),(self._volume_worker,'remote-volume'),(self._index,'cider-index'),(self._pages,'cider-pages'),(self._lyrics_prefetch,'cider-lyrics'),(self._neighbors,'cider-neighbors')]:
             t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
         if self.realtime:
             for target,name in [(self._event_worker,'cider-events'),(self._stream_worker,'cider-stream')]:
@@ -833,6 +835,7 @@ class Bridge:
         self.handoff.close()
         self.stop.set()
         self.wake.set()
+        self.volume_wake.set()
         self.fill_cancel.set()
         closer = getattr(self.client, 'close', None)
         if closer: closer()
@@ -846,7 +849,7 @@ class Bridge:
             self.live_pending=None;self.live_next=0.;self.reopen_reason=None
             self.library.lyrics.select('')
             self.seek_refresh=None
-            self.opened=False;self.generation=0;self.requests.clear();self._drop_jobs();self.scheduler.reset(0);self.volume_delta=0
+            self.opened=False;self.generation=0;self.requests.clear();self._drop_jobs();self.scheduler.reset(0);self.volume_delta=0;self.volume_set=None
     def command(self,payload):
         if self.handoff.command(payload):
             return True
@@ -866,7 +869,7 @@ class Bridge:
                     normalized=set(advertised)
                     if 'localdiag-live' in normalized:normalized.update(('localdiag','live'))
                     self.capabilities=frozenset(normalized)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading','localdiag','live','remote-name'}
-                    window=int(fields[2]);self.volume_delta=0;self.generation=secrets.randbelow(0xfffffffe)+1;self.scheduler.reset(self.generation,window)
+                    window=int(fields[2]);self.volume_delta=0;self.volume_set=None;self.generation=secrets.randbelow(0xfffffffe)+1;self.scheduler.reset(self.generation,window)
                     self.seek_refresh=None
                     self.warm_window.clear();self.warm_queue.clear();self.warm_jobs.clear();self.neighbors=None
                     self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
@@ -902,7 +905,12 @@ class Bridge:
                     req=int(fields[2])
                     if fields[3]=='volume-step':
                         self.volume_delta=max(-100,min(100,self.volume_delta+int(fields[4])))
-                    elif fields[3]=='volume':raise ValueError('Cider volume disabled')
+                        self.volume_wake.set()
+                    elif fields[3]=='volume':
+                        value=int(fields[4])
+                        if not 0 <= value <= 100:raise ValueError('Invalid monitor volume')
+                        self.volume_set=(self.generation,req,value)
+                        self.volume_delta=0;self.volume_wake.set()
                     elif fields[3]=='remote-home':
                         # The device entered the remote Home row: a deferred
                         # Rufin switch may happen now (FU56).
@@ -1203,6 +1211,7 @@ class Bridge:
                 except OSError:state['volume'],state['muted']=0,False
                 with self.lock:
                     if epoch!=self.remote_epoch:continue   # the backend changed during this read
+                    volume_refresh=self.volume_refresh;self.volume_refresh=False
                     if item_refresh and hint_seq==self.item_refresh_seq:self.item_refresh.clear()
                     loading_before=self.loading.value
                     rufin=getattr(self.client,'explicit_loading',False) is True
@@ -1235,9 +1244,9 @@ class Bridge:
                     if state['template']:
                         self.templates[state['art']]=state['template']
                         if len(self.templates)>128:self.templates.pop(next(iter(self.templates)))
-                    if changed or transition or item_refresh or seek_arrived:
+                    if changed or transition or item_refresh or seek_arrived or volume_refresh:
                         published=dict(state);anchor=now
-                        self._state(transition or item_refresh or item_changed or seek_arrived)
+                        self._state(transition or item_refresh or item_changed or seek_arrived or volume_refresh)
                     seeking=self.seek_refresh is not None
                 target=self.client.ab_tick(state)
                 if target is not None:
@@ -1316,14 +1325,33 @@ class Bridge:
                     self.scheduler.push(2,2,native_page_frame(generation,req,page),req,bulk=True)
                     log.info('page ready gen=%d req=%d kind=%s offset=%d rows=%d stale=%s ms=%.1f',generation,req,kind,offset,len(page['items']),bool(page['stale']),1000*(time.monotonic()-started))
     @survive()
-    def _control(self):
+    def _volume_worker(self):
         while not self.stop.is_set():
+            if not self.volume_wake.wait(.1) or self.stop.wait(.04):
+                continue
+            self.volume_wake.clear()
             with self.lock:
                 delta=self.volume_delta;self.volume_delta=0
-            if delta:
-                # One aggregated relative command per worker turn; no stale absolute target.
-                try:self.volume.step(delta);self.wake.set()
-                except OSError:log.warning('Host system volume unavailable')
+                absolute=self.volume_set;self.volume_set=None
+            ok=True
+            try:
+                if absolute:
+                    generation,req,value=absolute
+                    self.volume.set(max(0,min(100,value+delta)))
+                elif delta:
+                    self.volume.step(delta)
+            except OSError:
+                ok=False;log.warning('Monitor volume unavailable')
+            with self.lock:
+                self.volume_refresh=True
+                if absolute and generation==self.generation and self.opened:
+                    reason='OK' if ok else 'Monitor volume unavailable'
+                    self.scheduler.push(0,2,f'CK\t{generation}\t{req}\t{int(ok)}\t{reason}'.encode())
+            self.wake.set()
+
+    @survive()
+    def _control(self):
+        while not self.stop.is_set():
             try:item=self.controls.get(timeout=.04)
             except queue.Empty:continue
             generation,req,command,value=item[:4]
