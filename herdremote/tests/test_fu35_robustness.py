@@ -17,8 +17,9 @@ def bridge(tmp_path):
     yield b
     b.close()
 
-def worker(b):
-    t=threading.Thread(target=b._work);t.start();b.threads.append(t)
+def worker(b, fill=True):
+    jobs=b.fill_jobs if fill else b.jobs
+    t=threading.Thread(target=b._work,args=(jobs,));t.start();b.threads.append(t)
 
 def wait_until(condition):
     end=time.monotonic()+3
@@ -37,7 +38,7 @@ def test_slow_fill_retry_does_not_replace_inflight_token(bridge):
         assert entered.wait(1)
         for _ in range(30):request(bridge)
         assert bridge.requests[393] is token
-        assert bridge.jobs.qsize()==0
+        assert bridge.fill_jobs.qsize()==0
     finally:release.set()
     wait_until(lambda:393 not in bridge.requests)
     bridge.scheduler.grant(131072)
@@ -102,8 +103,10 @@ def test_foreground_precedes_fill_and_fill_completes_afterward(bridge):
     order=[]
     def artwork(key,tier):order.append(key);return b'x'*2060
     bridge.artwork=artwork
-    request(bridge,1,'a'*64,4);request(bridge,2,'b'*64,3);worker(bridge)
+    request(bridge,1,'a'*64,4);request(bridge,2,'b'*64,3)
+    worker(bridge)
+    worker(bridge, fill=False)
     wait_until(lambda:not bridge.requests)
-    assert order==['b'*64,'a'*64]
+    assert sorted(order)==['a'*64,'b'*64]
     bridge.scheduler.grant(131072)
     assert [int.from_bytes(bridge.scheduler.next_frame()[1][8:12],'little') for _ in range(2)]==[2,1]

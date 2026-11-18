@@ -245,10 +245,14 @@ def test_art_geometry_cache_and_fallback(setup):
     bridge, jf, rf, state, _ = setup
     key = bridge.library.page('albums', 0, 1)['items'][0]['art']
     for tier, dimension in SIZES.items():
+        prior = len(jf.calls)
         raw = bridge.artwork(key, tier)
-        call = jf.calls[-1]
-        assert call[1] == f'/music/Items/{ALBUM}/Images/Primary'
-        assert call[2]['MaxWidth'] == call[2]['MaxHeight'] == str(dimension)
+        if tier=='XS':
+            assert len(jf.calls) == prior  # Warm M can supply a preview.
+        else:
+            call = jf.calls[-1]
+            assert call[1] == f'/music/Items/{ALBUM}/Images/Primary'
+            assert call[2]['MaxWidth'] == call[2]['MaxHeight'] == str(dimension)
         assert raw[:12] == AAT.pack(0x5441, 8, dimension, dimension, int(tier == 'M'), 0)
         assert len(raw) == 12 + 2 * dimension ** 2
         count = len(jf.calls)

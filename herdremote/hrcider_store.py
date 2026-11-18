@@ -6,6 +6,7 @@ CRC) inventory in SQLite, checks it against the player's count/digest on every
 connect, and re-lists only on a mismatch. Offers are cheap text; the player
 pulls the bytes itself, only while its disk already spins."""
 import struct
+from bisect import bisect_right
 import threading
 import time
 import zlib
@@ -125,7 +126,7 @@ class Planner:
         mine = self.cache.art_crc(key, tier)   # changed render -> push the new one
         return mine is not None and mine != have
 
-    def next(self, n, priority=(), now=None):
+    def next(self, n, priority=(), now=None, keys=None):
         """Up to n (key, tier) pairs the player lacks or holds stale."""
         now = time.monotonic() if now is None else now
         out = []
@@ -140,12 +141,16 @@ class Planner:
                     out.append((key, 'L'))
             while len(out) < n and self.tier < len(FILL_ORDER):
                 tier = FILL_ORDER[self.tier]
-                keys = self.cache.library_arts(self.after, 64)
-                if not keys:
+                if keys is None:
+                    page = self.cache.library_arts(self.after, 64)
+                else:
+                    start = bisect_right(keys, self.after)
+                    page = keys[start:start + 64]
+                if not page:
                     self.tier += 1
                     self.after = ''
                     continue
-                for i, key in enumerate(keys):
+                for key in page:
                     self.after = key
                     if (key, tier) not in self.offered and self.wanted(key, tier):
                         out.append((key, tier))
@@ -156,14 +161,16 @@ class Planner:
         return out
 
 
-    def progress(self, initial=False, capacity=1 << 30, with_generation=False):
+    def progress(self, initial=False, capacity=1 << 30, with_generation=False, keys=None):
         """Completion requires device ACKs with the rendered CRC for every tier.
         Offers, transport-ready and index enumeration are never completion evidence.
         """
         with self.cache.lock:
             generation = self.cache.generation
-            keys = set(self.cache.library_arts(limit=1000000))
-            missing_art = sum(a['art']=='-' for a in self.cache.album_view().rows)
+            missing_art = 0
+            if keys is None:
+                keys = self.cache.library_arts(limit=1000000)
+                missing_art = sum(a['art']=='-' for a in self.cache.album_view().rows)
             rendered = {(k,t):c for k,t,c in self.cache.db.execute('SELECT key,tier,crc FROM art_crc')}
             held = {(bytes(k).hex(),t):c for k,t,c in self.cache.db.execute('SELECT k8,tier,crc FROM ipod_art')}
         total = len(keys) * len(FILL_ORDER)

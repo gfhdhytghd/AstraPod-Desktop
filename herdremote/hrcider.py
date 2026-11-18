@@ -15,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
+from weakref import WeakValueDictionary
 import hrhandoff
 import hrspectrum
 from hrcider_cache import Cache, Index, art_id, canonical_art_url
@@ -794,6 +795,7 @@ class Bridge:
         self.fetch=fetch or urllib.request.urlopen
         self.cache=cache or Cache();self.scheduler=Scheduler();self.lock=threading.RLock()
         self.stop=threading.Event();self.requests={};self.jobs=queue.PriorityQueue(32);self.controls=queue.Queue(16)
+        self.fill_jobs=queue.PriorityQueue(32)
         self.worker_errors=WorkerErrors()
         self.state=None;self.available=False;self.reason='Starting';self.state_seq=0;self.last_state=0
         self.opened=False;self.state_dirty=False;self.library_sent=0;self.wake=threading.Event();self.failures=0;self.templates={};self.generation=0;self.threads=[]
@@ -816,19 +818,30 @@ class Bridge:
         self.volume_delta=0;self.volume_set=None;self.volume_wake=threading.Event()
         self.volume_refresh=False
         self.pages=queue.Queue(1);self.page_token=0
-        self.art_locks=[threading.RLock() for _ in range(32)]
+        self.art_locks=WeakValueDictionary()
+        self.art_locks_mutex=threading.Lock()
         self.prefetch=queue.Queue(10)
         self.warm_window=set();self.warm_queue=set();self.warm_jobs={};self.neighbors=None
         self.capabilities=frozenset();self.loading=Loading()
         self.client.rpc_observer=self._rpc_event
         self.ledger=Ledger(self.cache);self.planner=Planner(self.cache,self.ledger);self.offer_pairs=set();self.art_times={};self.progress_at=0;self.store_capacity=1<<30;self.inventory_pages=0
+        self.rufin_catalog=None
         self.live_pending=None;self.live_next=0.;self.reopen_reason=None
         self.handoff = hrhandoff.Controller(self._handoff_player, self._handoff_pin)
         self.spectrum = hrspectrum.Spectrum()
     def start(self):
         starter = getattr(self.client, 'start', None)
         if starter: starter()
-        for target,name in [(self._prefetch_worker,'cider-prefetch-'+str(i)) for i in range(4)]+[(self._poll,'cider-state'),(self._work,'cider-art'),(self._control,'cider-control'),(self._volume_worker,'remote-volume'),(self._index,'cider-index'),(self._pages,'cider-pages'),(self._lyrics_prefetch,'cider-lyrics'),(self._neighbors,'cider-neighbors')]:
+        workers = [(self._prefetch_worker,'cider-prefetch-'+str(i)) for i in range(4)]
+        workers += [(self._work,'cider-art'),(self._work,'cider-art-2'),
+                    (lambda: self._work(self.fill_jobs),'cider-fill'),
+                    (self._poll,'cider-state'),(self._control,'cider-control'),
+                    (self._volume_worker,'remote-volume'),(self._index,'cider-index'),
+                    (self._pages,'cider-pages'),(self._lyrics_prefetch,'cider-lyrics'),
+                    (self._neighbors,'cider-neighbors')]
+        if self.rufin is not None:
+            workers.append((self._rufin_inventory,'rufin-inventory'))
+        for target,name in workers:
             t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
         if self.realtime:
             for target,name in [(self._event_worker,'cider-events'),(self._stream_worker,'cider-stream')]:
@@ -912,7 +925,8 @@ class Bridge:
                     req=int(fields[2])
                     if req==0:
                         self.requests.clear();self._drop_jobs()
-                        for r in list(self.scheduler.live):self.scheduler.cancel(r)
+                        for r in {item[6] for item in self.scheduler.heap if item[4]==3}:
+                            self.scheduler.cancel(r)
                     else:self.requests.pop(req,None);self.scheduler.cancel(req);self._drop_jobs(req)
                 elif name=='cc' and len(fields)==5:
                     req=int(fields[2])
@@ -947,7 +961,8 @@ class Bridge:
                         return True
                     self.scheduler.cancel(req);self._drop_jobs(req)
                     token=object();self.requests[req]=token
-                    self.jobs.put_nowait((priority,distance,time.monotonic_ns(),self.generation,req,key,tier,offset,token))
+                    jobs=self.fill_jobs if priority==4 else self.jobs
+                    jobs.put_nowait((priority,distance,time.monotonic_ns(),self.generation,req,key,tier,offset,token))
                     self.art_times[req]=(time.monotonic(),key,tier,0)
                     while len(self.art_times)>128:self.art_times.pop(next(iter(self.art_times)))
                     log.info('art request gen=%d req=%d tier=%s offset=%d distance=%d credit=%d store_miss=%s fill=%s',self.generation,req,tier,offset,distance,self.scheduler.credit,miss,priority==4)
@@ -961,8 +976,10 @@ class Bridge:
                         return True
                     self.scheduler.cancel(req);self._drop_jobs(req)
                     token=object();self.requests[req]=token
-                    self.jobs.put_nowait((3,0,time.monotonic_ns(),self.generation,req,tuple(keys),'XS',0,token))
+                    self.jobs.put_nowait((2,0,time.monotonic_ns(),self.generation,req,tuple(keys),'XS',0,token))
                     self.art_times[req]=(time.monotonic(),','.join(keys),'XS',0)
+                    while len(self.art_times)>128:self.art_times.pop(next(iter(self.art_times)))
+                    log.info('art batch gen=%d req=%d tier=XS count=%d',self.generation,req,len(keys))
                 elif name=='cp' and len(fields)==7:
                     req=int(fields[2]);page=self.cache.page(fields[3],int(fields[4]),int(fields[5]),stale=not self.available or self.index.initial or self.index.force)
                     self.scheduler.push(2,2,page_frame(self.generation,req,page),req,bulk=True)
@@ -1030,15 +1047,17 @@ class Bridge:
             urgent=[]
             if self.state and self.state.get('art') not in (None,'-'):urgent.append(self.state['art'])
             if self.neighbors:urgent.extend(k for k in self.neighbors[2:] if k!='-')
-            pairs=self.planner.next(n,urgent)
+            keys=self._rufin_catalog_keys()
+            pairs=self.planner.next(n,urgent,keys=keys)
             log.info('localstore offers gen=%d count=%d bytes=%d',gen,len(pairs),sum(12+SIZES[t]**2*2 for _,t in pairs))
             for record in offer_records(gen,pairs):self.scheduler.push(4,2,record)
             self.offer_pairs=set(pairs)|set(list(self.offer_pairs)[-8:])
             self._schedule_warm()
     def _drop_jobs(self,request=None):
-        with self.jobs.mutex:
-            self.jobs.queue=[v for v in self.jobs.queue if request is not None and v[4]!=request]
-            heapq.heapify(self.jobs.queue)
+        for jobs in (self.jobs, self.fill_jobs):
+            with jobs.mutex:
+                jobs.queue=[v for v in jobs.queue if request is not None and v[4]!=request]
+                heapq.heapify(jobs.queue)
 
     def remote_name(self):
         return 'Rufin' if self.rufin is not None and self.client is self.rufin else 'Cider'
@@ -1059,13 +1078,15 @@ class Bridge:
         self.library.lyrics.select('')
         library.lyrics.select('')
         self.client=client;self.library=library;self.remote_epoch+=1
+        self.rufin_catalog=None
+        self.planner.reset();self.offer_pairs.clear();self.progress_at=0
         self.seek_refresh=None
         self.switch_deferred=False;self.failures=0;self.neighbors=None;self.warm_queue.clear()
         self.loading.cancel();self.fill_cancel.set()
         self.page_token+=1
         try:self.pages.get_nowait()
         except queue.Empty:pass
-        self.scheduler.heap=[v for v in self.scheduler.heap if v[5][:3]!=b'CL\t'];heapq.heapify(self.scheduler.heap)
+        self.scheduler.heap=[v for v in self.scheduler.heap if v[5][:3] not in (b'CL\t',b'CO\t',b'CB\t')];heapq.heapify(self.scheduler.heap)
         log.info('remote switch from=%s to=%s reason=%s epoch=%d',before,self.remote_name(),clean(reason,80),self.remote_epoch)
         self._announce_remote();self.wake.set()
     def _handoff_player(self):
@@ -1110,6 +1131,55 @@ class Bridge:
                 else:self._switch_remote(self.rufin,self.rufin_library,'Home row entered' if home and busy else 'Rufin available')
     def _rufin_active(self):
         return self.rufin is not None and self.client is self.rufin
+
+    def _rufin_catalog_keys(self):
+        if not self._rufin_active():
+            return None  # Use the indexed Cider library.
+        catalog=self.rufin_catalog
+        if catalog is not None and catalog[0]==self.rufin_library.generation:
+            return catalog[1]
+        return ()
+
+    @survive()
+    def _rufin_inventory(self):
+        """Enumerate artwork from the same Rufin album route that the iPod sees."""
+        scan=None
+        offset=0
+        keys=set()
+        while not self.stop.wait(.25):
+            with self.lock:
+                if not self.opened or not self.available or not self._rufin_active() or 'localstore' not in self.capabilities:
+                    continue
+                library=self.rufin_library
+                identity=(self.remote_epoch, library.generation)
+                if self.rufin_catalog is not None and self.rufin_catalog[0]==identity[1]:
+                    continue
+            if identity!=scan:
+                scan=identity
+                offset=0
+                keys.clear()
+            try:
+                page=library.page('albums',offset,50)
+            except (OSError, ValueError, TimeoutError):
+                self.stop.wait(2)
+                continue
+            if page['generation']!=identity[1] or page['stale'] or page['offset']!=offset:
+                scan=None
+                continue
+            rows=page['items']
+            if not rows and offset<page['total']:
+                scan=None
+                self.stop.wait(2)
+                continue
+            keys.update(row['art'] for row in rows if row.get('art') not in (None,'-'))
+            offset+=len(rows)
+            if offset>=page['total']:
+                with self.lock:
+                    if self._rufin_active() and identity==(self.remote_epoch, library.generation):
+                        self.rufin_catalog=(identity[1],tuple(sorted(keys)))
+                        self.planner.reset();self.progress_at=0
+                        log.info('Rufin localstore catalog albums=%d artwork=%d',offset,len(keys))
+                scan=None
     def _state(self,force=False):
         self.state_dirty=True
         if not self.opened:return
@@ -1442,7 +1512,11 @@ class Bridge:
                 if generation==self.generation and self.opened:self.scheduler.push(0,2,f'CK\t{generation}\t{req}\t{int(ok)}\t{text}'.encode())
     def artwork(self,key,tier):
         # One CDN download per key even when a visible request joins prefetch.
-        lock=self.art_locks[int(key[:2],16)%len(self.art_locks)]
+        with self.art_locks_mutex:
+            lock=self.art_locks.get(key)
+            if lock is None:
+                lock=threading.Lock()
+                self.art_locks[key]=lock
         if not lock.acquire(timeout=2):raise TimeoutError('Artwork busy')
         try:
             return self._artwork(key,tier)
@@ -1453,17 +1527,31 @@ class Bridge:
         if cached is not None and len(cached)==12+SIZES[tier]**2*2 and cached[:12]==expected:return cached
         raw=self.cache.get_art(key,'original')
         if raw is None:
+            if tier=='XS':
+                # A warm M cover already contains the whole image. Its native
+                # pixels are column-major, so undo the transpose before resizing.
+                medium=self.cache.get_art(key,'M')
+                if medium is not None and len(medium)==32780 and medium[:12]==AAT.pack(0x5441,8,128,128,1,0):
+                    from PIL import Image
+                    image=Image.frombytes('RGB',(128,128),medium[12:],'raw','BGR;16')
+                    png=io.BytesIO()
+                    image.transpose(Image.Transpose.TRANSPOSE).save(png,'PNG')
+                    result=render(png.getvalue(),tier)
+                    self.cache.put_art(key,tier,result)
+                    return result
             template=self.templates.get(key) or self.cache.template(key) or (self.rufin_library.template(key) if self.rufin_library else None)
             if not template:raise ValueError('Unknown artwork id')
-            if template.startswith('jellyfin:') and self.jellyfin_library is not None:
+            if template.startswith('jellyfin:'):
+                if self.jellyfin_library is None:raise ValueError('Jellyfin artwork source unavailable')
                 artwork,cacheable=self.jellyfin_library.artwork(template,SIZES[tier])
                 pixels=render(artwork,tier)
                 if cacheable:self.cache.put_art(key,tier,pixels)
                 return pixels
-        if raw is None and template.startswith('rufin:'):
+        rufin_uri = self._rufin_art_uri(template) if raw is None else None
+        if rufin_uri is not None:
             if self.rufin is None:raise ValueError('Unknown artwork id')
             # Rufin's own cover endpoint on the verified loopback port.
-            raw=self.rufin.artwork(template[6:])
+            raw=self.rufin.artwork(rufin_uri)
             from PIL import Image
             with Image.open(io.BytesIO(raw)) as image:
                 if image.width>240 or image.height>240:raise ValueError('Artwork exceeded cap')
@@ -1479,6 +1567,17 @@ class Bridge:
             self.cache.put_art(key,'original',raw)
         result=render(raw,tier);self.cache.put_art(key,tier,result)
         return result
+
+    @staticmethod
+    def _rufin_art_uri(template):
+        uri=template.removeprefix('rufin:')
+        parts=urllib.parse.urlsplit(uri)
+        if (parts.scheme in ('http','https') and parts.hostname in ('127.0.0.1','localhost','::1')
+                and parts.path=='/api/artwork'):
+            uris=urllib.parse.parse_qs(parts.query).get('uri', [])
+            if len(uris)!=1 or len(uris[0])>4096:raise ValueError('Invalid Rufin artwork URI')
+            return uris[0]
+        return uri if uri!=template else None
     def _schedule_warm(self):
         desired=self.warm_window|self.warm_queue|self.offer_pairs
         while True:
@@ -1488,7 +1587,7 @@ class Bridge:
             except queue.Empty:break
         for pair in list(self.warm_jobs):
             if pair not in desired:self.warm_jobs.pop(pair,None)
-        for pair in sorted(desired):
+        for pair in sorted(desired,key=lambda pair:(pair not in self.warm_window,pair)):
             if pair not in self.warm_jobs:
                 try:self.prefetch.put_nowait((self.generation,pair))
                 except queue.Full:break  # bounded background work, retried next window
@@ -1559,9 +1658,10 @@ class Bridge:
                     self.worker_errors.note('_neighbors',error)
             self.stop.wait(1)
     @survive()
-    def _work(self):
+    def _work(self,jobs=None):
+        if jobs is None:jobs=self.jobs
         while not self.stop.is_set():
-            try:priority,distance,order,generation,req,key,tier,offset,token=self.jobs.get(timeout=.2)
+            try:priority,distance,order,generation,req,key,tier,offset,token=jobs.get(timeout=.2)
             except queue.Empty:continue
             started=time.monotonic()
             with self.lock:
@@ -1569,11 +1669,16 @@ class Bridge:
             try:
                 if isinstance(key,tuple):
                     items=[]
+                    completed=True
                     for item in key:
                         with self.lock:
-                            if generation!=self.generation or self.requests.get(req) is not token:break
-                        items.append((item,self.artwork(item,'XS')))
-                    if len(items)!=len(key):continue
+                            if generation!=self.generation or self.requests.get(req) is not token:
+                                completed=False
+                                break
+                        try:items.append((item,self.artwork(item,'XS')))
+                        except (OSError,ValueError,TimeoutError) as error:
+                            log.info('art preview unavailable gen=%d req=%d reason=%s',generation,req,clean(error,120))
+                    if not completed:continue
                     raw=pack_xs(generation,req,items)
                 else:raw=self.artwork(key,tier)
             except Exception as error:
@@ -1622,7 +1727,13 @@ class Bridge:
                 self.live_pending=(nonce,now);self.live_next=now+1.0
             if 'localdiag' in self.capabilities and time.monotonic()-self.progress_at>=5:
                 self.progress_at=time.monotonic()
-                done,total,status,revision=self.planner.progress(initial=self.index.initial or self.index.force,capacity=self.store_capacity,with_generation=True)
+                keys=self._rufin_catalog_keys()
+                rufin=keys is not None
+                initial=(self.rufin_catalog is None or self.rufin_catalog[0]!=self.rufin_library.generation
+                         if rufin else self.index.initial or self.index.force)
+                done,total,status,revision=self.planner.progress(initial=initial,capacity=self.store_capacity,
+                                                                 with_generation=True,keys=keys)
+                revision=self.wire_library_generation(self.rufin_library.generation) if rufin else self.wire_library_generation(revision)
                 self.scheduler.push(4,2,f'CB\t{self.generation}\t{revision}\t{done}\t{total}\t{status}'.encode())
                 log.info('localstore build progress gen=%d library=%d done=%d total=%d state=%d inventory_pages=%d',self.generation,revision,done,total,status,self.inventory_pages)
             library=self.wire_library_generation()

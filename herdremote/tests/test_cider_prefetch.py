@@ -155,3 +155,52 @@ class Prefetch(unittest.TestCase):
         deadline=time.monotonic()+2
         while len(calls)<2 and time.monotonic()<deadline:time.sleep(.005)
         self.assertEqual(calls,[keys[0],chosen])
+
+    def test_rufin_preview_origin_and_loopback_skip_cdn_size_rewrite(self):
+        self.bridge.rufin=Mock()
+        self.bridge.rufin.artwork.return_value=self.raw
+        self.bridge.fetch=Mock(side_effect=AssertionError('Rufin cover routed as CDN'))
+        pairs = [('rufin:rufin:source/album/fixture','rufin:source/album/fixture'),
+                 ('http://127.0.0.1:49241/api/artwork?uri=rufin%3Asource%2Falbum%2Ffixture&size=240',
+                  'rufin:source/album/fixture')]
+        for template, uri in pairs:
+            key=hrcider.art_id(template)
+            self.bridge.templates[key]=template
+            self.assertEqual(self.bridge.artwork(key,'XS'),hrcider.render(self.raw,'XS'))
+            self.bridge.rufin.artwork.assert_called_with(uri)
+            self.assertEqual(self.bridge.artwork(key,'M'),hrcider.render(self.raw,'M'))
+        self.assertEqual(self.bridge.rufin.artwork.call_count,2)
+        self.bridge.fetch.assert_not_called()
+
+    def test_missing_preview_and_running_fill_leave_visible_previews_available(self):
+        fill, missing, visible = ('a'*64,'b'*64,'c'*64)
+        blocked, release = threading.Event(), threading.Event()
+        xs=hrcider.render(self.raw,'XS')
+        def artwork(key,tier):
+            if key == fill:
+                blocked.set()
+                self.assertTrue(release.wait(3))
+                return hrcider.render(self.raw,tier)
+            if key == missing:
+                raise ValueError('Artwork unavailable')
+            return xs
+        self.bridge.artwork=artwork
+        self.bridge.scheduler.reset(7, 131072)
+        self.bridge.scheduler.grant(131072)
+        for work in (self.bridge._work, lambda: self.bridge._work(self.bridge.fill_jobs)):
+            worker=threading.Thread(target=work)
+            worker.start()
+            self.bridge.threads.append(worker)
+        self.bridge.command(f'cr\t7\t1\t{fill}\tM\t0\t4\t0'.encode())
+        try:
+            self.assertTrue(blocked.wait(1))
+            self.bridge.command(f'cb\t7\t2\t{missing},{visible}'.encode())
+            deadline=time.monotonic()+1
+            frame=None
+            while frame is None and time.monotonic()<deadline:
+                frame=self.bridge.scheduler.next_frame()
+                if frame is None: time.sleep(.005)
+            self.assertIsNotNone(frame)
+            self.assertEqual(hrcider.unpack_xs(frame[1]),(7,2,[(visible,xs)]))
+        finally:
+            release.set()

@@ -169,7 +169,8 @@ class BridgeTests(Base):
         self.connect();self.bridge.ledger.synced=True
         key=self.ids[1];self.cache.put_art(key,'M',native('M',4))
         req=f'cr\t{self.gen}\t5\t{key}\tM\t0\t4\t0'.encode()
-        self.bridge.command(req);self.assertEqual(len(self.bridge.jobs.queue),1);self.assertEqual(self.bridge.jobs.queue[0][0],4)
+        self.bridge.command(req);self.assertEqual(len(self.bridge.fill_jobs.queue),1);self.assertEqual(self.bridge.fill_jobs.queue[0][0],4)
+        self.assertTrue(self.bridge.jobs.empty())
 
 
     def test_fu30_capabilities_diagnostics_and_art_ack_info_logs(self):
