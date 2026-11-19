@@ -136,7 +136,7 @@ scripts, not this worktree. Keep the existing virtual environments, other
 runtime siblings, voice settings and units.
 
 ```sh
-src=/home/wilf/data/PodJS/podbox.wt-disk
+src=<repo>
 hr="$HOME/.local/share/podbox-herdremote/tools/herdremote"
 ir="$HOME/.local/share/podbox-usbkey"
 install -m 644 "$src/tools/herdremote/herdremote.py" "$src/tools/herdremote/hrdisk.py" "$src/tools/herdremote/hrfallback.py" "$hr/"

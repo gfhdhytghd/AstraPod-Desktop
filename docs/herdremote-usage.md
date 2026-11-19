@@ -7,7 +7,7 @@ Updated for Amendments 1–5 and corrected Amendment 8 on 2026-11-04. The implem
 ## Omarchy reference and chosen interfaces
 
 The supplied reference is **origin/quattro**, commit `cc9976409`, from
-`/home/wilf/data/PodJS/ipod/evidence/omarchy-usage-ref/`. The four
+`<workspace>/evidence/omarchy-usage-ref/`. The four
 `bin/omarchy-agent-usage-{codex,claude,grok,agy}` scripts were read, together
 with `docs/agent-usage-collectors.md` and `shell/plugins/agents/collectors.py`.
 `Main.qml:241` builds `omarchy-agent-usage-update` commands; `refreshLimits()`
@@ -291,7 +291,7 @@ The dump starts the background collectors, waits up to the chosen budget for
 indexing, prints one final protocol frame, and exits. It never constructs the
 herdr daemon or probes serial devices. Tests mock every HTTP, keyring, and live
 RPC request. pty integration uses a private fake herdr and fake iPod. See
-`/home/wilf/data/PodJS/ipod/AGENTS-USAGE-BACKEND.md` for the real output,
+`<workspace>/AGENTS-USAGE-BACKEND.md` for the real output,
 measurements, Omarchy-source comparison, and remaining upstream omissions.
 
 ## Disk Mode control (FU42)
