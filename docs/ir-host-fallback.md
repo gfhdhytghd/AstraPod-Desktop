@@ -65,7 +65,7 @@ Usage semantics with Detail's pane-focus behavior.
 ## Mode definition and arbitration
 
 The bridge polls every 100 ms. EP0 health is a fresh USB GET_CONFIGURATION on
-the verified Astra device. Failed transfers dispose the handle and back off
+the verified AstraPod device. Failed transfers dispose the handle and back off
 500 ms. Absence, unplug and transfer errors count as unavailable. In parallel,
 HerdRemote reports its currently open PodLink session. Disk Mode is unavailable
 for this purpose, even if EP0 itself responds. Disk presence uses EP0 status,
