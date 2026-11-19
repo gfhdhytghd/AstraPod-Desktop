@@ -15,7 +15,7 @@
   └ Read SKILL.md (ste skill)
     + Show details
 
-• Ran sed -n '/^## 2/,/^## 6/p' /home/wilf/.codex/skills/ste/references/terminology.md
+• Ran sed -n '/^## 2/,/^## 6/p' /home/user/.codex/skills/ste/references/terminology.md
   └ | 推荐 | 选项列表中 Agent 推荐的一项 | 建议选择、首选 |
 
     ## 6. 标点与混排

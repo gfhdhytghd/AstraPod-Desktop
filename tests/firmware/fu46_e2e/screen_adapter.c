@@ -7,7 +7,7 @@ extern int bridge_action(int *raw, int *held);
 extern void bridge_advance(int ticks);
 static int raw_button, held_button;
 static struct viewport test_vp = {.width=320,.height=210,.font=FONT_UI};
-static struct viewport *test_current_vp=&test_vp;
+struct viewport *lcd_current_viewport = &test_vp;
 static struct font test_font={.height=14};
 static int metric(const unsigned char *s,int *w,int *h){int n=0;for(;*s;s++)if((*s&0xc0)!=0x80)n+=*s>=0xe0?14:7;if(w)*w=n;if(h)*h=14;return n;}
 static void nothing(void){}
@@ -18,7 +18,7 @@ static void point(int x,int y){(void)x;(void)y;}
 static void line(int a,int b,int c){(void)a;(void)b;(void)c;}
 static void puts_at(int x,int y,const unsigned char*s){(void)x;(void)y;CHECK(s);(void)strlen((const char*)s);}
 static void alpha(const unsigned char*s,int a,int b,int c,int d,int e,int f,int g){CHECK(s);(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;}
-static struct viewport *setvp(struct viewport*v){struct viewport*old=test_current_vp;test_current_vp=v?v:&test_vp;return old;}
+static struct viewport *setvp(struct viewport*v){struct viewport*old=lcd_current_viewport;lcd_current_viewport=v?v:&test_vp;return old;}
 struct screen screens[NB_SCREENS]={{.lcdwidth=320,.lcdheight=240,.depth=16,.is_color=true,
  .set_viewport=setvp,.getstringsize=metric,.set_foreground=colour,.set_background=colour,.set_drawmode=mode,
  .clear_viewport=nothing,.update_viewport=nothing,.update_viewport_rect=rect,.drawrect=rect,.fillrect=rect,
@@ -52,6 +52,94 @@ void gui_synclist_draw(struct gui_synclist*l){char buf[256];CHECK(l->callback_ge
  if(l->callback_draw_status)l->callback_draw_status(i,l->data,&screens[0],&test_vp);
  }if(l->callback_speak_item&&l->nb_items)l->callback_speak_item(l->selected_item,l->data);}
 void gui_synclist_draw_status(struct gui_synclist*l){gui_synclist_draw(l);}
+
+#ifdef PODBOX_UI_SCENE_H
+/* This fixture advances actions directly. SDL checks scene composition. */
+bool ui_scene_capture(struct ui_scene *scene, const void *from, const void *to, bool push)
+{
+    (void)scene; (void)from; (void)to; (void)push;
+    return false;
+}
+
+bool ui_scene_capture_pan(struct ui_scene *scene, const void *from, const void *to,
+                          int direction, int top)
+{
+    (void)direction; (void)top;
+    return ui_scene_capture(scene, from, to, false);
+}
+
+bool ui_scene_automatic(void) { return false; }
+void ui_scene_interrupt(void) {}
+void ui_scene_start(struct ui_scene *scene) { (void)scene; }
+void ui_scene_update(struct ui_scene *scene, bool changed) { (void)scene; (void)changed; }
+int ui_scene_timeout(const struct ui_scene *scene, int timeout) { (void)scene; return timeout; }
+void ui_scene_cancel(struct ui_scene *scene) { memset(scene, 0, sizeof(*scene)); }
+
+static bool dirty[NB_SCREENS], flush_inhibited;
+void ui_mark_dirty_rect(enum screen_type screen, int x, int y, int w, int h)
+{
+    (void)x; (void)y;
+    CHECK(w >= 0 && h >= 0);
+    if (w && h)
+        dirty[screen] = true;
+}
+
+bool ui_take_dirty(enum screen_type screen)
+{
+    bool pending = dirty[screen];
+    dirty[screen] = false;
+    return pending;
+}
+
+void ui_inhibit_flush(bool inhibit) { flush_inhibited = inhibit; }
+bool ui_flush_inhibited(void) { return flush_inhibited; }
+void ui_flush_dirty(void)
+{
+    if (!flush_inhibited)
+        memset(dirty, 0, sizeof(dirty));
+}
+
+void sb_update(enum screen_type screen, bool force) { (void)screen; (void)force; }
+void crumb(enum crumb_id id, uint32_t value) { (void)id; (void)value; }
+void gui_synclist_scroll_stop(struct gui_synclist *list) { (void)list; }
+bool gui_synclist_paint_background(const struct gui_synclist *list,
+                                  const struct viewport *region)
+{
+    CHECK(list && region->width >= 0 && region->height >= 0);
+    return true;
+}
+
+void ui_theme_snapshot(struct ui_theme *theme) { ui_theme_builtin(theme, false); }
+unsigned ui_theme_rgb565(enum ui_color_role role)
+{
+    uint32_t rgb = ui_theme_color(NULL, role, NULL);
+    return LCD_RGBPACK(rgb >> 16, (rgb >> 8) & 255, rgb & 255);
+}
+
+int font_getstringnsize(const unsigned char *s, size_t bytes, int *w, int *h, int font)
+{
+    (void)font;
+    int width = 0;
+    for (size_t i = 0; i < bytes && s[i]; i++)
+        if ((s[i] & 0xc0) != 0x80)
+            width += s[i] >= 0xe0 ? 14 : 7;
+    if (w) *w = width;
+    if (h) *h = 14;
+    return width;
+}
+
+int font_run_next(struct font *font, struct font_run *run, ucschar_t ch,
+                  struct font_glyph *glyph)
+{
+    int width = font_get_width(font, ch);
+    if (glyph)
+        *glyph = (struct font_glyph){.origin = run->pen, .x = run->pen / 64,
+                                     .width = width, .height = font->height};
+    run->pen += width * 64;
+    return run->pen / 64;
+}
+#endif
+
 #ifndef FU46_REAL_ACTION
 int get_action(int context,int timeout){(void)context;(void)timeout;return bridge_action(&raw_button,&held_button);}
 int get_action_statuscode(int *raw){if(raw)*raw=raw_button;return (raw_button&BUTTON_REPEAT)?ACTION_REPEAT:0;}
@@ -105,5 +193,5 @@ int screen_test_home_double(void){
 }
 
 #ifdef FU46_REAL_ACTION
-#include "/home/wilf/data/PodJS/podbox.wt-disk/tools/tests/fu46_e2e/action_adapter.c"
+#include "action_adapter.c"
 #endif

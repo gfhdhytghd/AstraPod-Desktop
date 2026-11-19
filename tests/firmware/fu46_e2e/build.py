@@ -28,7 +28,15 @@ def precompile(name,src):
  subprocess.run(cmd+['-E',str(source),'-o',str(o/(name+'.i'))],check=True)
  subprocess.run(flags+['-c',str(o/(name+'.i')),'-o',str(o/(name+'.o'))],check=True)
  return str(o/(name+'.o'))
-objs=[precompile('screen','#include '+json.dumps(str(r/'apps-ipod/screens/system/agents_screen.c'))+'\n'+(R/'tools/tests/fu46_e2e/screen_adapter.c').read_text())]
+screen = r/'apps-ipod/screens/system/agents_screen.c'
+adapter = R/'tools/tests/fu46_e2e/screen_adapter.c'
+objs = [precompile('screen', f'#include {json.dumps(str(screen))}\n'
+                            f'#include {json.dumps(str(adapter))}\n')]
+for name, path in [('color', 'apps-ipod/draw/color.c'),
+                   ('theme', 'apps-ipod/ui/native_theme.c')]:
+ source = r/path
+ if source.is_file():
+  objs.append(precompile(name, '#include '+json.dumps(str(source))))
 for name,path in [('detail','apps-ipod/screens/system/detail_layout.c'),('nav','apps-ipod/input/agents_shortcut.c'),('remote','apps-ipod/input/agents_remote.c'),('wrap','apps-ipod/draw/text_wrap.c'),('unicode','firmware/common/unicode.c'),('diacritic','firmware/common/diacritic.c'),('dialog','apps-ipod/widgets/dialog.c')]:
  objs.append(precompile(name,'#include '+json.dumps(str(r/path))))
 # Fixture controller includes resolve production transport from source-root.

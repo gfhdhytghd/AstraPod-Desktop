@@ -94,6 +94,10 @@ class Detection(unittest.TestCase):
         q = self.q("codex-resume-choice.txt")
         self.assertEqual(len(q["options"]), 4)
         self.assertEqual(q["lines"][0], "Working directory · resume")
+        self.assertEqual(q["options"][:2], [
+            (1, "Use session directory (/home/user/data/viewflow-wt/headlessws)"),
+            (2, "Use current directory (/home/user/data/Hackathon)"),
+        ])
 
     def test_codex_question_queued_then_open(self):
         q = self.q("codex-question2-a.txt")

@@ -36,5 +36,5 @@
 
 › Ask Codex to do anything
 
-  GPT-6.1-Sol medium · /tmp/claude-1000/-home-wilf-data-PodJS-podbox-wt-herdr/f8880791-6aa7-4335-baad-1c7a95ca0be1/scr…
+  GPT-6.1-Sol medium · /tmp/claude-1000/-home-user-data-PodJS-podbox-wt-herdr/f8880791-6aa7-4335-baad-1c7a95ca0be1/scr…
   ← for agents · ? for shortcuts                                                             ⚠ 2 warnings · f2 to view

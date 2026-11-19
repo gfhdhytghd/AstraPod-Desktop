@@ -1,7 +1,7 @@
 
  ▐▛███▛█   Claude Code v2.1.316
 ▝▜██████▀  Haiku 5.5 · Claude Team
- ▝▝   ▝▝   /…/-home-wilf-data-PodJS-podbox-wt-herdr/f8880791-6aa7-4335-baad-1c7a95ca0be1/scratchpad/cwd-claude
+ ▝▝   ▝▝   /…/-home-user-data-PodJS-podbox-wt-herdr/f8880791-6aa7-4335-baad-1c7a95ca0be1/scratchpad/cwd-claude
 
 
 ❯ This is a UI test. Call the AskUserQuestion tool exactly once with one question: '你想用哪种颜色? Which colour?'
