@@ -305,9 +305,12 @@ class JellyfinLibrary(RufinLibrary):
             artwork = self.jellyfin_art(session, 'album', ident, tag) if isinstance(tag, str) and tag else '-'
             subtitle = [value.get('AlbumArtist')]
             genres = value.get('Genres')
-            if isinstance(genres, list):
+            if display != 'panel' and isinstance(genres, list):
                 subtitle.extend(genres)
-            return dict(row(title, self.token_route('album', page), 'album', id=ident),
+            path = self.token_route('album', page)
+            if display == 'panel':
+                path += '?format=panel'
+            return dict(row(title, path, 'album', id=ident),
                         art=artwork, subtitle=' · '.join(s for s in subtitle if isinstance(s, str) and s),
                         year=year, duration=ms, count=number(value.get('SongCount')) or number(value.get('ChildCount')))
         if kind == 'Audio':
@@ -321,10 +324,10 @@ class JellyfinLibrary(RufinLibrary):
                 artwork = self.jellyfin_art(session, 'album', album_id, album_tag)
             elif isinstance(tag, str) and tag:
                 artwork = self.jellyfin_art(session, 'track', ident, tag)
-            if album_tracks and number(value.get('IndexNumber')):
+            if display != 'panel' and album_tracks and number(value.get('IndexNumber')):
                 disc = number(value.get('ParentIndexNumber')) or 1
                 title = f"{disc}.{value['IndexNumber']:02d} {title}"
-            if (album_tracks or display == 'duration') and ticks:
+            if display != 'panel' and (album_tracks or display == 'duration') and ticks:
                 title += f' - {ms // 60000:02}:{ms // 1000 % 60:02}'
             if display == 'rating' and session.user:
                 user_data = value.get('UserData')
