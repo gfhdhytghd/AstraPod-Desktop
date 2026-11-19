@@ -4,9 +4,7 @@ Mutations are explicit controls, never page reads. No local music file access.
 import json
 import re
 import urllib.parse
-import xml.etree.ElementTree as ET
-from decimal import Decimal
-from hrlyrics import lyrics_rows, millis
+from hrlyrics import lyric_lines, source_rows, millis
 
 
 def data(reply):
@@ -17,83 +15,6 @@ def text(value):
     if isinstance(value, (list, dict)):
         return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
     return str(value or '')
-
-
-def lyric_sources(reply):
-    value = data(reply)
-    if isinstance(value, list):
-        for item in value:
-            yield from lyric_sources(item)
-    elif isinstance(value, dict):
-        for key in ('ttml', 'lyrics', 'text', 'content'):
-            if value.get(key):
-                yield from lyric_sources(value[key])
-                return
-        if isinstance(value.get('attributes'), dict):
-            yield from lyric_sources(value['attributes'])
-    elif isinstance(value, str):
-        yield value
-
-
-def ttml_time(value):
-    """Apple lyrics use absolute media times, with optional hour fields."""
-    if not value or len(value) > 20:
-        return None
-    clock = re.fullmatch(r'(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)(ms|s)?', value, re.ASCII)
-    if not clock:
-        return None
-    hours, minutes, seconds, unit = clock.groups()
-    if hours is not None and minutes is None:
-        hours, minutes = None, hours
-    if unit and minutes is not None:
-        return None
-    return int(Decimal(seconds) * (1 if unit == 'ms' else 1000)) + (
-        int(hours or 0) * 3600 + int(minutes or 0) * 60) * 1000
-
-
-def ttml_line(p):
-    parts, cues = [], []
-    pos = 0
-
-    def append(text):
-        nonlocal pos
-        if text:
-            parts.append(text)
-            pos += len(text.encode('utf-8'))
-
-    def inline(node, depth):
-        first = pos
-        append(node.text)
-        count = len(cues)
-        for child in node:
-            # Excess nesting has no effect on timing and stays plain text.
-            if depth < 16:
-                inline(child, depth + 1)
-            else:
-                append(''.join(child.itertext()))
-            append(child.tail)
-        begin = ttml_time(node.get('begin'))
-        if depth and begin is not None and pos > first and len(cues) == count:
-            cues.append((begin, ttml_time(node.get('end')), first, pos))
-
-    inline(p, 0)
-    return ''.join(parts), ttml_time(p.get('begin')), ttml_time(p.get('end')), cues
-
-
-def lyric_lines(reply):
-    for source in lyric_sources(reply):
-        if not source.lstrip().startswith('<'):
-            yield from ((line, None, None, []) for line in source.splitlines())
-            continue
-        if '<!DOCTYPE' in source or '<!ENTITY' in source:
-            continue
-        try:
-            tree = ET.fromstring(source)
-        except ET.ParseError:
-            continue
-        for p in tree.iter():
-            if p.tag.rsplit('}', 1)[-1] == 'p':
-                yield ttml_line(p)
 
 
 def lyrics_text(reply):
@@ -112,7 +33,7 @@ def timed_lyrics(client, expected):
     reply = client.request('/api/v1/lyrics/' + urllib.parse.quote(expected, safe=''))
     if track(client.now_playing()) != expected:
         return None
-    return lyrics_rows(lyric_lines(reply), 0, millis(before.get('durationInMillis')) or 0, row)
+    return source_rows(reply, 0, millis(before.get('durationInMillis')) or 0, row)
 
 
 def quality_text(quality):

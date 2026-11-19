@@ -1801,7 +1801,7 @@ def native_page_frame(generation,request,page):
     for item in page['items']:
         fields=[item.get(k,'') for k in ('id','title','subtitle','art','duration','count','kind','route','bg','year')]
         values=[clean(v,380 if i==7 else 120) for i,v in enumerate(fields)]
-        if fields[0] in ('lrc1', 'lrc1+') and page.get('_lyrics_v1'):
+        if fields[0] in ('lrc1', 'lrc1+', 'ttml2', 'ttml2+') and page.get('_lyrics_v1'):
             # A fragment boundary can fall on a space. Preserve it verbatim.
             from hrlyrics import safe_text
             values[1]=safe_text(fields[1]).encode()[:120].decode('utf-8','ignore')

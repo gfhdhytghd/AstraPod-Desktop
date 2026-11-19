@@ -1,6 +1,9 @@
 """FU59 host-side lyrics normalization and bounded native-page rows."""
 import re
 import threading
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from decimal import Decimal
 from itertools import groupby
 
 
@@ -132,6 +135,242 @@ def lyrics_rows(lines, offset, duration, row):
     return plain_rows(texts, row)
 
 
+def lyric_sources(reply):
+    value = reply.get('data', reply) if isinstance(reply, dict) else reply
+    if isinstance(value, list):
+        for item in value:
+            yield from lyric_sources(item)
+    elif isinstance(value, dict):
+        for key in ('ttml', 'lyrics', 'text', 'content'):
+            if value.get(key):
+                yield from lyric_sources(value[key])
+                return
+        if isinstance(value.get('attributes'), dict):
+            yield from lyric_sources(value['attributes'])
+    elif isinstance(value, str):
+        yield value
+
+
+def ttml_time(value):
+    """Apple lyrics use absolute media times, with optional hour fields."""
+    if not value or len(value) > 20:
+        return None
+    clock = re.fullmatch(r'(?:(\d+):)?(?:(\d+):)?(\d+(?:\.\d+)?)(ms|s)?', value, re.ASCII)
+    if not clock:
+        return None
+    hours, minutes, seconds, unit = clock.groups()
+    if hours is not None and minutes is None:
+        hours, minutes = None, hours
+    if unit and minutes is not None:
+        return None
+    return int(Decimal(seconds) * (1 if unit == 'ms' else 1000)) + (
+        int(hours or 0) * 3600 + int(minutes or 0) * 60) * 1000
+
+
+def ttml_line(p):
+    parts, cues = [], []
+    pos = 0
+
+    def append(text):
+        nonlocal pos
+        if text:
+            parts.append(text)
+            pos += len(text.encode('utf-8'))
+
+    def inline(node, depth):
+        first = pos
+        append(node.text)
+        count = len(cues)
+        for child in node:
+            # Excess nesting has no effect on timing and stays plain text.
+            if depth < 16:
+                inline(child, depth + 1)
+            else:
+                append(''.join(child.itertext()))
+            append(child.tail)
+        begin = ttml_time(node.get('begin'))
+        if depth and begin is not None and pos > first and len(cues) == count:
+            cues.append((begin, ttml_time(node.get('end')), first, pos))
+
+    inline(p, 0)
+    return ''.join(parts), ttml_time(p.get('begin')), ttml_time(p.get('end')), cues
+
+
+def ttml_tree(source):
+    if '<!DOCTYPE' in source or '<!ENTITY' in source:
+        return None
+    try:
+        return ET.fromstring(source)
+    except ET.ParseError:
+        return None
+
+
+def local_name(tag):
+    return tag.rsplit('}', 1)[-1]
+
+
+def lyric_lines(reply):
+    for source in lyric_sources(reply):
+        if not source.lstrip('\ufeff \t\r\n').startswith('<'):
+            yield from ((line, None, None, []) for line in source.splitlines())
+            continue
+        tree = ttml_tree(source)
+        if tree is not None:
+            for p in tree.iter():
+                if local_name(p.tag) == 'p':
+                    yield ttml_line(p)
+
+
+TTM = '{http://www.w3.org/ns/ttml#metadata}'
+XML_ID = '{http://www.w3.org/XML/1998/namespace}id'
+TTML_PACKET_BYTES = 8192
+TTML_DOCUMENT_BYTES = 96 * 1024
+TTML_AGENTS = 64
+TTML_PERSON = 3
+TTML_GROUP = 0x100
+TTML_OTHER = 0x200
+
+
+@dataclass
+class LyricsVariants:
+    legacy: list
+    duet: list
+
+
+def duet_rows(trees, offset, duration, row):
+    """Emit independent, bounded paragraphs with track-wide performer indices.
+
+    Code 0 is unspecified and 1 is a list of performers. The remaining
+    codes identify each performer in a range for their type. The subtitle
+    carries the track-wide performer count for stable progressive layout.
+    """
+    indices, kinds, seen, paragraphs = {}, {}, set(), []
+    counts = {TTML_PERSON: 0, TTML_GROUP: 0, TTML_OTHER: 0}
+    has_voices = False
+    for source, tree in enumerate(trees):
+        for agent in tree.iter(TTM + 'agent'):
+            if agent.get(XML_ID):
+                kinds[source, agent.get(XML_ID)] = agent.get('type', 'person')
+
+    def performer(ids, source):
+        nonlocal has_voices
+        ids = dict.fromkeys(ids.split())
+        seen.update((source, name) for name in ids)
+        has_voices |= bool(ids)
+        codes = []
+        for name in ids:
+            key = source, name
+            kind = kinds.get(key, 'person')
+            if key not in indices:
+                base = {'person': TTML_PERSON, 'group': TTML_GROUP}.get(kind, TTML_OTHER)
+                indices[key] = base + counts[base]
+                counts[base] += 1
+            codes.append(indices[key])
+        return 1 if len(codes) > 1 else next(iter(codes), 0)
+
+    def node_agent(node, source, default):
+        ids = node.get(TTM + 'agent')
+        return performer(ids, source) if ids is not None else default
+
+    def timing(source, target):
+        begin, end, dur = (ttml_time(source.get(name)) for name in ('begin', 'end', 'dur'))
+        if end is None and begin is not None and dur is not None:
+            end = begin + dur
+        for name, value in (('begin', begin), ('end', end)):
+            if value is not None:
+                target.set(name, f'{max(0, value - offset)}ms')
+        if dur is not None and end is None:
+            target.set('dur', f'{dur}ms')
+        return begin
+
+    def inline(node, source, inherited, depth=0):
+        nonlocal has_voices
+        if depth > 16:
+            raise ValueError('TTML span nesting')
+        agent = node_agent(node, source, inherited)
+        target = ET.Element('span', {'a': str(agent)} if agent != inherited else {})
+        timing(node, target)
+        if node.get(TTM + 'role') == 'x-bg':
+            has_voices = True
+            target.set('bg', '1')
+        target.text = safe_xml_text(node.text)
+        for child in node:
+            if local_name(child.tag) == 'br':
+                item = ET.Element('br')
+            else:
+                item = inline(child, source, agent, depth + 1)
+            item.tail = safe_xml_text(child.tail)
+            target.append(item)
+        return target
+
+    def collect(node, source, inherited=0, depth=0):
+        if depth > 16:
+            raise ValueError('TTML block nesting')
+        kind = local_name(node.tag)
+        if kind in ('head', 'metadata'):
+            return
+        agent = node_agent(node, source, inherited)
+        if kind == 'p':
+            target = ET.Element('p', {'a': str(agent)})
+            begin = timing(node, target)
+            if begin is None:
+                # The firmware can infer a line start from its first timed span.
+                begin = min((t for span in node.iter()
+                             if (t := ttml_time(span.get('begin'))) is not None),
+                            default=0)
+            target.text = safe_xml_text(node.text)
+            for child in node:
+                span = ET.Element('br') if local_name(child.tag) == 'br' else inline(child, source, agent)
+                span.tail = safe_xml_text(child.tail)
+                target.append(span)
+            paragraphs.append((begin, target))
+        else:
+            for child in node:
+                collect(child, source, agent, depth + 1)
+
+    try:
+        for source, tree in enumerate(trees):
+            collect(tree, source)
+    except ValueError:
+        return None
+    if not has_voices or not paragraphs or len(seen) > TTML_AGENTS:
+        return None
+
+    records, cost = [], 0
+    for _, p in sorted(paragraphs, key=lambda item: item[0]):
+        visible = ''.join(p.itertext()).strip()
+        if not visible:
+            continue
+        packet = ET.tostring(p, encoding='unicode', short_empty_elements=True)
+        # Budget for both voice records and at most one firmware cue per
+        # text/tail run. The firmware checks the same arena before each write.
+        size = len(packet.encode())
+        runs = sum(bool(n.text) + bool(n.tail) + (local_name(n.tag) == 'br') for n in p.iter())
+        cost += sum(len((n.text or "").encode()) + len((n.tail or "").encode())
+                    for n in p.iter()) + 84 + 17 * runs
+        if size >= TTML_PACKET_BYTES or cost > TTML_DOCUMENT_BYTES:
+            return None
+        parts = list(chunks(packet))
+        records.extend(dict(row(part, '', id='ttml2+' if i < len(parts) - 1 else 'ttml2'),
+                            subtitle=str(len(seen)))
+                       for i, part in enumerate(parts))
+    return records or None
+
+
+def safe_xml_text(value):
+    if value is None:
+        return None
+    return re.sub(r'[\x00-\x1f\x7f]', ' ', value)
+
+
+def source_rows(reply, offset, duration, row):
+    legacy = lyrics_rows(lyric_lines(reply), offset, duration, row)
+    sources = list(lyric_sources(reply))
+    trees = [tree for text in sources if (tree := ttml_tree(text)) is not None]
+    duet = duet_rows(trees, offset, duration, row) if len(trees) == len(sources) else None
+    return LyricsVariants(legacy, duet) if duet else legacy
+
+
 class LyricsPages:
     """One converted track in memory and one stable nonce snapshot."""
     def __init__(self):
@@ -176,7 +415,7 @@ class LyricsPages:
                     self._ready = rows
         return rows is not None and self._epoch == epoch
 
-    def get(self, query, track, offset, fetch, row):
+    def get(self, query, track, offset, fetch, row, duet=False):
         if not re.fullmatch(r'[a-zA-Z0-9._-]{1,79}', track):
             return []
         wait = [row('', '', id='lyric-wait')]
@@ -204,5 +443,7 @@ class LyricsPages:
                 rows = self._ready
             if rows is None:
                 return wait
+            if isinstance(rows, LyricsVariants):
+                rows = rows.duet if duet else rows.legacy
             self.query, self.rows = query, rows
             return rows

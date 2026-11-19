@@ -188,7 +188,7 @@ class Library:
         name = parsed.path
         args = dict(urllib.parse.parse_qsl(parsed.query))
         if name == 'now/lyrics' and args.get('lrc') == '1':
-            items = self.lyrics.get(query, args.get('track', ''), offset, self.timed_lyrics, row)
+            items = self.lyrics.get(query, args.get('track', ''), offset, self.timed_lyrics, row, duet=args.get('duet') == '1')
             return dict(generation=self.cache.generation, offset=offset, total=len(items),
                         stale=stale, items=items[offset:offset+limit], _lyrics_v1=True)
         if name.startswith('now/'):

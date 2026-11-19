@@ -30,7 +30,7 @@ from pathlib import Path
 from hrcider import Client, HTTPStatusError, clean
 from hrcider_cache import art_id
 from hrcider_library import ROOT, row as menu_row, route as make_route
-from hrlyrics import LyricsPages, lyrics_rows, millis
+from hrlyrics import LyricsPages, lyric_sources, lyrics_rows, millis, source_rows
 
 log = logging.getLogger('herdremote.rufin')
 
@@ -789,7 +789,7 @@ class RufinLibrary:
         result = lambda items, total, first=offset: dict(generation=self.generation, offset=first, total=total,
                                                          stale=bool(stale), items=items)
         if name == 'now/lyrics' and args.get('lrc') == '1':
-            items = self.lyrics.get(query, args.get('track', ''), offset, self.timed_lyrics, menu_row)
+            items = self.lyrics.get(query, args.get('track', ''), offset, self.timed_lyrics, menu_row, duet=args.get('duet') == '1')
             return dict(result(items[offset:offset + limit], len(items)), _lyrics_v1=True)
         if name.startswith('now/'):
             items = self.now(name)
@@ -863,6 +863,10 @@ class RufinLibrary:
         reply = self.client.get('/api/lyrics')
         if playing()[:2] != (uri, run):
             return None
+        if isinstance(reply, str):
+            return source_rows(reply, 0, duration, menu_row)
+        if not isinstance(reply, dict):
+            return lyrics_rows([], 0, duration, menu_row)
         if reply.get('state') == 'loading':
             return None
         if reply.get('state') != 'ready':
@@ -870,8 +874,14 @@ class RufinLibrary:
         if reply.get('media_uri') != uri or (run is not None and reply.get('run') != run):
             return None
         document = reply.get('document') or {}
-        offset = document.get('offset_millis')
+        offset = document.get('offset_millis') if isinstance(document, dict) else 0
         offset = offset if type(offset) is int else 0
+        sources = [value for container in (document, reply) for value in lyric_sources(container)
+                   if value.lstrip('\ufeff \t\r\n').startswith('<')]
+        if sources:
+            return source_rows(sources[:1], offset, duration, menu_row)
+        if not isinstance(document, dict):
+            return lyrics_rows([], 0, duration, menu_row)
         lines = []
         for line in document.get('lines') or []:
             if not isinstance(line, dict) or not isinstance(line.get('text'), str):
