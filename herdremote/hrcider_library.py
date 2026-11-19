@@ -314,7 +314,37 @@ class Library:
                     elif field=='guest':values.update(g for g in s.get('guests',[]) if g.strip().lower()!=s.get('albumartist','').strip().lower())
                     else:values.add(s.get(field,'') or (s.get('subtitle','') if field in ('artist','albumartist') else ''))
                 target='albumartists' if field in ('genre','year') else 'albums'
-                items=[row(v,route(target,**(args|{field:v})), 'artist' if field in ('artist','albumartist','guest') else 'menu') for v in sorted(values,key=str.casefold) if v]
+                is_artist = field in ('artist', 'albumartist', 'guest')
+                portraits, first = {}, {}
+                if is_artist:
+                    portraits = {a['title'].casefold(): a for a in self._items('artists')
+                                 if a.get('artwork')}
+                    albums = {member: a for a in self._items('albums')
+                              for member in a.get('members', [a['id']])}
+                    for song in songs:
+                        names = song.get('guests', []) if field == 'guest' else [
+                            song.get(field) or song.get('subtitle', '')]
+                        album = next((albums[k] for k in song.get('albums', []) if k in albums), song)
+                        image = album.get('artwork')
+                        if not image:
+                            continue
+                        rank = (album.get('releaseDate') or '9999',
+                                (album.get('album') or album['title']).casefold(), album['id'])
+                        for artist in names:
+                            key = artist.casefold()
+                            if key not in first or rank < first[key][0]:
+                                first[key] = (rank, image)
+                for value in sorted(values, key=str.casefold):
+                    if not value:
+                        continue
+                    item = row(value, route(target, **(args | {field: value})),
+                               'artist' if is_artist else 'menu')
+                    if is_artist:
+                        key = value.casefold()
+                        portrait = portraits.get(key, {})
+                        artwork = portrait.get('artwork') or first.get(key, (None, ''))[1]
+                        item.update(id=portrait.get('id', value), art=art_id(artwork))
+                    items.append(item)
             else:
                 values=songs if name=='songs' else self._items(name)
                 if name=='songs':values=songs

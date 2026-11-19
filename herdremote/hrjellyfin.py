@@ -273,6 +273,19 @@ class JellyfinLibrary(RufinLibrary):
         session = self.session
         if session and session.art_scope == scope:
             try:
+                if kind.startswith('album-for-'):
+                    field = 'AlbumArtistIds' if kind == 'album-for-albumartist' else 'ArtistIds'
+                    rows, _ = self.jellyfin.page(
+                        session, 'Items', 0, 1, ParentId=session.folder,
+                        Recursive='true', IncludeItemTypes='MusicAlbum',
+                        SortBy='ProductionYear,SortName', SortOrder='Ascending,Ascending',
+                        **{field: item})
+                    album = id_or_none(rows[0].get('Id')) if rows else None
+                    if not album:
+                        raise ValueError('No album for artist artwork')
+                    return self.jellyfin.request(
+                        session, f'Items/{album}/Images/Primary', image=True,
+                        MaxWidth=size, MaxHeight=size, Format='Jpg'), False
                 raw = self.jellyfin.request(session, f'Items/{item}/Images/Primary',
                                            image=True, MaxWidth=size, MaxHeight=size, Format='Jpg')
                 return raw, True
@@ -337,8 +350,17 @@ class JellyfinLibrary(RufinLibrary):
             return dict(row(title, 'play/library-songs/' + key, 'song', id=key),
                         art=artwork, subtitle=subtitle, duration=ms, year=year)
         if kind == 'MusicArtist':
-            return row(title, route('albums', artistid=ident), 'artist', id=ident)
+            return self.artist_row(session, value, 'artistid')
         raise JellyfinError('unexpected library item type')
+
+    def artist_row(self, session, value, arg):
+        ident, title = value['Id'], value['Name']
+        tags = value.get('ImageTags')
+        tag = tags.get('Primary') if isinstance(tags, dict) else None
+        role = 'albumartist' if arg == 'albumartistid' else 'artist'
+        art = self.jellyfin_art(session, 'artist', ident, tag) if tag else self.jellyfin_art(
+            session, 'album-for-' + role, ident, session.art_scope)
+        return dict(row(title, route('albums', **{arg: ident}), 'artist', id=ident), art=art)
 
     def album_id(self, session, name):
         if not name.startswith('album/t'):
@@ -414,7 +436,7 @@ class JellyfinLibrary(RufinLibrary):
             endpoint = {'artists': 'Artists', 'albumartists': 'Artists/AlbumArtists',
                         'genres': 'MusicGenres', 'years': 'Years'}[name]
             params.update(IncludeItemTypes='MusicAlbum' if name == 'years' else 'Audio,MusicAlbum',
-                          EnableImages='false')
+                          EnableImages='true' if name in ('artists', 'albumartists') else 'false')
             term = args.get('artist~' if name == 'artists' else 'albumartist~')
             if term:
                 params['SearchTerm'] = term
@@ -430,7 +452,8 @@ class JellyfinLibrary(RufinLibrary):
                     if not ident or not isinstance(title, str):
                         raise JellyfinError('malformed library item')
                     arg = {'artists': 'artistid', 'albumartists': 'albumartistid', 'genres': 'genreid'}[name]
-                    items.append(row(title, route('albums', **{arg: ident}), 'menu' if name == 'genres' else 'artist'))
+                    items.append(row(title, route('albums', **{arg: ident})) if name == 'genres'
+                                 else self.artist_row(session, v, arg))
             return result(items, total)
 
         params.update(Recursive='true', Fields=ITEM_FIELDS,

@@ -1575,6 +1575,13 @@ class Bridge:
         if raw is None or tier=='P':
             template=self.templates.get(key) or self.cache.template(key) or (self.rufin_library.template(key) if self.rufin_library else None)
             if raw is None and not template:raise ValueError('Unknown artwork id')
+            if template and template.startswith('rufin-artist:'):
+                if self.rufin_library is None:raise ValueError('Rufin artwork source unavailable')
+                artwork = self.rufin_library.artist_artwork(
+                    template, PALETTE_SOURCE_LIMIT if tier == 'P' else dim)
+                pixels = render(artwork, tier)
+                self.cache.put_art(key, cache_tier, pixels)
+                return pixels
             if template and template.startswith('jellyfin:'):
                 if self.jellyfin_library is None:raise ValueError('Jellyfin artwork source unavailable')
                 artwork,cacheable=self.jellyfin_library.artwork(

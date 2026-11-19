@@ -637,7 +637,9 @@ class RufinLibrary:
             return self.templates.get(key)
 
     def art(self, uri):
-        template = art_template(uri)
+        return self.register_art(art_template(uri))
+
+    def register_art(self, template):
         if not template:
             return '-'
         key = art_id(template)
@@ -711,8 +713,44 @@ class RufinLibrary:
         if kind not in names:
             return None
         path, view = names[kind]
-        return dict(id=jarg(ident), title=str(value.get('name') or value.get('title') or ''), subtitle='', art='-',
+        art = '-'
+        if kind == 'artist':
+            uri = value.get('uri')
+            uri = uri if isinstance(uri, str) else ''
+            template = 'rufin-artist:' + jarg([path, ident, uri])
+            art = self.register_art(template)
+        return dict(id=jarg(ident), title=str(value.get('name') or value.get('title') or ''), subtitle='', art=art,
                     duration=ms, count=count, kind=view, route=path + '/' + quoted, bg='181818', year=0)
+
+    def artist_artwork(self, template, size):
+        kind, ident, uri = json.loads(template.removeprefix('rufin-artist:'))
+        if uri:
+            try:
+                return self.client.artwork(uri, size=size)
+            except (OSError, ValueError):
+                pass
+        endpoint, _, filters = self.COLLECTIONS[kind]
+        best = None
+        offset = 0
+        while True:
+            page = self.client.get(endpoint, id=jarg(ident), offset=offset,
+                                   limit=100, total='true', **filters)
+            tracks = self._rows(page)
+            for track in tracks:
+                album_uri = self.client.album_uri(track)
+                if not album_uri:
+                    continue
+                year = track.get('year')
+                rank = (year if isinstance(year, int) and year > 0 else 10000,
+                        str(track.get('album') or '').casefold(), album_uri)
+                if best is None or rank < best:
+                    best = rank
+            offset += len(tracks)
+            if not tracks or offset >= page.get('total', offset):
+                break
+        if best is None:
+            raise ValueError('No album for artist artwork')
+        return self.client.artwork(best[2], size=size)
 
     # --- reading --------------------------------------------------------
     @staticmethod
