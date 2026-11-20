@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import stat
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -128,6 +129,24 @@ class JellyfinClient:
             session.base + '/' + path + ('?' + query if query else ''), method='GET',
             headers={'Authorization': f'MediaBrowser Token="{session.token}"',
                      'Accept': 'image/jpeg' if image else 'application/json'})
+        return self.read_reply(req, image=image)
+
+    def authenticate(self, base, username, password):
+        # Jellyfin uses the client identity to associate logins with a device.
+        device = hashlib.sha256(("AstraPod:" + socket.gethostname()).encode()).hexdigest()
+        request = urllib.request.Request(
+            https_base(base) + "/Users/AuthenticateByName",
+            data=json.dumps({"Username": username, "Pw": password}).encode("utf-8"),
+            headers={
+                "Authorization": f'MediaBrowser Client="AstraPod", Device="Desktop", '
+                                 f'DeviceId="{device}", Version="1.0"',
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST")
+        return self.read_reply(request)
+
+    def read_reply(self, req, image=False):
         deadline = time.monotonic() + 2 * self.timeout
         body = bytearray()
         try:

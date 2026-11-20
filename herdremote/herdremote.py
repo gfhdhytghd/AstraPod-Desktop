@@ -810,6 +810,18 @@ class Daemon:
 
 
 def main():
+    try:
+        import podlink_settings
+        for key, value in podlink_settings.load().items():
+            os.environ.setdefault(key, value)
+        if "CIDER_API_TOKEN" not in os.environ:
+            token = podlink_settings.cider_token()
+            if token:
+                os.environ["CIDER_API_TOKEN"] = token
+    except ImportError:
+        pass
+    except (OSError, ValueError) as error:
+        logging.getLogger("herdremote").warning("Could not load desktop settings: %s", error)
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--socket", help="herdr API socket "

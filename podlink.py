@@ -392,57 +392,77 @@ def prepare_media(paths, directory):
     return tracks
 
 
-def import_media(link, tracks):
-    def expect(response):
-        message = link.receive()
-        if message.type != TEXT or message.payload != response:
-            detail = message.payload[:100].decode("ascii", errors="replace")
-            raise RuntimeError(f"expected {response.decode()}, received {detail!r}")
+def media_reply(link):
+    # Resident clients can announce their capabilities before the screen replies.
+    deadline = time.monotonic() + link.timeout
+    while (remaining := deadline - time.monotonic()) > 0:
+        message = link.receive(remaining)
+        if message.type == TEXT and message.payload.startswith((b"MS1 ", b"MS2 ")):
+            return message.payload
+    raise TimeoutError("media status reply timed out")
 
+
+def expect_media(link, response):
+    got = media_reply(link)
+    if got != response:
+        detail = got[:100].decode("ascii", errors="replace")
+        raise RuntimeError(f"expected {response.decode()}, received {detail!r}")
+
+
+def upload_media_track(link, track, sync_name=None):
     chunk_size = link.max_message - 4
     if chunk_size <= 0:
         raise RuntimeError("peer message limit is too small for media import")
+    with track.upload.open("rb") as source:
+        digest = hashlib.sha256()
+        checksum = size = 0
+        while chunk := source.read(65536):
+            size += len(chunk)
+            if size > MEDIA_MAX_BYTES:
+                raise ValueError("file exceeds 128 MiB")
+            digest.update(chunk)
+            checksum = zlib.crc32(chunk, checksum)
+        if not size:
+            raise ValueError("empty file")
+        suffix = track.upload.suffix.lower()
+        name = sync_name or digest.hexdigest() + suffix
+        protocol = "MS2" if sync_name else "MS1"
+        source.seek(0)
+        link.send(TEXT, f"{protocol} PUT {size:08x} {checksum:08x} {name}")
+        expect_media(link, b"MS1 READY")
+        remaining = size
+        while remaining:
+            chunk = source.read(min(remaining, chunk_size))
+            if not chunk:
+                raise ValueError("file shrank after checksumming")
+            link.send(BINARY, b"MSD1" + chunk)
+            expect_media(link, b"MS1 ACK")
+            remaining -= len(chunk)
+        if source.read(1):
+            raise ValueError("file grew after checksumming")
+        link.send(TEXT, b"MS1 END")
+        expect_media(link, b"MS1 STORED")
+    folder = "/Music/PodLink/Jellyfin" if sync_name else "/Music/PodLink"
+    return {
+        "source": str(track.source), "device": f"{folder}/{name}",
+        "source_sample_rate_hz": track.source_rate, "sample_rate_hz": track.upload_rate,
+    }
 
+
+def refresh_media(link):
+    link.send(TEXT, b"MS1 REFRESH")
+    expect_media(link, b"MS1 QUEUED")
+
+
+def import_media(link, tracks):
     stored = []
     for track in tracks:
         try:
-            with track.upload.open("rb") as source:
-                digest = hashlib.sha256()
-                checksum = size = 0
-                while chunk := source.read(65536):
-                    size += len(chunk)
-                    if size > MEDIA_MAX_BYTES:
-                        raise ValueError("file exceeds 128 MiB")
-                    digest.update(chunk)
-                    checksum = zlib.crc32(chunk, checksum)
-                if not size:
-                    raise ValueError("empty file")
-                name = digest.hexdigest() + track.upload.suffix.lower()
-                source.seek(0)
-                link.send(TEXT, f"MS1 PUT {size:08x} {checksum:08x} {name}")
-                expect(b"MS1 READY")
-                remaining = size
-                while remaining:
-                    chunk = source.read(min(remaining, chunk_size))
-                    if not chunk:
-                        raise ValueError("file shrank after checksumming")
-                    link.send(BINARY, b"MSD1" + chunk)
-                    expect(b"MS1 ACK")
-                    remaining -= len(chunk)
-                if source.read(1):
-                    raise ValueError("file grew after checksumming")
-                link.send(TEXT, b"MS1 END")
-                expect(b"MS1 STORED")
+            stored.append(upload_media_track(link, track))
         except (OSError, RuntimeError, ValueError, TimeoutError) as error:
             raise RuntimeError(f"{track.source}: {error}; device acknowledged {len(stored)} earlier files") from error
-        stored.append({
-            "source": str(track.source), "device": f"/Music/PodLink/{name}",
-            "source_sample_rate_hz": track.source_rate,
-            "sample_rate_hz": track.upload_rate,
-        })
     try:
-        link.send(TEXT, b"MS1 REFRESH")
-        expect(b"MS1 QUEUED")
+        refresh_media(link)
     except (OSError, RuntimeError, ValueError, TimeoutError) as error:
         raise RuntimeError(f"device stored {len(stored)} files; refresh acknowledgement unavailable: {error}") from error
     return {"tracks": stored, "rockbox_refresh": "queued"}
