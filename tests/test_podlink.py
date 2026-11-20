@@ -20,6 +20,18 @@ sys.modules[spec.name] = p
 spec.loader.exec_module(p)
 
 
+class MediaSampleRateTests(unittest.TestCase):
+    def test_only_downsamples_above_48_khz(self):
+        rates = {
+            22050: 22050, 44100: 44100, 48000: 48000, 50000: 48000,
+            88200: 44100, 92000: 48000, 96000: 48000,
+            176400: 44100, 192000: 48000,
+        }
+        for source, expected in rates.items():
+            with self.subTest(source=source):
+                self.assertEqual(p.media_sample_rate(source), expected)
+
+
 class FakeSerial:
     """Protocol peer, fragmented reads/writes; not a USB device emulator."""
     def __init__(self, maximum=p.MAX_MESSAGE):
