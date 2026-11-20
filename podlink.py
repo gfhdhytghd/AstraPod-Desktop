@@ -2,18 +2,24 @@
 """PodLink v1: RAM-only framed CDC messages and a localhost WebSocket bridge.
 
 Dependencies: pyserial; 'serve' also requires websockets >= 14.
+'import-media' uses ffprobe and uses ffmpeg for downsampling.
 Open System > PodLink while unplugged, then connect USB.
 """
 import argparse
 import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
+import hashlib
 import json
 import math
+from pathlib import Path
 import secrets
 import select
 import struct
+import subprocess
+from tempfile import TemporaryDirectory
 import threading
 import time
 import zlib
@@ -23,6 +29,7 @@ MAGIC = b"PLNK"
 HEADER = struct.Struct("<4sBBHII")
 OPEN, TEXT, BINARY, PING, PONG, CLOSE, HELLO = range(1, 8)
 MAX_MESSAGE = 16384
+MEDIA_MAX_BYTES = 128 * 1024 * 1024
 HELLO_DATA = struct.pack("<HI", 1, MAX_MESSAGE)
 
 
@@ -321,6 +328,126 @@ class Link:
         return results
 
 
+@dataclass(frozen=True)
+class MediaTrack:
+    source: Path
+    upload: Path
+    source_rate: int
+    upload_rate: int
+
+
+def media_sample_rate(rate):
+    if rate <= 48000:
+        return rate
+    return 44100 if rate % 44100 == 0 else 48000
+
+
+def media_command(*args):
+    try:
+        return subprocess.run(args, check=True, capture_output=True, text=True).stdout
+    except FileNotFoundError as error:
+        raise RuntimeError(f"{args[0]} is required for media import") from error
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.strip() or f"exit code {error.returncode}"
+        raise RuntimeError(f"{args[0]}: {detail}") from error
+
+
+def prepare_media(paths, directory):
+    tracks = []
+    for path in paths:
+        suffix = path.suffix.lower()
+        if suffix not in (".flac", ".m4a", ".mp3"):
+            raise ValueError(f"{path}: expected a FLAC, M4A or MP3 file")
+        if not path.is_file():
+            raise ValueError(f"{path}: expected a local audio file")
+        try:
+            probe = json.loads(media_command(
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=sample_rate,codec_name",
+                "-of", "json", "-i", str(path.resolve())))
+            streams = probe.get("streams", [])
+            rate = int(streams[0].get("sample_rate", 0)) if streams else 0
+            if rate <= 0:
+                raise ValueError("no audio stream with a valid sample rate")
+            target = media_sample_rate(rate)
+            upload = path
+            if rate != target:
+                upload = directory / f"{len(tracks)}{suffix}"
+                codec = {
+                    ".flac": ("-c:a", "flac"),
+                    ".mp3": ("-c:a", "libmp3lame", "-q:a", "0"),
+                    ".m4a": ("-c:a", "alac") if streams[0].get("codec_name") == "alac"
+                            else ("-c:a", "aac", "-b:a", "256k"),
+                }[suffix]
+                media_command(
+                    "ffmpeg", "-nostdin", "-v", "error", "-xerror",
+                    "-i", str(path.resolve()), "-map", "0:a:0",
+                    "-map", "0:v:disp:attached_pic?", "-map_metadata", "0",
+                    "-c:v", "copy", "-ar", str(target), *codec, str(upload))
+            if not 0 < upload.stat().st_size <= MEDIA_MAX_BYTES:
+                raise ValueError("prepared file must be between 1 byte and 128 MiB")
+        except (OSError, RuntimeError, ValueError) as error:
+            raise RuntimeError(f"{path}: {error}") from error
+        tracks.append(MediaTrack(path, upload, rate, target))
+    return tracks
+
+
+def import_media(link, tracks):
+    def expect(response):
+        message = link.receive()
+        if message.type != TEXT or message.payload != response:
+            detail = message.payload[:100].decode("ascii", errors="replace")
+            raise RuntimeError(f"expected {response.decode()}, received {detail!r}")
+
+    chunk_size = link.max_message - 4
+    if chunk_size <= 0:
+        raise RuntimeError("peer message limit is too small for media import")
+
+    stored = []
+    for track in tracks:
+        try:
+            with track.upload.open("rb") as source:
+                digest = hashlib.sha256()
+                checksum = size = 0
+                while chunk := source.read(65536):
+                    size += len(chunk)
+                    if size > MEDIA_MAX_BYTES:
+                        raise ValueError("file exceeds 128 MiB")
+                    digest.update(chunk)
+                    checksum = zlib.crc32(chunk, checksum)
+                if not size:
+                    raise ValueError("empty file")
+                name = digest.hexdigest() + track.upload.suffix.lower()
+                source.seek(0)
+                link.send(TEXT, f"MS1 PUT {size:08x} {checksum:08x} {name}")
+                expect(b"MS1 READY")
+                remaining = size
+                while remaining:
+                    chunk = source.read(min(remaining, chunk_size))
+                    if not chunk:
+                        raise ValueError("file shrank after checksumming")
+                    link.send(BINARY, b"MSD1" + chunk)
+                    expect(b"MS1 ACK")
+                    remaining -= len(chunk)
+                if source.read(1):
+                    raise ValueError("file grew after checksumming")
+                link.send(TEXT, b"MS1 END")
+                expect(b"MS1 STORED")
+        except (OSError, RuntimeError, ValueError, TimeoutError) as error:
+            raise RuntimeError(f"{track.source}: {error}; device acknowledged {len(stored)} earlier files") from error
+        stored.append({
+            "source": str(track.source), "device": f"/Music/PodLink/{name}",
+            "source_sample_rate_hz": track.source_rate,
+            "sample_rate_hz": track.upload_rate,
+        })
+    try:
+        link.send(TEXT, b"MS1 REFRESH")
+        expect(b"MS1 QUEUED")
+    except (OSError, RuntimeError, ValueError, TimeoutError) as error:
+        raise RuntimeError(f"device stored {len(stored)} files; refresh acknowledgement unavailable: {error}") from error
+    return {"tracks": stored, "rockbox_refresh": "queued"}
+
+
 def serial_port(device, timeout):
     import serial
     from serial.tools import list_ports
@@ -445,6 +572,7 @@ def main():
     sub.add_parser("bench").add_argument("--bytes", type=int, default=1024 * 1024)
     sub.add_parser("latency").add_argument("--samples", type=int, default=100)
     sub.add_parser("serve").add_argument("--listen-port", type=int, default=8765)
+    sub.add_parser("import-media").add_argument("files", type=Path, nargs="+")
     args = parser.parse_args()
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
@@ -452,15 +580,26 @@ def main():
         if args.command == "serve":
             asyncio.run(serve(args.port, args.listen_port, args.timeout))
             return
-        with serial_port(args.port, args.timeout) as port:
+        with ExitStack() as stack:
+            if args.command == "import-media":
+                directory = Path(stack.enter_context(TemporaryDirectory(prefix="podlink-media-")))
+                tracks = prepare_media(args.files, directory)
+            port = stack.enter_context(serial_port(args.port, args.timeout))
             link = Link(port, args.timeout)
             link.open()
             try:
                 if args.command == "echo": result = link.echo(args.text)
                 elif args.command == "bench": result = link.bench(args.bytes)
                 elif args.command == "latency": result = link.latency(args.samples)
+                elif args.command == "import-media": result = import_media(link, tracks)
                 else: result = getattr(link, args.command)()
-            finally:
+            except BaseException:
+                try:
+                    link.close()
+                except (OSError, RuntimeError, ValueError, TimeoutError):
+                    pass
+                raise
+            else:
                 link.close()
             print(json.dumps(dict(port=port.port, result=result), ensure_ascii=False, indent=2))
     except (ImportError, OSError, RuntimeError, ValueError, TimeoutError) as error:
