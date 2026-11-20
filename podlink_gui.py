@@ -1,144 +1,155 @@
 #!/usr/bin/env python3
-"""Desktop window for the PodLink media importer."""
+"""Wayland-compatible desktop window for PodLink media import."""
 import json
 from pathlib import Path
-from queue import Empty, SimpleQueue
 import subprocess
 import sys
 from threading import Thread
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gio, GLib, Gtk
 
 
-class ImportWindow:
-    def __init__(self, root):
-        self.root = root
-        self.paths = []
-        self.results = SimpleQueue()
+class ImportWindow(Gtk.ApplicationWindow):
+    def __init__(self, application):
+        super().__init__(application=application, title="AstraPod · 媒体同步")
+        self.set_default_size(760, 490)
+        self.paths = {}
         self.busy = False
-        root.title("AstraPod · 媒体同步")
-        root.geometry("760x490")
-        root.minsize(560, 390)
-        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.connect("close-request", lambda *_: self.busy)
 
-        body = ttk.Frame(root, padding=24)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text="媒体同步", font=("TkDefaultFont", 20, "bold")).pack(anchor="w")
-        ttk.Label(body, text="在 iPod 上打开 System > PodLink。导入不需要 Disk Mode。").pack(
-            anchor="w", pady=(8, 16))
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(body, f"set_margin_{side}")(24)
+        self.set_child(body)
 
-        toolbar = ttk.Frame(body)
-        toolbar.pack(fill="x", pady=(0, 8))
-        self.add_button = ttk.Button(toolbar, text="添加音频…", command=self.add)
-        self.add_button.pack(side="left")
-        self.remove_button = ttk.Button(toolbar, text="移除所选", command=self.remove)
-        self.remove_button.pack(side="left", padx=(8, 0))
-        self.port = tk.StringVar()
-        self.port_entry = ttk.Entry(toolbar, textvariable=self.port, width=18)
-        self.port_entry.pack(side="right")
-        ttk.Label(toolbar, text="串口（留空自动识别）").pack(side="right", padx=(0, 8))
+        heading = Gtk.Label(label="媒体同步", xalign=0)
+        heading.add_css_class("title-1")
+        body.append(heading)
+        body.append(Gtk.Label(
+            label="在 iPod 上打开 System > PodLink。导入不需要 Disk Mode。",
+            xalign=0, wrap=True))
 
-        list_frame = ttk.Frame(body)
-        list_frame.pack(fill="both", expand=True)
-        self.files = ttk.Treeview(list_frame, columns=("file", "rate"), show="headings",
-                                  selectmode="extended")
-        self.files.heading("file", text="音频文件")
-        self.files.heading("rate", text="采样率")
-        self.files.column("file", width=410)
-        self.files.column("rate", width=150, stretch=False)
-        scroll = ttk.Scrollbar(list_frame, command=self.files.yview)
-        self.files.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.files.pack(side="left", fill="both", expand=True)
+        toolbar = Gtk.Box(spacing=8)
+        body.append(toolbar)
+        self.add_button = Gtk.Button(label="添加音频…")
+        self.add_button.connect("clicked", self.add)
+        toolbar.append(self.add_button)
+        self.remove_button = Gtk.Button(label="移除所选")
+        self.remove_button.connect("clicked", self.remove)
+        toolbar.append(self.remove_button)
+        toolbar.append(Gtk.Box(hexpand=True))
+        self.port = Gtk.Entry(placeholder_text="串口（留空自动识别）", width_chars=23)
+        toolbar.append(self.port)
 
-        footer = ttk.Frame(body)
-        footer.pack(fill="x", pady=(16, 0))
-        self.status = tk.StringVar(value="超过 48 kHz 的音频会自动降采样。")
-        ttk.Label(footer, textvariable=self.status).pack(side="left")
-        self.import_button = ttk.Button(footer, text="导入到 iPod", command=self.start)
-        self.import_button.pack(side="right")
-        self.update_buttons()
-        self.files.bind("<<TreeviewSelect>>", self.update_buttons)
+        scroll = Gtk.ScrolledWindow(vexpand=True, min_content_height=160)
+        self.files = Gtk.ListBox(selection_mode=Gtk.SelectionMode.MULTIPLE)
+        self.files.add_css_class("boxed-list")
+        self.files.connect("selected-rows-changed", self.update_buttons)
+        scroll.set_child(self.files)
+        body.append(scroll)
 
-    def update_buttons(self, _event=None):
-        self.add_button.state(["disabled" if self.busy else "!disabled"])
-        self.port_entry.state(["disabled" if self.busy else "!disabled"])
-        self.remove_button.state(["!disabled" if not self.busy and self.files.selection()
-                                  else "disabled"])
-        self.import_button.state(["!disabled" if self.paths and not self.busy else "disabled"])
-
-    def redraw(self):
-        self.files.delete(*self.files.get_children())
-        for index, path in enumerate(self.paths):
-            self.files.insert("", "end", iid=str(index), values=(str(path), "待检测"))
+        footer = Gtk.Box(spacing=12)
+        self.status = Gtk.Label(label="超过 48 kHz 的音频会自动降采样。",
+                                xalign=0, hexpand=True, wrap=True)
+        footer.append(self.status)
+        self.import_button = Gtk.Button(label="导入到 iPod", valign=Gtk.Align.CENTER)
+        self.import_button.add_css_class("suggested-action")
+        self.import_button.connect("clicked", self.start)
+        footer.append(self.import_button)
+        body.append(footer)
         self.update_buttons()
 
-    def add(self):
-        paths = filedialog.askopenfilenames(
-            parent=self.root, title="选择音频文件",
-            filetypes=[("音频", "*.flac *.m4a *.mp3 *.FLAC *.M4A *.MP3"), ("所有文件", "*")])
-        for path in paths:
-            if path not in self.paths:
-                self.paths.append(path)
-        self.redraw()
+    def update_buttons(self, *_):
+        self.add_button.set_sensitive(not self.busy)
+        self.port.set_sensitive(not self.busy)
+        self.remove_button.set_sensitive(not self.busy and bool(self.files.get_selected_rows()))
+        self.import_button.set_sensitive(not self.busy and bool(self.paths))
 
-    def remove(self):
-        selected = {int(index) for index in self.files.selection()}
-        self.paths = [path for index, path in enumerate(self.paths) if index not in selected]
-        self.redraw()
+    def add(self, _button):
+        dialog = Gtk.FileChooserNative(
+            title="选择音频文件", transient_for=self,
+            action=Gtk.FileChooserAction.OPEN, accept_label="添加", cancel_label="取消")
+        dialog.set_select_multiple(True)
+        audio_filter = Gtk.FileFilter(name="音频")
+        for suffix in ("mp3", "m4a", "flac"):
+            audio_filter.add_suffix(suffix)
+        dialog.add_filter(audio_filter)
+        dialog.connect("response", self.add_response)
+        dialog.show()
 
-    def start(self):
+    def add_response(self, dialog, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            for file in dialog.get_files():
+                path = file.get_path()
+                if not path or any(item[0] == path for item in self.paths.values()):
+                    continue
+                fields = Gtk.Box(spacing=12, margin_top=9, margin_bottom=9,
+                                 margin_start=12, margin_end=12)
+                name = Gtk.Label(label=Path(path).name, xalign=0, hexpand=True, wrap=True)
+                name.set_tooltip_text(path)
+                fields.append(name)
+                rate = Gtk.Label(label="待检测")
+                fields.append(rate)
+                row = Gtk.ListBoxRow(child=fields)
+                self.paths[row] = (path, rate)
+                self.files.append(row)
+            self.update_buttons()
+        dialog.destroy()
+
+    def remove(self, _button):
+        for row in self.files.get_selected_rows():
+            del self.paths[row]
+            self.files.remove(row)
+        self.update_buttons()
+
+    def start(self, _button):
         command = [sys.executable, str(Path(__file__).with_name("podlink.py"))]
-        port = self.port.get().strip()
+        port = self.port.get_text().strip()
         if port:
             command.extend(("--port", port))
-        command.extend(("import-media", "--", *self.paths))
+        command.extend(("import-media", "--", *(path for path, _ in self.paths.values())))
         self.busy = True
-        self.status.set("正在检查采样率、转换并导入音频…")
+        self.status.set_text("正在检查采样率、转换并导入音频…")
         self.update_buttons()
         Thread(target=self.run_import, args=(command,), daemon=True).start()
-        self.root.after(100, self.poll)
 
     def run_import(self, command):
         try:
             result = subprocess.run(command, capture_output=True, text=True, check=True)
-            self.results.put((json.loads(result.stdout)["result"]["tracks"], None))
+            GLib.idle_add(self.finish, json.loads(result.stdout)["result"]["tracks"], None)
         except subprocess.CalledProcessError as error:
-            self.results.put((None, error.stderr.strip() or str(error)))
+            GLib.idle_add(self.finish, None, error.stderr.strip() or str(error))
         except (OSError, ValueError, KeyError) as error:
-            self.results.put((None, str(error)))
+            GLib.idle_add(self.finish, None, str(error))
 
-    def poll(self):
-        try:
-            tracks, error = self.results.get_nowait()
-        except Empty:
-            self.root.after(100, self.poll)
-            return
+    def finish(self, tracks, error):
         self.busy = False
         self.update_buttons()
         if error:
-            self.status.set("导入失败。")
-            messagebox.showerror("导入失败", error, parent=self.root)
+            self.status.set_text("导入失败。")
+            Gtk.AlertDialog(message="导入失败", detail=error).show(self)
             return
-        for index, track in enumerate(tracks):
+        for (_, label), track in zip(self.paths.values(), tracks):
             source = track["source_sample_rate_hz"] / 1000
             target = track["sample_rate_hz"] / 1000
-            rate = f"{source:g} kHz" if source == target else f"{source:g} → {target:g} kHz"
-            self.files.set(str(index), "rate", rate)
-        self.status.set(f"已导入 {len(tracks)} 首。设备已接收曲库更新请求。")
+            label.set_text(f"{source:g} kHz" if source == target else f"{source:g} → {target:g} kHz")
+        self.status.set_text(f"已导入 {len(tracks)} 首。设备已接收曲库更新请求。")
 
-    def close(self):
-        if self.busy:
-            self.root.bell()
-        else:
-            self.root.destroy()
+
+def activate(application):
+    window = application.get_active_window() or ImportWindow(application)
+    window.present()
 
 
 def main():
-    root = tk.Tk()
-    ImportWindow(root)
-    root.mainloop()
+    application = Gtk.Application(application_id="org.podbox.AstraPodMedia",
+                                  flags=Gio.ApplicationFlags.NON_UNIQUE)
+    application.connect("activate", activate)
+    return application.run(sys.argv)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
