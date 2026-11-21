@@ -1,4 +1,5 @@
 """Offline tests for the EP0 plugin and framebuffer commands."""
+import errno
 import json
 from pathlib import Path
 import struct
@@ -80,6 +81,97 @@ class Player:
         data = self.pixels[start:start + self.chunk]
         assert len(data) == payload
         return data
+
+
+def test_find_player_skips_unreadable_usb_candidates(monkeypatch):
+    class Unreadable:
+        idVendor = 0x05AC
+
+        def __init__(self, product, error):
+            self.idProduct = product
+            self.error = error
+            self.serial_reads = 0
+
+        @property
+        def serial_number(self):
+            self.serial_reads += 1
+            raise self.error
+
+    trackpad = Unreadable(0x0324, ValueError("The device has no langid"))
+    bad_player = Unreadable(0x1261, shell.usb.core.USBError("Access denied", errno=errno.EACCES))
+    player = SimpleNamespace(idVendor=0x05AC, idProduct=0x1261, serial_number="target")
+    monkeypatch.setattr(shell.usb.core, "find", lambda **kwargs: iter((trackpad, bad_player, player)))
+
+    assert shell.find_player("target") is player
+    assert trackpad.serial_reads == 0
+    assert bad_player.serial_reads == 1
+
+
+def test_plugin_launch_retries_stall_after_previous_exit(monkeypatch):
+    player = Player()
+    monkeypatch.setattr(shell.time, "sleep", lambda _: None)
+    snow = shell.plugin_launch(player, "snow")
+    shell.plugin_exit(player)
+    assert shell.plugin_status(player).generation == snow.generation
+    transfer = player.ctrl_transfer
+    attempts = []
+
+    def busy(direction, request, value, index, data, **kwargs):
+        if direction == 0x40 and value == 9:
+            attempts.append(data)
+            if len(attempts) == 1:
+                raise shell.usb.core.USBError("Pipe error", errno=errno.EPIPE)
+        return transfer(direction, request, value, index, data, **kwargs)
+
+    monkeypatch.setattr(player, "ctrl_transfer", busy)
+    stopwatch = shell.plugin_launch(player, "stopwatch")
+    assert stopwatch.generation == snow.generation + 1
+    assert attempts == [b"stopwatch", b"stopwatch"]
+    assert player.commands == [9, 10, 9]
+
+
+@pytest.mark.parametrize(("code", "attempt_count"),
+                         [(errno.EPIPE, len(shell.EP0_STALL_DELAYS) + 1), (errno.ENODEV, 1)])
+def test_ep0_retries_are_bounded_and_stall_only(monkeypatch, code, attempt_count):
+    attempts = []
+
+    def fail(*args, **kwargs):
+        attempts.append(args)
+        raise shell.usb.core.USBError("Control transfer failed", errno=code)
+
+    monkeypatch.setattr(shell.time, "sleep", lambda _: None)
+    player = SimpleNamespace(ctrl_transfer=fail)
+    with pytest.raises(shell.usb.core.USBError) as error:
+        shell.plugin_exit(player)
+    assert error.value.errno == code
+    assert attempts == [(0x40, 0x5D, 10, 0x4951, b"")] * attempt_count
+
+
+def test_missing_track_stops_before_first_plugin(tmp_path, monkeypatch):
+    player = Player()
+    player.audio = 1  # A different track was playing before the smoke test.
+    transfer = player.ctrl_transfer
+
+    def missing(direction, request, value, index, data, **kwargs):
+        if direction == 0x40 and value == 2:
+            player.commands.append(value)
+            return 0  # Firmware acknowledges play even when the fixture is absent.
+        return transfer(direction, request, value, index, data, **kwargs)
+
+    monkeypatch.setattr(player, "ctrl_transfer", missing)
+    monkeypatch.setattr(shell, "find_player", lambda _: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda _: None)
+    monkeypatch.setattr(smoke, "time", SimpleNamespace(
+        monotonic=iter(i / 20 for i in range(10000)).__next__, sleep=lambda _: None,
+    ))
+    monkeypatch.setattr(smoke, "usb_takeover", lambda *args: pytest.fail("Unexpected USB takeover"))
+
+    out = tmp_path / "evidence"
+    with pytest.raises(RuntimeError, match="irq-dma44.flac"):
+        smoke.run("test", out, None)
+    assert player.commands[:2] == [4, 2]
+    assert 9 not in player.commands
+    assert sorted(p.name for p in out.iterdir()) == ["result.json"]
 
 
 def test_cli_launch_status_and_exit(monkeypatch, capsys):
@@ -169,7 +261,8 @@ def test_smoke_default_cases_and_playback(tmp_path, monkeypatch):
         assert keys
     assert player.commands.count(9) == 7
     assert player.commands.count(10) == 8
-    assert 2 in player.commands and player.commands[-1] == 4
+    assert player.commands[:3] == [4, 2, 9]
+    assert player.commands.count(4) == 2
     assert player.keys[::2] == [(key, 1) for _, keys, _ in smoke.CASES for key in keys]
     assert player.keys[1::2] == [(key, 0) for _, keys, _ in smoke.CASES for key in keys]
 

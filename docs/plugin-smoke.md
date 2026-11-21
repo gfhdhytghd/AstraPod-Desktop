@@ -32,11 +32,13 @@ From this checkout, use the normal Desktop Python environment.
 Use the actual USB serial number. Use a new output directory. Supply
 `--control-socket PATH` if HerdRemote uses a custom Disk Mode socket.
 
-The script launches Snow, Stopwatch, Dice, Rockbox Info, Maze,
-Rockblox 1D and Oscilloscope. It saves before and after PNGs and checks
-the exit status. The two games use Menu as their ordinary exit key.
-The script starts the test track for Oscilloscope and verifies playback
-during and after the plugin.
+The script stops the current playback and checks the test track first.
+If the track does not play, the script stops before launching any
+plugin. Oscilloscope runs first with playback active. The script checks
+playback during and after Oscilloscope. It then launches Snow, Stopwatch,
+Dice, Rockbox Info, Maze and Rockblox 1D. It saves before and after PNGs
+and checks each exit status. The two games use Menu as their ordinary
+exit key.
 
 The final case launches Snow and requests Disk Mode through HerdRemote.
 The script identifies the same iPod volume, unmounts with

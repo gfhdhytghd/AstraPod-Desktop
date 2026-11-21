@@ -16,22 +16,22 @@ from usb_remote_key import usb_remote_key as remote
 
 
 CASES = (
+    ("oscilloscope", (remote.RIGHT, remote.RIGHT), False),
     ("snow", (remote.LEFT, remote.RIGHT), False),
     ("stopwatch", (remote.SELECT, remote.RIGHT), True),
     ("dice", (remote.SELECT, remote.SELECT), True),
     ("rb_info", (remote.SELECT,), True),
     ("maze", (remote.SELECT, remote.RIGHT), True),
     ("rockblox1d", (remote.PLAY, remote.PLAY), False),
-    ("oscilloscope", (remote.RIGHT, remote.RIGHT), False),
 )
 
 
 def tap(player, key):
-    player.ctrl_transfer(0x40, remote.REQUEST, key, 1, b"", timeout=1000)
+    shell.ep0_transfer(player, 0x40, remote.REQUEST, key, 1, b"")
     try:
         time.sleep(.12)
     finally:
-        player.ctrl_transfer(0x40, remote.REQUEST, key, 0, b"", timeout=1000)
+        shell.ep0_transfer(player, 0x40, remote.REQUEST, key, 0, b"")
     time.sleep(.18)
 
 
@@ -82,9 +82,13 @@ def capture(player, output, label):
     return path
 
 
-def playing(player):
+def audio_status(player):
     flags, = struct.unpack("<I", shell.read_control(player, 5, 4))
-    return (flags & 3) == 1
+    return flags
+
+
+def playing(player):
+    return (audio_status(player) & 3) == 1
 
 
 def exercise(player, output, case, require_playback=False):
@@ -168,14 +172,20 @@ def run(serial, output, control_socket):
     results = {}
     try:
         player = shell.find_player(serial)
-        capture(player, output, "native-before")
         for case in CASES:
             name = case[0]
             if name == "oscilloscope":
+                # Shell play can acknowledge a missing fixture without changing
+                # the current track. Stop first to detect that case.
+                shell.execute(serial, "stop")
+                wait_for(lambda: True if (audio_status(player) & 1) == 0 else None, 5,
+                         "Previous playback did not stop")
                 shell.execute(serial, "play")
                 try:
                     wait_for(lambda: True if playing(player) else None, 5,
-                             "Test track is not playing; check /.rockbox/sm1-test/irq-dma44.flac")
+                             "Playback preflight failed. Install a playable test track at "
+                             "/.rockbox/sm1-test/irq-dma44.flac and rerun the smoke test.")
+                    capture(player, output, "native-before")
                     results[name] = exercise(player, output, case, require_playback=True)
                     if not playing(player):
                         raise RuntimeError("Playback stopped when Oscilloscope exited")

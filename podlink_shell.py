@@ -16,6 +16,8 @@ import usb.core
 
 COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4, "open-bench": 5}
 REQUEST, INDEX = 0x5D, 0x4951
+IPOD_VENDOR, IPOD_PRODUCT = 0x05AC, 0x1261
+EP0_STALL_DELAYS = (.05, .10, .20, .25, .25, .25, .25, .25)
 RECORD_START = {"line-in": 6, "mic": 7}
 RECORD_STOP = 8
 RECORD_ACTIVE, RECORD_READY, RECORD_ERROR = 1, 2, 3
@@ -47,32 +49,45 @@ class PluginStatus:
 
 
 def find_player(serial):
-    players = [
-        device for device in usb.core.find(
-            find_all=True, idVendor=0x05AC, idProduct=0x1261
-        )
-        if device.serial_number == serial
-    ]
+    players = []
+    for device in usb.core.find(find_all=True, idVendor=IPOD_VENDOR, idProduct=IPOD_PRODUCT):
+        if (device.idVendor, device.idProduct) != (IPOD_VENDOR, IPOD_PRODUCT):
+            continue
+        try:
+            if device.serial_number == serial:
+                players.append(device)
+        except (ValueError, usb.core.USBError):
+            continue
     if len(players) != 1:
         raise RuntimeError("Expected one connected iPod with the specified USB serial")
     return players[0]
 
 
 def status(device):
-    return struct.unpack("<4I", device.ctrl_transfer(
-        0xC0, REQUEST, 0, INDEX, 16, timeout=1000
-    ))
+    return struct.unpack("<4I", read_control(device, 0, 16))
+
+
+def ep0_transfer(player, direction, request, value, index, payload):
+    """Retry a stalled transfer without repeating the surrounding command."""
+    for delay in EP0_STALL_DELAYS:
+        try:
+            return player.ctrl_transfer(direction, request, value, index, payload, timeout=1000)
+        except usb.core.USBError as error:
+            if error.errno != errno.EPIPE:
+                raise
+            time.sleep(delay)
+    return player.ctrl_transfer(direction, request, value, index, payload, timeout=1000)
 
 
 def read_control(player, value, length):
-    data = bytes(player.ctrl_transfer(0xC0, REQUEST, value, INDEX, length, timeout=1000))
+    data = bytes(ep0_transfer(player, 0xC0, REQUEST, value, INDEX, length))
     if len(data) != length:
         raise RuntimeError(f"Short PodLink Shell response for value {value:#x}")
     return data
 
 
 def write_control(player, value, data=b""):
-    if player.ctrl_transfer(0x40, REQUEST, value, INDEX, data, timeout=1000) != len(data):
+    if ep0_transfer(player, 0x40, REQUEST, value, INDEX, data) != len(data):
         raise RuntimeError(f"Short PodLink Shell write for value {value:#x}")
 
 
@@ -278,7 +293,7 @@ def execute(serial, action, argument=None):
     else:
         command = COMMANDS[action]
     address = (player.bus, player.address)
-    player.ctrl_transfer(0x40, REQUEST, command, INDEX, b"", timeout=1000)
+    ep0_transfer(player, 0x40, REQUEST, command, INDEX, b"")
     deadline = time.monotonic() + 35
     while time.monotonic() < deadline:
         time.sleep(0.2)
