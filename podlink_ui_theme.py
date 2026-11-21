@@ -1,15 +1,18 @@
-"""Qt binding loader, adaptive Light/Dark/System theming, and UI preference storage."""
+"""Qt binding loader, Material 3 theming (Light/Dark/System, seed colour) and UI preference storage."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
+import subprocess
 import sys
 
 _TOOLS_DIR = Path(__file__).resolve().parent
 if str(_TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(_TOOLS_DIR))
 
+import podlink_m3
 import podlink_settings
 
 try:
@@ -33,7 +36,7 @@ except ImportError:
 
 THEME_MODES = ("system", "light", "dark")
 THEME_LABELS = {
-    "system": "随系统",
+    "system": "跟随系统",
     "light": "浅色",
     "dark": "深色",
 }
@@ -43,9 +46,78 @@ RESOLVED_LABELS = {
 }
 
 
+M3_ROLES = tuple(podlink_m3.LIGHT_TONES)
+DEFAULT_SEED = "#E0245E"
+SEED_SWATCHES = ("#E0245E", "#6750A4", "#1E6FD9", "#00897B", "#7CB342", "#F4A100")
+COLOR_SOURCES = ("system", "cover", "swatch")
+COLOR_SOURCE_LABELS = {"system": "跟随系统", "cover": "封面取色", "swatch": "自选颜色"}
+# GNOME's org.gnome.desktop.interface accent-color names, as libadwaita draws them.
+GNOME_ACCENTS = {
+    "blue": "#3584E4", "teal": "#2190A4", "green": "#3A944A", "yellow": "#C88800",
+    "orange": "#ED5B00", "red": "#E62D42", "pink": "#D56199", "purple": "#9141AC",
+    "slate": "#6F8396",
+}
+
+# Shape scale (corner radii in px, 1 px = 1 dp on the desktop).
+SHAPE_XS, SHAPE_S, SHAPE_M, SHAPE_L, SHAPE_XL = 4, 8, 12, 16, 28
+
+
 @dataclass(frozen=True)
 class ThemeTokens:
+    """Material 3 colour roles for one seed and mode.
+
+    The role fields are M3's names. The older names after them (bg_*, text_*,
+    accent*, glass*, …) are aliases onto those roles, kept because the painted
+    widgets read them; "rgba(r,g,b,a)" values are state layers.
+    """
     name: str
+    seed: str
+    primary: str
+    on_primary: str
+    primary_container: str
+    on_primary_container: str
+    secondary: str
+    on_secondary: str
+    secondary_container: str
+    on_secondary_container: str
+    tertiary: str
+    on_tertiary: str
+    tertiary_container: str
+    on_tertiary_container: str
+    error: str
+    on_error: str
+    error_container: str
+    on_error_container: str
+    surface: str
+    on_surface: str
+    surface_variant: str
+    on_surface_variant: str
+    surface_dim: str
+    surface_bright: str
+    surface_container_lowest: str
+    surface_container_low: str
+    surface_container: str
+    surface_container_high: str
+    surface_container_highest: str
+    outline: str
+    outline_variant: str
+    inverse_surface: str
+    inverse_on_surface: str
+    inverse_primary: str
+    scrim: str
+    on_success: str
+    success_container: str
+    on_success_container: str
+    warning_container: str
+    on_warning_container: str
+    info: str
+    # Layout surfaces: the window behind panes, panes, and raised areas in them.
+    window_bg: str
+    pane: str
+    pane_high: str
+    hover_layer: str
+    press_layer: str
+    # Aliases for the painted widgets.
     bg_window: str
     bg_header: str
     bg_card: str
@@ -79,85 +151,136 @@ class ThemeTokens:
     warning_border: str
     scrollbar_handle: str
     scrollbar_hover: str
+    glass: str
+    glass_strong: str
+    glass_border: str
+    sidebar_glass: str
+    hairline: str
+    row_hover: str
+    row_selected: str
+    shadow: str
+    lcd_bg: str
+    lcd_text: str
+    gauge_track: str
+    cap_audio: str
+    cap_other: str
+    cap_free: str
+    star: str
+    working: str
+    waiting: str
+    done: str
+    idle: str
 
 
-LIGHT_TOKENS = ThemeTokens(
-    name="light",
-    bg_window="#F4F6F9",
-    bg_header="#FFFFFF",
-    bg_card="#FFFFFF",
-    bg_subtle="#ECEFF4",
-    bg_input="#FFFFFF",
-    bg_input_disabled="#F3F4F6",
-    bg_code="#F8FAFC",
-    border="#E2E8F0",
-    border_strong="#CBD5E1",
-    border_focus="#2563EB",
-    text_primary="#0F172A",
-    text_secondary="#334155",
-    text_muted="#64748B",
-    text_disabled="#94A3B8",
-    text_on_accent="#FFFFFF",
-    accent="#2563EB",
-    accent_hover="#1D4ED8",
-    accent_pressed="#1E40AF",
-    accent_soft="#EFF6FF",
-    accent_text="#1D4ED8",
-    success="#15803D",
-    success_bg="#ECFDF5",
-    success_border="#BBF7D0",
-    danger="#DC2626",
-    danger_hover="#B91C1C",
-    danger_pressed="#991B1B",
-    danger_bg="#FEF2F2",
-    danger_border="#FECACA",
-    warning="#B45309",
-    warning_bg="#FFFBEB",
-    warning_border="#FDE68A",
-    scrollbar_handle="#CBD5E1",
-    scrollbar_hover="#94A3B8",
-)
-
-DARK_TOKENS = ThemeTokens(
-    name="dark",
-    bg_window="#0F1218",
-    bg_header="#151922",
-    bg_card="#171C26",
-    bg_subtle="#202634",
-    bg_input="#11151D",
-    bg_input_disabled="#161B24",
-    bg_code="#10141C",
-    border="#262E3D",
-    border_strong="#364154",
-    border_focus="#60A5FA",
-    text_primary="#F1F5F9",
-    text_secondary="#CBD5E1",
-    text_muted="#8B98AD",
-    text_disabled="#5B667A",
-    text_on_accent="#FFFFFF",
-    accent="#3B82F6",
-    accent_hover="#60A5FA",
-    accent_pressed="#2563EB",
-    accent_soft="#172554",
-    accent_text="#93C5FD",
-    success="#4ADE80",
-    success_bg="#0B2A1A",
-    success_border="#166534",
-    danger="#F87171",
-    danger_hover="#EF4444",
-    danger_pressed="#DC2626",
-    danger_bg="#351419",
-    danger_border="#7F1D1D",
-    warning="#FBBF24",
-    warning_bg="#33240B",
-    warning_border="#78350F",
-    scrollbar_handle="#364154",
-    scrollbar_hover="#4B5870",
-)
+FONT_UI = ("Roboto Flex", "Roboto", "Noto Sans CJK SC", "Source Han Sans CN",
+           "HarmonyOS Sans SC", "sans-serif")
+FONT_DISPLAY = FONT_UI
+FONT_NUMERIC = ("Roboto Flex", "Roboto", "Noto Sans CJK SC", "sans-serif")
+FONT_MONO = ("JetBrains Mono", "Roboto Mono", "Noto Sans Mono CJK SC", "monospace")
 
 
-def tokens_for(resolved: str) -> ThemeTokens:
-    return DARK_TOKENS if resolved == "dark" else LIGHT_TOKENS
+def qcolor(value: str) -> "QtGui.QColor":
+    """Parse a token colour, including the "rgba(r,g,b,a)" form."""
+    text = value.strip()
+    if text.startswith("rgba(") and text.endswith(")"):
+        r, g, b, a = (int(float(part)) for part in text[5:-1].split(","))
+        return QtGui.QColor(r, g, b, a)
+    return QtGui.QColor(text)
+
+
+def font_family_css(families: tuple[str, ...]) -> str:
+    return ", ".join(f'"{name}"' if " " in name else name for name in families)
+
+
+def _layer(color: str, opacity: float) -> str:
+    """A state layer: the role colour at an opacity, as rgba()."""
+    r, g, b = podlink_m3.argb_to_rgb(podlink_m3.hex_to_argb(color))
+    return f"rgba({r},{g},{b},{round(opacity * 255)})"
+
+
+def _over(color: str, base: str, opacity: float) -> str:
+    """A state layer flattened onto an opaque base colour."""
+    fg = podlink_m3.argb_to_rgb(podlink_m3.hex_to_argb(color))
+    bg = podlink_m3.argb_to_rgb(podlink_m3.hex_to_argb(base))
+    mixed = [round(b + (f - b) * opacity) for f, b in zip(fg, bg)]
+    return "#%02X%02X%02X" % tuple(mixed)
+
+
+def build_tokens(seed: str, dark: bool) -> ThemeTokens:
+    r = podlink_m3.scheme(podlink_m3.hex_to_argb(seed), dark)
+    window_bg = r["surface"] if dark else r["surface_container"]
+    pane = r["surface_container"] if dark else r["surface_container_lowest"]
+    pane_high = r["surface_container_high"] if dark else r["surface_container_low"]
+    roles = {k: v for k, v in r.items() if k not in ("shadow", "success", "warning", "on_success")}
+    return ThemeTokens(
+        name="dark" if dark else "light",
+        seed=seed,
+        **roles,
+        on_success=r["on_success"],
+        window_bg=window_bg, pane=pane, pane_high=pane_high,
+        hover_layer=_layer(r["on_surface"], 0.08),
+        press_layer=_layer(r["on_surface"], 0.12),
+        bg_window=window_bg,
+        bg_header=r["surface_container"],
+        bg_card=pane,
+        bg_subtle=pane_high,
+        bg_input=pane,
+        bg_input_disabled=_over(r["on_surface"], pane, 0.04),
+        bg_code=r["surface_container_low"],
+        border=r["outline_variant"],
+        border_strong=r["outline"],
+        border_focus=r["primary"],
+        text_primary=r["on_surface"],
+        text_secondary=r["on_surface_variant"],
+        text_muted=r["on_surface_variant"],
+        text_disabled=_over(r["on_surface"], pane, 0.38),
+        text_on_accent=r["on_primary"],
+        accent=r["primary"],
+        accent_hover=_over(r["on_primary"], r["primary"], 0.08),
+        accent_pressed=_over(r["on_primary"], r["primary"], 0.12),
+        accent_soft=r["secondary_container"],
+        accent_text=r["primary"],
+        success=r["success"],
+        success_bg=r["success_container"],
+        success_border=r["success_container"],
+        danger=r["error"],
+        danger_hover=_over(r["on_error"], r["error"], 0.08),
+        danger_pressed=_over(r["on_error"], r["error"], 0.12),
+        danger_bg=r["error_container"],
+        danger_border=r["error_container"],
+        warning=r["warning"],
+        warning_bg=r["warning_container"],
+        warning_border=r["warning_container"],
+        scrollbar_handle=r["outline_variant"],
+        scrollbar_hover=r["outline"],
+        glass=pane,
+        glass_strong=pane_high,
+        glass_border=r["outline_variant"],
+        sidebar_glass=r["surface_container_low"],
+        hairline=r["outline_variant"],
+        row_hover=_layer(r["on_surface"], 0.08),
+        row_selected=r["secondary_container"],
+        shadow="rgba(0,0,0,110)" if dark else "rgba(0,0,0,46)",
+        lcd_bg=r["surface_container_high"],
+        lcd_text=r["on_surface"],
+        gauge_track=r["secondary_container"],
+        cap_audio=r["primary"],
+        cap_other=r["tertiary"],
+        cap_free=r["secondary_container"],
+        star=r["primary"],
+        working=r["success"],
+        waiting=r["warning"],
+        done=r["info"],
+        idle=r["outline"],
+    )
+
+
+LIGHT_TOKENS = build_tokens(DEFAULT_SEED, False)
+DARK_TOKENS = build_tokens(DEFAULT_SEED, True)
+
+
+def tokens_for(resolved: str, seed: str = DEFAULT_SEED) -> ThemeTokens:
+    return build_tokens(seed, resolved == "dark")
 
 
 def ui_prefs_path() -> Path:
@@ -191,8 +314,8 @@ def save_theme_preference(mode: str, path: Path | None = None) -> None:
     podlink_settings.write_private(target, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def detect_system_theme(app: QtWidgets.QApplication,
-                        fallback_palette: QtGui.QPalette | None = None) -> str:
+def qt_hint_scheme(app: QtWidgets.QApplication | None) -> str | None:
+    """Qt's own light/dark answer, or None when the platform theme has none."""
     color_scheme_enum = getattr(QtCore.Qt, "ColorScheme", None)
     hints = app.styleHints() if app is not None else None
     if color_scheme_enum is not None and hints is not None and hasattr(hints, "colorScheme"):
@@ -201,16 +324,176 @@ def detect_system_theme(app: QtWidgets.QApplication,
             return "dark"
         if scheme == color_scheme_enum.Light:
             return "light"
+    return None
+
+
+def detect_system_theme(app: QtWidgets.QApplication,
+                        fallback_palette: QtGui.QPalette | None = None,
+                        appearance: "SystemAppearance | None" = None) -> str:
+    scheme = appearance.scheme(app) if appearance is not None else qt_hint_scheme(app)
+    if scheme:
+        return scheme
     palette = fallback_palette if fallback_palette is not None else app.palette()
     window_color = palette.color(QtGui.QPalette.ColorRole.Window)
     return "dark" if window_color.lightnessF() < 0.5 else "light"
 
 
 def resolve_theme(mode: str, app: QtWidgets.QApplication,
-                  fallback_palette: QtGui.QPalette | None = None) -> str:
+                  fallback_palette: QtGui.QPalette | None = None,
+                  appearance: "SystemAppearance | None" = None) -> str:
     if mode in ("light", "dark"):
         return mode
-    return detect_system_theme(app, fallback_palette)
+    return detect_system_theme(app, fallback_palette, appearance)
+
+
+# The desktop's appearance -------------------------------------------------
+PORTAL_SERVICE = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+PORTAL_SETTINGS = "org.freedesktop.portal.Settings"
+APPEARANCE = "org.freedesktop.appearance"
+
+
+def _command(argv: list[str], timeout: float) -> str | None:
+    """stdout of a short read-only command, or None. Only absolute
+    environment facts are relied on: the session bus address and PATH that
+    a systemd user service inherits."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def portal_value(text: str | None):
+    """The plain value inside busctl's JSON reply to Settings.ReadOne."""
+    try:
+        value = json.loads(text) if text else None
+    except ValueError:
+        return None
+    while isinstance(value, dict) and "data" in value:
+        value = value["data"]
+        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+            value = value[0]
+    return value
+
+
+def read_portal(key: str):
+    return portal_value(_command(
+        ["busctl", "--user", "--json=short", "--timeout=2", "call", PORTAL_SERVICE, PORTAL_PATH,
+         PORTAL_SETTINGS, "ReadOne", "ss", APPEARANCE, key], 3))
+
+
+def portal_scheme(value) -> str | None:
+    """color-scheme: 1 prefers dark, 2 prefers light, 0 has no preference."""
+    return {1: "dark", 2: "light"}.get(value) if isinstance(value, int) else None
+
+
+def portal_accent(value) -> str | None:
+    """accent-color is three doubles in 0..1; anything else means unset."""
+    if (not isinstance(value, list) or len(value) != 3
+            or not all(isinstance(c, (int, float)) and 0 <= c <= 1 for c in value)):
+        return None
+    return "#" + "".join(f"{round(c * 255):02X}" for c in value)
+
+
+def read_gsettings(key: str) -> str | None:
+    text = _command(["gsettings", "get", "org.gnome.desktop.interface", key], 2)
+    return text.strip().strip("'") if text else None
+
+
+def gsettings_scheme(value: str | None) -> str | None:
+    return {"prefer-dark": "dark", "prefer-light": "light", "default": "light"}.get(value or "")
+
+
+def gsettings_accent(value: str | None) -> str | None:
+    return GNOME_ACCENTS.get((value or "").lower())
+
+
+class SystemAppearance(QtCore.QObject):
+    """Light/dark and the accent colour from the desktop: the XDG desktop
+    portal first, then Qt's style hints (light/dark only), then GNOME's
+    gsettings, then the Qt palette's Highlight for the accent. Emits
+    changed when the portal or gsettings report a new value."""
+
+    changed = Signal()
+
+    def __init__(self, parent: QtCore.QObject | None = None, listen: bool = True):
+        super().__init__(parent)
+        self.values: dict[str, object] = {}
+        self._debounce = QtCore.QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(150)
+        self._debounce.timeout.connect(self._reread)
+        self._monitor = None
+        self.refresh()
+        if listen:
+            self._listen()
+
+    def refresh(self) -> None:
+        self.values = {
+            "portal_scheme": portal_scheme(read_portal("color-scheme")),
+            "portal_accent": portal_accent(read_portal("accent-color")),
+            "gsettings_scheme": gsettings_scheme(read_gsettings("color-scheme")),
+            "gsettings_accent": gsettings_accent(read_gsettings("accent-color")),
+        }
+
+    def scheme(self, app: QtWidgets.QApplication | None) -> str | None:
+        return (self.values.get("portal_scheme") or qt_hint_scheme(app)
+                or self.values.get("gsettings_scheme"))
+
+    def accent(self, palette: QtGui.QPalette | None = None) -> tuple[str | None, str]:
+        """(hex colour, where it came from) or (None, "")."""
+        if self.values.get("portal_accent"):
+            return self.values["portal_accent"], "portal"
+        if self.values.get("gsettings_accent"):
+            return self.values["gsettings_accent"], "gsettings"
+        if palette is not None:
+            highlight = palette.color(QtGui.QPalette.ColorRole.Highlight)
+            if highlight.isValid() and highlight.saturationF() > 0.05:
+                return highlight.name().upper(), "palette"
+        return None, ""
+
+    def _listen(self) -> None:
+        try:
+            from PySide6 import QtDBus
+        except ImportError:
+            QtDBus = None
+        if QtDBus is not None and QT_BINDING == "PySide6":
+            bus = QtDBus.QDBusConnection.sessionBus()
+            if bus.isConnected():
+                bus.connect(PORTAL_SERVICE, PORTAL_PATH, PORTAL_SETTINGS, "SettingChanged",
+                            self, QtCore.SLOT("_setting_changed(QDBusMessage)"))
+        # GNOME's accent-color reaches the portal only through some backends,
+        # so its own change notifications are watched as well.
+        self._monitor = QtCore.QProcess(self)
+        self._monitor.setProgram("gsettings")
+        self._monitor.setArguments(["monitor", "org.gnome.desktop.interface"])
+        self._monitor.setStandardInputFile(QtCore.QProcess.nullDevice())
+        self._monitor.readyReadStandardOutput.connect(self._monitor_output)
+        self._monitor.start()
+
+    @Slot("QDBusMessage")
+    def _setting_changed(self, message) -> None:
+        arguments = message.arguments()
+        if arguments and arguments[0] == APPEARANCE:
+            self._debounce.start()
+
+    def _monitor_output(self) -> None:
+        text = bytes(self._monitor.readAllStandardOutput()).decode("utf-8", "replace")
+        if re.search(r"^(color-scheme|accent-color):", text, re.MULTILINE):
+            self._debounce.start()
+
+    def _reread(self) -> None:
+        before = dict(self.values)
+        self.refresh()
+        if self.values != before:
+            self.changed.emit()
+
+    def stop(self) -> None:
+        if self._monitor is not None and self._monitor.state() != QtCore.QProcess.ProcessState.NotRunning:
+            self._monitor.kill()
+            self._monitor.waitForFinished(500)
 
 
 def build_palette(tokens: ThemeTokens) -> QtGui.QPalette:
@@ -255,177 +538,454 @@ def build_palette(tokens: ThemeTokens) -> QtGui.QPalette:
 
 
 def build_stylesheet(t: ThemeTokens) -> str:
+    """Material 3 components as Qt style sheet rules.
+
+    Type scale: headline-medium page titles, title-medium card titles,
+    body-medium text, label-large buttons. Shapes follow SHAPE_*.
+    """
+    ui = font_family_css(FONT_UI)
+    mono = font_family_css(FONT_MONO)
+    hover = t.hover_layer
+    press = t.press_layer
+    primary_hover = _layer(t.primary, 0.08)
+    primary_press = _layer(t.primary, 0.12)
     return f"""
-QMainWindow, QDialog {{
-    background-color: {t.bg_window};
-    color: {t.text_primary};
+QMainWindow, QDialog, QMessageBox {{
+    background-color: {t.window_bg};
+    color: {t.on_surface};
+}}
+
+QDialog, QMessageBox {{
+    background-color: {t.surface_container_high};
 }}
 
 QWidget {{
-    color: {t.text_primary};
-    font-size: 13px;
+    color: {t.on_surface};
+    font-family: {ui};
+    font-size: 14px;
 }}
 
-QFrame#HeaderBar {{
-    background-color: {t.bg_header};
-    border-bottom: 1px solid {t.border};
+QLabel {{
+    background: transparent;
 }}
 
-QLabel#BrandTitle {{
-    font-size: 15px;
-    font-weight: 700;
-    color: {t.text_primary};
+/* Type scale ----------------------------------------------------------- */
+QLabel[role="page-title"] {{
+    font-size: 28px;
+    font-weight: 400;
+    color: {t.on_surface};
 }}
 
-QLabel#BrandSubtitle {{
-    font-size: 11px;
-    font-weight: 600;
-    color: {t.text_muted};
-    background-color: {t.bg_subtle};
-    border: 1px solid {t.border};
-    border-radius: 5px;
-    padding: 2px 7px;
+QLabel[role="page-subtitle"] {{
+    font-size: 14px;
+    color: {t.on_surface_variant};
 }}
 
-QFrame[segmented="true"] {{
-    background-color: {t.bg_subtle};
-    border: 1px solid {t.border};
-    border-radius: 9px;
-    padding: 2px;
+QLabel[role="hero-title"] {{
+    font-size: 24px;
+    font-weight: 400;
 }}
 
-QPushButton[segment="true"] {{
-    background-color: transparent;
-    color: {t.text_secondary};
-    border: none;
-    border-radius: 7px;
-    padding: 5px 12px;
+QLabel[role="numeric"] {{
+    font-feature-settings: "tnum";
+}}
+
+QLabel[role="stat-value"] {{
+    font-size: 28px;
+    font-weight: 400;
+}}
+
+QLabel[role="stat-label"] {{
+    font-size: 12px;
     font-weight: 500;
+    color: {t.on_surface_variant};
 }}
 
-QPushButton[segment="true"]:hover {{
-    color: {t.text_primary};
-    background-color: {t.bg_card};
-}}
-
-QPushButton[segment="true"]:checked {{
-    background-color: {t.bg_card};
-    color: {t.text_primary};
-    font-weight: 600;
-    border: 1px solid {t.border};
-}}
-
-QFrame[card="true"] {{
-    background-color: {t.bg_card};
-    border: 1px solid {t.border};
-    border-radius: 12px;
+QLabel[role="sidebar-brand"] {{
+    font-size: 22px;
+    font-weight: 400;
+    color: {t.on_surface};
 }}
 
 QLabel[role="card-title"] {{
-    font-size: 14px;
-    font-weight: 600;
-    color: {t.text_primary};
+    font-size: 16px;
+    font-weight: 500;
+    color: {t.on_surface};
 }}
 
 QLabel[role="section-subtitle"] {{
-    font-size: 12px;
-    font-weight: 600;
-    color: {t.text_secondary};
+    font-size: 14px;
+    font-weight: 500;
+    color: {t.on_surface_variant};
 }}
 
 QLabel[role="field-label"] {{
-    font-size: 13px;
-    color: {t.text_secondary};
+    font-size: 14px;
+    color: {t.on_surface};
 }}
 
 QLabel[role="helper"] {{
     font-size: 12px;
-    color: {t.text_muted};
+    color: {t.on_surface_variant};
 }}
 
+QLabel[role="error"] {{
+    font-size: 12px;
+    color: {t.error};
+}}
+
+/* Cards: tonal panes on the window surface ------------------------------ */
+QFrame[card="true"] {{
+    background-color: {t.pane};
+    border: none;
+    border-radius: {SHAPE_L}px;
+}}
+
+QFrame[card="outlined"] {{
+    background-color: transparent;
+    border: 1px solid {t.outline_variant};
+    border-radius: {SHAPE_M}px;
+}}
+
+QFrame#FooterBar {{
+    background-color: {t.surface_container_high};
+    border: none;
+    border-radius: {SHAPE_L}px;
+}}
+
+QFrame#Divider {{
+    background-color: {t.outline_variant};
+    border: none;
+    max-height: 1px;
+    min-height: 1px;
+}}
+
+/* Status chips (assist-chip shape) -------------------------------------- */
 QLabel[badge="true"] {{
     font-size: 12px;
-    font-weight: 600;
-    border-radius: 10px;
-    padding: 2px 10px;
+    font-weight: 500;
+    border-radius: {SHAPE_S}px;
+    padding: 4px 10px;
 }}
 
 QLabel[badge="true"][tone="neutral"] {{
-    background-color: {t.bg_subtle};
-    color: {t.text_secondary};
-    border: 1px solid {t.border};
+    background-color: transparent;
+    color: {t.on_surface_variant};
+    border: 1px solid {t.outline_variant};
 }}
 
 QLabel[badge="true"][tone="success"] {{
-    background-color: {t.success_bg};
-    color: {t.success};
-    border: 1px solid {t.success_border};
+    background-color: {t.success_container};
+    color: {t.on_success_container};
+    border: 1px solid {t.success_container};
 }}
 
 QLabel[badge="true"][tone="danger"] {{
-    background-color: {t.danger_bg};
-    color: {t.danger};
-    border: 1px solid {t.danger_border};
+    background-color: {t.error_container};
+    color: {t.on_error_container};
+    border: 1px solid {t.error_container};
 }}
 
 QLabel[badge="true"][tone="busy"] {{
-    background-color: {t.warning_bg};
-    color: {t.warning};
-    border: 1px solid {t.warning_border};
+    background-color: {t.warning_container};
+    color: {t.on_warning_container};
+    border: 1px solid {t.warning_container};
 }}
 
 QLabel[badge="true"][tone="accent"] {{
-    background-color: {t.accent_soft};
-    color: {t.accent_text};
-    border: 1px solid {t.border_focus};
+    background-color: {t.secondary_container};
+    color: {t.on_secondary_container};
+    border: 1px solid {t.secondary_container};
 }}
 
-QLineEdit, QComboBox {{
-    background-color: {t.bg_input};
-    color: {t.text_primary};
-    border: 1px solid {t.border_strong};
-    border-radius: 8px;
+/* Buttons: outlined by default; filled, tonal, text and error variants --- */
+QPushButton {{
+    background-color: transparent;
+    color: {t.primary};
+    border: 1px solid {t.outline};
+    border-radius: 20px;
+    padding: 0px 22px;
+    min-height: 38px;
+    font-size: 14px;
+    font-weight: 500;
+}}
+
+QPushButton:hover {{
+    background-color: {primary_hover};
+}}
+
+QPushButton:pressed {{
+    background-color: {primary_press};
+}}
+
+QPushButton:focus {{
+    border: 2px solid {t.primary};
+    padding: 0px 21px;
+}}
+
+QPushButton:disabled {{
+    color: {_layer(t.on_surface, 0.38)};
+    border-color: {_layer(t.on_surface, 0.12)};
+    background-color: transparent;
+}}
+
+/* Every variant keeps a 1px border, transparent where unseen: a radius over
+   half the button's height makes Qt draw square corners. */
+QPushButton[variant="primary"] {{
+    background-color: {t.primary};
+    color: {t.on_primary};
+    border: 1px solid transparent;
+    padding: 0px 24px;
+}}
+
+QPushButton[variant="primary"]:hover {{
+    background-color: {t.accent_hover};
+}}
+
+QPushButton[variant="primary"]:pressed {{
+    background-color: {t.accent_pressed};
+}}
+
+QPushButton[variant="primary"]:focus {{
+    border: 2px solid {t.on_primary_container};
+    padding: 0px 22px;
+}}
+
+QPushButton[variant="primary"]:disabled, QPushButton[variant="tonal"]:disabled,
+QPushButton[variant="danger"]:disabled, QPushButton[variant="option"]:disabled {{
+    background-color: {_layer(t.on_surface, 0.12)};
+    color: {_layer(t.on_surface, 0.38)};
+    border: 1px solid transparent;
+}}
+
+QPushButton[variant="tonal"], QPushButton[variant="option"] {{
+    background-color: {t.secondary_container};
+    color: {t.on_secondary_container};
+    border: 1px solid transparent;
+    padding: 0px 24px;
+}}
+
+QPushButton[variant="tonal"]:hover, QPushButton[variant="option"]:hover {{
+    background-color: {_over(t.on_secondary_container, t.secondary_container, 0.08)};
+}}
+
+QPushButton[variant="tonal"]:pressed, QPushButton[variant="option"]:pressed {{
+    background-color: {_over(t.on_secondary_container, t.secondary_container, 0.12)};
+}}
+
+QPushButton[variant="tonal"]:focus, QPushButton[variant="option"]:focus {{
+    border: 2px solid {t.primary};
+    padding: 0px 22px;
+}}
+
+QPushButton[variant="danger"] {{
+    background-color: {t.error};
+    color: {t.on_error};
+    border: 1px solid transparent;
+    padding: 0px 24px;
+}}
+
+QPushButton[variant="danger"]:hover {{
+    background-color: {t.danger_hover};
+}}
+
+QPushButton[variant="danger"]:pressed {{
+    background-color: {t.danger_pressed};
+}}
+
+QPushButton[variant="ghost"] {{
+    background-color: transparent;
+    color: {t.primary};
+    border: 1px solid transparent;
+    padding: 0px 12px;
+}}
+
+QPushButton[variant="ghost"]:hover {{
+    background-color: {primary_hover};
+}}
+
+QPushButton[variant="ghost"]:pressed {{
+    background-color: {primary_press};
+}}
+
+QPushButton[variant="ghost"]:focus {{
+    border: 2px solid {t.primary};
+    padding: 0px 10px;
+}}
+
+QPushButton[variant="ghost"]:disabled {{
+    border: 1px solid transparent;
+}}
+
+QToolButton {{
+    background-color: transparent;
+    border: none;
+    border-radius: 20px;
+    padding: 6px;
+    color: {t.on_surface_variant};
+}}
+
+QToolButton:hover {{
+    background-color: {hover};
+}}
+
+QToolButton:pressed {{
+    background-color: {press};
+}}
+
+QToolButton:focus {{
+    border: 2px solid {t.primary};
+}}
+
+/* Segmented buttons ------------------------------------------------------ */
+QFrame[segmented="true"] {{
+    background-color: transparent;
+    border: 1px solid {t.outline};
+    border-radius: 20px;
+}}
+
+QPushButton[segment="true"] {{
+    background-color: transparent;
+    color: {t.on_surface};
+    border: none;
+    border-left: 1px solid {t.outline};
+    border-radius: 0px;
+    padding: 0px 16px;
+    min-height: 38px;
+    font-weight: 500;
+}}
+
+QPushButton[segment="true"][first="true"] {{
+    border-left: none;
+    border-top-left-radius: 19px;
+    border-bottom-left-radius: 19px;
+}}
+
+QPushButton[segment="true"][last="true"] {{
+    border-top-right-radius: 19px;
+    border-bottom-right-radius: 19px;
+}}
+
+QPushButton[segment="true"]:hover {{
+    background-color: {hover};
+}}
+
+QPushButton[segment="true"]:checked {{
+    background-color: {t.secondary_container};
+    color: {t.on_secondary_container};
+}}
+
+QPushButton[segment="true"]:focus {{
+    padding: 0px 16px;
+    border-top: none;
+    border-bottom: none;
+    border-right: none;
+    background-color: {_layer(t.on_surface, 0.10)};
+}}
+
+QPushButton[segment="true"]:checked:focus {{
+    background-color: {_over(t.on_secondary_container, t.secondary_container, 0.10)};
+}}
+
+/* Text fields: outlined ---------------------------------------------- */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
+    background-color: transparent;
+    color: {t.on_surface};
+    border: 1px solid {t.outline};
+    border-radius: {SHAPE_XS}px;
+    padding: 8px 12px;
+    min-height: 22px;
+    selection-background-color: {t.primary};
+    selection-color: {t.on_primary};
+}}
+
+/* The editor's inset comes from its text margins: this padding is lost
+   when the style sheet is replaced. */
+QAbstractSpinBox QLineEdit {{
+    background: transparent;
+    border: none;
+    padding: 0px;
+    min-height: 0px;
+}}
+
+/* Without an explicit origin, a styled spin box with no buttons
+   gives its editor a width of 1 pixel. */
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{
+    width: 0px;
+    border: none;
+    subcontrol-origin: border;
+}}
+
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {{
+    border-color: {t.on_surface};
+}}
+
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
+    border: 2px solid {t.primary};
     padding: 7px 11px;
-    min-height: 20px;
-    selection-background-color: {t.accent};
-    selection-color: {t.text_on_accent};
-}}
-
-QLineEdit:hover, QComboBox:hover {{
-    border-color: {t.text_muted};
-}}
-
-QLineEdit:focus, QComboBox:focus {{
-    border: 1.5px solid {t.border_focus};
-    padding: 6.5px 10.5px;
 }}
 
 QLineEdit:disabled, QComboBox:disabled {{
-    background-color: {t.bg_input_disabled};
-    color: {t.text_disabled};
-    border-color: {t.border};
+    color: {_layer(t.on_surface, 0.38)};
+    border-color: {_layer(t.on_surface, 0.12)};
+}}
+
+QLineEdit[readonlyField="true"] {{
+    background-color: transparent;
+    border: none;
+    border-bottom: 1px solid {t.outline_variant};
+    border-radius: 0px;
+    padding: 6px 2px;
+}}
+
+QLineEdit[readonlyField="true"]:hover, QLineEdit[readonlyField="true"]:focus {{
+    border: none;
+    border-bottom: 1px solid {t.primary};
+    padding: 6px 2px;
+}}
+
+/* Search bar: full-pill, surface-container-high ------------------------- */
+QLineEdit#SearchField {{
+    background-color: {t.surface_container_high};
+    border: none;
+    border-radius: 24px;
+    padding: 0px 16px 0px 4px;
+    min-height: 48px;
+    font-size: 16px;
+    color: {t.on_surface};
+}}
+
+QLineEdit#SearchField:hover {{
+    background-color: {_over(t.on_surface, t.surface_container_high, 0.08)};
+}}
+
+QLineEdit#SearchField:focus {{
+    border: none;
+    padding: 0px 16px 0px 4px;
+    background-color: {t.surface_container_highest};
+}}
+
+QLineEdit#SearchField:disabled {{
+    background-color: {_layer(t.on_surface, 0.04)};
 }}
 
 QComboBox {{
-    padding-right: 32px;
+    padding-right: 36px;
+}}
+
+QComboBox:focus {{
+    padding-right: 35px;
 }}
 
 QComboBox QLineEdit {{
     border: none;
     padding: 0px;
-    margin: 0px;
     background: transparent;
-    min-height: 0px;
 }}
 
 QComboBox::drop-down {{
-    subcontrol-origin: border;
-    subcontrol-position: top right;
-    width: 28px;
-    border-left: 1px solid {t.border};
-    border-top-right-radius: 8px;
-    border-bottom-right-radius: 8px;
-    background: transparent;
+    border: none;
+    width: 36px;
 }}
 
 QComboBox::down-arrow {{
@@ -435,178 +995,267 @@ QComboBox::down-arrow {{
 }}
 
 QComboBox QAbstractItemView {{
-    background-color: {t.bg_card};
-    color: {t.text_primary};
-    border: 1px solid {t.border_strong};
-    border-radius: 8px;
-    padding: 4px;
-    selection-background-color: {t.accent};
-    selection-color: {t.text_on_accent};
-    outline: 0;
-}}
-
-QPlainTextEdit#DiffPreview {{
-    background-color: {t.bg_code};
-    color: {t.text_primary};
-    border: 1px solid {t.border};
-    border-radius: 9px;
-    padding: 2px;
-    selection-background-color: {t.accent};
-    selection-color: {t.text_on_accent};
-}}
-
-QPushButton {{
-    background-color: {t.bg_card};
-    color: {t.text_primary};
-    border: 1px solid {t.border_strong};
-    border-radius: 8px;
-    padding: 7px 16px;
-    font-weight: 600;
-    min-height: 20px;
-}}
-
-QPushButton:hover {{
-    background-color: {t.bg_subtle};
-    border-color: {t.text_muted};
-}}
-
-QPushButton:pressed {{
-    background-color: {t.border};
-}}
-
-QPushButton:disabled {{
-    background-color: {t.bg_input_disabled};
-    color: {t.text_disabled};
-    border-color: {t.border};
-}}
-
-QPushButton[variant="primary"] {{
-    background-color: {t.accent};
-    color: {t.text_on_accent};
-    border: 1px solid {t.accent};
-}}
-
-QPushButton[variant="primary"]:hover {{
-    background-color: {t.accent_hover};
-    border-color: {t.accent_hover};
-}}
-
-QPushButton[variant="primary"]:pressed {{
-    background-color: {t.accent_pressed};
-    border-color: {t.accent_pressed};
-}}
-
-QPushButton[variant="primary"]:disabled {{
-    background-color: {t.bg_subtle};
-    color: {t.text_disabled};
-    border-color: {t.border};
-}}
-
-QPushButton[variant="danger"] {{
-    background-color: {t.danger};
-    color: {t.text_on_accent};
-    border: 1px solid {t.danger};
-}}
-
-QPushButton[variant="danger"]:hover {{
-    background-color: {t.danger_hover};
-    border-color: {t.danger_hover};
-}}
-
-QPushButton[variant="danger"]:pressed {{
-    background-color: {t.danger_pressed};
-    border-color: {t.danger_pressed};
-}}
-
-QFrame#FooterBar {{
-    background-color: {t.bg_card};
-    border: 1px solid {t.border};
-    border-radius: 12px;
-}}
-
-QFrame#Divider {{
-    background-color: {t.border};
-    max-height: 1px;
-    min-height: 1px;
-}}
-
-QProgressBar {{
-    background-color: {t.bg_subtle};
+    background-color: {t.surface_container};
+    color: {t.on_surface};
     border: none;
-    border-radius: 3px;
-    max-height: 5px;
-    min-height: 5px;
+    border-radius: {SHAPE_XS}px;
+    padding: 8px 0px;
+    outline: none;
+    selection-background-color: {hover};
+    selection-color: {t.on_surface};
+}}
+
+QPlainTextEdit, QTextEdit {{
+    background-color: transparent;
+    color: {t.on_surface};
+    border: 1px solid {t.outline};
+    border-radius: {SHAPE_XS}px;
+    padding: 6px 8px;
+    selection-background-color: {t.primary};
+    selection-color: {t.on_primary};
+}}
+
+QPlainTextEdit:focus, QTextEdit:focus {{
+    border: 2px solid {t.primary};
+    padding: 5px 7px;
+}}
+
+QPlainTextEdit#DiffPreview, QPlainTextEdit#LogView {{
+    background-color: {t.surface_container_low};
+    border: none;
+    border-radius: {SHAPE_M}px;
+    font-family: {mono};
+    font-size: 12px;
+    padding: 10px 12px;
+}}
+
+/* Progress, sliders --------------------------------------------------- */
+QProgressBar {{
+    background-color: {t.secondary_container};
+    border: none;
+    border-radius: 2px;
+    max-height: 4px;
+    min-height: 4px;
+    text-align: center;
+    color: transparent;
 }}
 
 QProgressBar::chunk {{
-    background-color: {t.accent};
-    border-radius: 3px;
+    background-color: {t.primary};
+    border-radius: 2px;
+}}
+
+QSlider::groove:horizontal {{
+    height: 4px;
+    background: {t.secondary_container};
+    border-radius: 2px;
+}}
+
+QSlider::sub-page:horizontal {{
+    background: {t.primary};
+    border-radius: 2px;
+}}
+
+QSlider::handle:horizontal {{
+    background: {t.primary};
+    width: 20px;
+    height: 20px;
+    margin: -8px 0;
+    border-radius: 10px;
+}}
+
+/* Lists and the songs data table ---------------------------------------- */
+QTableView, QTreeView, QListView {{
+    background-color: transparent;
+    alternate-background-color: transparent;
+    border: none;
+    outline: none;
+    gridline-color: transparent;
+    selection-background-color: {t.secondary_container};
+    selection-color: {t.on_secondary_container};
+}}
+
+QTableView::item, QTreeView::item {{
+    border: none;
+    border-bottom: 1px solid {t.outline_variant};
+    padding: 0px 10px;
+}}
+
+QTableView::item:hover, QTreeView::item:hover {{
+    background-color: {hover};
+}}
+
+QTableView::item:selected, QTreeView::item:selected, QListView::item:selected {{
+    background-color: {t.secondary_container};
+    color: {t.on_secondary_container};
+}}
+
+QListView::item {{
+    border-radius: {SHAPE_M}px;
+    padding: 6px 10px;
+}}
+
+QListView::item:hover {{
+    background-color: {hover};
+}}
+
+QHeaderView {{
+    background-color: transparent;
+    border: none;
+}}
+
+QHeaderView::section {{
+    background-color: transparent;
+    color: {t.on_surface_variant};
+    border: none;
+    border-bottom: 1px solid {t.outline_variant};
+    padding: 0px 10px;
+    min-height: 44px;
+    font-size: 13px;
+    font-weight: 500;
+}}
+
+QHeaderView::section:hover {{
+    background-color: {hover};
+    color: {t.on_surface};
+}}
+
+QAbstractScrollArea::corner, QTableCornerButton::section {{
+    background: transparent;
+    border: none;
+}}
+
+/* Tabs: primary tabs with a 3 px indicator ------------------------------ */
+QTabWidget::pane {{
+    border: none;
+    border-top: 1px solid {t.outline_variant};
+    top: -1px;
+}}
+
+QTabBar {{
+    background: transparent;
+    qproperty-drawBase: 0;
+}}
+
+QTabBar::tab {{
+    background: transparent;
+    color: {t.on_surface_variant};
+    border: none;
+    border-bottom: 3px solid transparent;
+    padding: 12px 16px 9px 16px;
+    font-size: 14px;
+    font-weight: 500;
+}}
+
+QTabBar::tab:selected {{
+    color: {t.primary};
+    border-bottom: 3px solid {t.primary};
+}}
+
+QTabBar::tab:hover {{
+    background-color: {hover};
+}}
+
+QCheckBox {{
+    spacing: 10px;
+}}
+
+QSplitter::handle {{
+    background: transparent;
 }}
 
 QScrollArea {{
-    background-color: transparent;
+    background: transparent;
     border: none;
 }}
 
 QScrollArea > QWidget > QWidget {{
-    background-color: transparent;
+    background: transparent;
 }}
 
 QScrollBar:vertical {{
     background: transparent;
     width: 10px;
-    margin: 2px 2px 2px 2px;
+    margin: 4px 2px 4px 0px;
 }}
 
 QScrollBar::handle:vertical {{
-    background: {t.scrollbar_handle};
-    min-height: 28px;
-    border-radius: 3px;
+    background: {t.outline_variant};
+    border-radius: 4px;
+    min-height: 32px;
 }}
 
 QScrollBar::handle:vertical:hover {{
-    background: {t.scrollbar_hover};
+    background: {t.outline};
 }}
 
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
-    background: transparent;
+QScrollBar::add-line, QScrollBar::sub-line {{
     height: 0px;
+    width: 0px;
+}}
+
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical,
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+    background: transparent;
 }}
 
 QScrollBar:horizontal {{
     background: transparent;
     height: 10px;
-    margin: 2px 2px 2px 2px;
+    margin: 0px 4px 2px 4px;
 }}
 
 QScrollBar::handle:horizontal {{
-    background: {t.scrollbar_handle};
-    min-width: 28px;
-    border-radius: 3px;
+    background: {t.outline_variant};
+    border-radius: 4px;
+    min-width: 32px;
 }}
 
 QScrollBar::handle:horizontal:hover {{
-    background: {t.scrollbar_hover};
+    background: {t.outline};
 }}
 
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal,
-QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
-    background: transparent;
-    width: 0px;
-}}
-
+/* Plain tooltip and menus ---------------------------------------------- */
 QToolTip {{
-    background-color: {t.bg_card};
-    color: {t.text_primary};
-    border: 1px solid {t.border_strong};
-    border-radius: 6px;
+    background-color: {t.inverse_surface};
+    color: {t.inverse_on_surface};
+    border: none;
+    border-radius: {SHAPE_XS}px;
     padding: 4px 8px;
+    font-size: 12px;
 }}
 
-QMessageBox {{
-    background-color: {t.bg_card};
-    color: {t.text_primary};
+QMenu {{
+    background-color: {t.surface_container};
+    color: {t.on_surface};
+    border: none;
+    border-radius: {SHAPE_XS}px;
+    padding: 8px 0px;
+}}
+
+QMenu::item {{
+    padding: 9px 24px 9px 16px;
+    background: transparent;
+}}
+
+QMenu::item:selected {{
+    background-color: {hover};
+}}
+
+QMenu::item:disabled {{
+    color: {_layer(t.on_surface, 0.38)};
+}}
+
+QMenu::separator {{
+    height: 1px;
+    background: {t.outline_variant};
+    margin: 8px 0px;
+}}
+
+QMenu::indicator {{
+    width: 18px;
+    height: 18px;
+    left: 8px;
 }}
 """
 
@@ -716,22 +1365,57 @@ def make_theme_icon(mode: str, color: str, size: int = 14) -> QtGui.QIcon:
     return _render_icon(size, draw)
 
 
+def load_color_source(path: Path | None = None) -> str:
+    """Where the seed colour comes from; follows the system unless the
+    owner chose the cover or a swatch."""
+    try:
+        payload = json.loads((path or ui_prefs_path()).read_text(encoding="utf-8"))
+        source = payload.get("color_source") if isinstance(payload, dict) else None
+    except (OSError, ValueError):
+        source = None
+    return source if source in COLOR_SOURCES else "system"
+
+
+def load_seed_preference(path: Path | None = None) -> str:
+    """The fallback seed colour saved with the UI preferences."""
+    try:
+        payload = json.loads((path or ui_prefs_path()).read_text(encoding="utf-8"))
+        seed = payload.get("seed") if isinstance(payload, dict) else None
+        if isinstance(seed, str):
+            podlink_m3.hex_to_argb(seed)
+            return seed.upper()
+    except (OSError, ValueError):
+        pass
+    return DEFAULT_SEED
+
+
 class ThemeManager(QtCore.QObject):
-    """Applies Follow-System / Light / Dark themes and persists UI preference."""
+    """Applies Follow-System / Light / Dark with a Material 3 seed colour,
+    and persists the mode. system_changed fires when the desktop's
+    light/dark or accent colour changes."""
 
     theme_changed = Signal(str, str)
+    system_changed = Signal()
 
     def __init__(self, app: QtWidgets.QApplication,
                  prefs_path: Path | None = None,
-                 parent: QtCore.QObject | None = None):
+                 parent: QtCore.QObject | None = None,
+                 appearance: SystemAppearance | None = None):
         super().__init__(parent)
         self.app = app
         self.prefs_path = prefs_path
         self._system_palette = QtGui.QPalette(app.palette())
         self._applying = False
+        self.appearance = appearance if appearance is not None else SystemAppearance(self)
+        self.appearance.changed.connect(self._on_appearance_changed)
+        if hasattr(self.appearance, "stop"):
+            app.aboutToQuit.connect(self.appearance.stop)
         self.mode = load_theme_preference(self.prefs_path)
-        self.resolved = resolve_theme(self.mode, self.app, self._system_palette)
-        self.tokens = tokens_for(self.resolved)
+        self.color_source = load_color_source(self.prefs_path)
+        self.swatch_seed = load_seed_preference(self.prefs_path)
+        self.seed = self.swatch_seed if self.color_source == "swatch" else self.system_seed()
+        self.resolved = resolve_theme(self.mode, self.app, self._system_palette, self.appearance)
+        self.tokens = tokens_for(self.resolved, self.seed)
 
         if "Fusion" in QtWidgets.QStyleFactory.keys():
             self.app.setStyle("Fusion")
@@ -739,6 +1423,17 @@ class ThemeManager(QtCore.QObject):
         hints = self.app.styleHints()
         if hints is not None and hasattr(hints, "colorSchemeChanged"):
             hints.colorSchemeChanged.connect(self._on_system_scheme_changed)
+
+    def system_accent(self) -> tuple[str | None, str]:
+        return self.appearance.accent(self._system_palette)
+
+    def system_seed(self) -> str:
+        return self.system_accent()[0] or DEFAULT_SEED
+
+    def _on_appearance_changed(self) -> None:
+        if self.mode == "system":
+            self.apply("system", persist=False)
+        self.system_changed.emit()
 
     def _sync_qt_color_scheme(self, mode: str) -> None:
         hints = self.app.styleHints()
@@ -768,8 +1463,9 @@ class ThemeManager(QtCore.QObject):
         self._applying = True
         try:
             self._sync_qt_color_scheme(target_mode)
-            resolved = resolve_theme(target_mode, self.app, self._system_palette)
-            tokens = tokens_for(resolved)
+            resolved = resolve_theme(target_mode, self.app, self._system_palette,
+                                     self.appearance)
+            tokens = tokens_for(resolved, self.seed)
             self.mode = target_mode
             self.resolved = resolved
             self.tokens = tokens
@@ -785,3 +1481,12 @@ class ThemeManager(QtCore.QObject):
 
         self.theme_changed.emit(self.mode, self.resolved)
         return self.resolved
+
+    def set_seed(self, seed: str) -> bool:
+        """Re-theme from a new source colour; False when it is unchanged."""
+        seed = podlink_m3.argb_to_hex(podlink_m3.hex_to_argb(seed))
+        if seed == self.seed:
+            return False
+        self.seed = seed
+        self.apply(persist=False)
+        return True
