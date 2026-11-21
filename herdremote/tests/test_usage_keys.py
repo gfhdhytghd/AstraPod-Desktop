@@ -10,12 +10,12 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'usb_remote_key'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import herdremote
 import hrkeys
 import hrproto
 import hrusagekeys
-import usb_remote_key as bridge
+from usb_remote_key import usb_remote_key as bridge
 
 
 class Deferred:

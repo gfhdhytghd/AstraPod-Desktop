@@ -6,9 +6,10 @@ import subprocess
 import sys
 
 
-ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from firmware_checkout import MISSING_FIRMWARE, find_firmware
 SOURCES = [
-    'tools/herdremote/cover_thumb.c',
     *('apps-ipod/draw/' + name + '.c' for name in
       ('jpeg_load', 'png_load', 'gif_load', 'webp_load', 'resize', 'bmp', 'image_load')),
     'apps-ipod/files/byte_stream.c',
@@ -18,12 +19,12 @@ SOURCES = [
 ]
 
 
-def build(output):
+def build(root, output):
     output.mkdir(parents=True, exist_ok=True)
     config = output / 'config'
     config.mkdir(exist_ok=True)
     if not (config / 'Makefile').exists():
-        subprocess.run([ROOT / 'tools/configure', '--target=ipod6g',
+        subprocess.run([root / 'tools/configure', '--target=ipod6g',
                         '--type=s', '--appsdir=apps-ipod'], cwd=config, check=True)
     dry = subprocess.check_output(
         ['make', '-n', str(config / 'apps-ipod/draw/jpeg_load.o')],
@@ -32,11 +33,14 @@ def build(output):
                                if ' -c ' in line and 'jpeg_load.c' in line))
     flags = command[:command.index('-c')]
     subprocess.run([*flags, '-ffunction-sections', '-fdata-sections',
-                    *(ROOT / source for source in SOURCES),
+                    HERE / 'cover_thumb.c', *(root / source for source in SOURCES),
                     '-Wl,--gc-sections', '-o', output / 'cover-thumb'], check=True)
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
         sys.exit('Usage: build-cover-thumb.py OUTPUT_DIR')
-    build(Path(sys.argv[1]).resolve())
+    root = find_firmware()
+    if root is None:
+        sys.exit(MISSING_FIRMWARE)
+    build(root, Path(sys.argv[1]).resolve())

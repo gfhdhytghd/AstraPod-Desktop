@@ -1,8 +1,10 @@
 """Captured IR -> host Menu down/up -> real EP0/button sampler -> keymaps."""
 from pathlib import Path
 import ast,re,subprocess,sys
-R=Path(__file__).resolve().parents[2];O=Path(sys.argv[1]).resolve();O.mkdir(parents=True,exist_ok=True)
-sys.path.insert(0,str(R/'tools/usb_remote_key/tests'))
+from _support import DESKTOP, require_firmware
+
+R=require_firmware();O=Path(sys.argv[1]).resolve();O.mkdir(parents=True,exist_ok=True)
+sys.path.insert(0,str(DESKTOP/'usb_remote_key/tests'))
 import test_gestures as gestures
 from test_usb_remote_key import k
 

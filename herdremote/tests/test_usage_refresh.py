@@ -193,7 +193,8 @@ class RefreshTests(unittest.TestCase):
         self.auth('grok',False)
         conn=Mock()
         fetch=Mock(side_effect=[usage.ExpiredToken('expired'),({'wk_pct':7},'fixture')])
-        with patch.object(usage.os,'setsid'),patch.object(usage,'limits_fetcher',return_value=fetch), \
+        with patch.object(usage.os,'setsid'),patch.object(usage.os,'getpgrp',return_value=-1), \
+             patch.object(usage,'limits_fetcher',return_value=fetch), \
              patch.object(usage,'cli_running',return_value=False),patch.object(usage,'run_refresh_cli',return_value='success'):
             usage._refresh_worker(conn,'grok',self.home)
         self.assertEqual(fetch.call_count,2)
@@ -204,7 +205,8 @@ class RefreshTests(unittest.TestCase):
         self.auth('grok')
         fetch=Mock(side_effect=usage.ExpiredToken('expired'))
         conn=Mock()
-        with patch.object(usage.os,'setsid'),patch.object(usage,'limits_fetcher',return_value=fetch), \
+        with patch.object(usage.os,'setsid'),patch.object(usage.os,'getpgrp',return_value=-1), \
+             patch.object(usage,'limits_fetcher',return_value=fetch), \
              patch.object(usage,'cli_running',return_value=False),patch.object(usage,'run_refresh_cli',return_value='login required'):
             usage._refresh_worker(conn,'grok',self.home)
         self.assertEqual(fetch.call_count,2)
@@ -214,7 +216,8 @@ class RefreshTests(unittest.TestCase):
         self.auth('grok')
         fetch=Mock(side_effect=usage.ExpiredToken('expired'))
         conn=Mock()
-        with patch.object(usage.os,'setsid'),patch.object(usage,'limits_fetcher',return_value=fetch), \
+        with patch.object(usage.os,'setsid'),patch.object(usage.os,'getpgrp',return_value=-1), \
+             patch.object(usage,'limits_fetcher',return_value=fetch), \
              patch.object(usage,'cli_running',return_value=True),patch.object(usage,'run_refresh_cli') as run:
             usage._refresh_worker(conn,'grok',self.home)
         run.assert_not_called()
@@ -224,7 +227,8 @@ class RefreshTests(unittest.TestCase):
     def test_fresh_token_after_external_refresh_skips_cli(self):
         conn=Mock()
         fetch=Mock(return_value=({'wk_pct':9},'fixture'))
-        with patch.object(usage.os,'setsid'),patch.object(usage,'limits_fetcher',return_value=fetch), \
+        with patch.object(usage.os,'setsid'),patch.object(usage.os,'getpgrp',return_value=-1), \
+             patch.object(usage,'limits_fetcher',return_value=fetch), \
              patch.object(usage,'run_refresh_cli') as run:
             usage._refresh_worker(conn,'grok',self.home)
         run.assert_not_called()

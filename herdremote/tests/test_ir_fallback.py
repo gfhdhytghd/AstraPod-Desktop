@@ -8,10 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 sys.path.insert(0,str(Path(__file__).parents[1]))
-sys.path.insert(0,str(Path(__file__).parents[2]/'usb_remote_key'))
+sys.path.insert(0,str(Path(__file__).parents[2]))
 import hrdisk
 import hrfallback
-import host_fallback
+from usb_remote_key import host_fallback
 
 
 class Fixture:

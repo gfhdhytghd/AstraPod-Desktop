@@ -20,7 +20,7 @@ from zipfile import ZipFile
 from PIL import Image, ImageGrab
 
 HERE = Path(__file__).resolve().parent
-REPO = HERE.parents[1]
+from _support import DESKTOP, require_firmware
 
 
 def instrument(source):
@@ -51,6 +51,7 @@ def prepare(root, package, scene):
             for name in assets.namelist():
                 if not name.startswith(('.rockbox/tools/', '.rockbox/rockbox.ipod')):
                     assets.extract(name, root)
+    (rockbox / 'wps').mkdir(exist_ok=True)
     (rockbox / 'wps/fu79.wps').write_text(
         '%V(0,0,320,240,-)\n%Cl(70,25,180,180,c,c)\n%Cd\n%ac%it\n')
     (rockbox / 'config01.cfg').unlink(missing_ok=True)
@@ -65,7 +66,7 @@ def prepare(root, package, scene):
 
 
 def serve(args, sock, stop, trace):
-    sys.path.insert(0, str(args.host / 'tools/herdremote'))
+    sys.path.insert(0, str(args.host / 'herdremote'))
     import hrcider
 
     def offline(*_args, **_kwargs):
@@ -295,7 +296,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--instrument',type=Path)
     parser.add_argument('--sim',type=lambda p: Path(p).resolve())
-    parser.add_argument('--host',type=lambda p: Path(p).resolve(),default=REPO)
+    parser.add_argument('--host',type=lambda p: Path(p).resolve(),default=DESKTOP)
     parser.add_argument('--fixtures',type=lambda p: Path(p).resolve())
     parser.add_argument('--package',type=Path)
     parser.add_argument('--out',type=lambda p: Path(p).resolve())
@@ -309,9 +310,10 @@ if __name__ == '__main__':
     parser.add_argument('--verify',action='store_true')
     arguments = parser.parse_args()
     if arguments.instrument:
-        instrument(arguments.instrument)
+        instrument(require_firmware(arguments.instrument))
     elif arguments.analyze:
         print(analyze(arguments.analyze, arguments.scene, arguments.verify))
     else:
+        require_firmware()
         logging.basicConfig(filename=arguments.out.parent / 'host-sim.log', level=logging.INFO)
         run(arguments)

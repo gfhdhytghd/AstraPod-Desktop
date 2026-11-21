@@ -1,7 +1,7 @@
 """AstraPod desktop: the iPod library, import, sync and remote companion.
 
 Parts map:
-  qt.py         Qt binding, sys.path for tools/ and tools/herdremote/
+  qt.py         Qt binding, sys.path for tools/ and herdremote/
   contracts.py  dataclasses of the shared interfaces, used when the real
                 modules are missing
   backends.py   real adapters: device library, daemon socket, plugin host

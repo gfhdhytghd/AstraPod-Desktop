@@ -60,8 +60,7 @@ Top-level MENU opens `Leave Agents?`: SELECT leaves, MENU stays.
 
 Older firmware keeps its existing controls and first-tab workspace list.
 The unchanged v1 heartbeat and agent frames remain available. Pre-NAV2
-firmware ignores new tab/detail frames. Typed detail ships with the matching eleven-field firmware from
-[DETAIL-DESIGN.md](../../../ipod/DETAIL-DESIGN.md). A nine-field-only player
+firmware ignores new tab/detail frames. Typed detail ships with the [matching eleven-field firmware](https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/herdremote-protocol.md). A nine-field-only player
 rejects the eleven-field record; other v1 messages keep their shape.
 
 It uses local herdr and Codex app-server sockets, and read-only Claude
@@ -86,8 +85,7 @@ or focus request reports a failure rather than retrying with these calls.
 
 ## Requirements
 
-- Python 3.9 or later, pyserial and websockets (`pip install -r
-  tools/herdremote/requirements.txt`).
+- Python 3.10 or later and the dependencies in `herdremote/requirements.txt`.
 - herdr running on this computer.
 - Read and write access to the player's tty. A desktop session usually has
   it; if the log says `Permission denied`, add yourself to the group that
@@ -96,7 +94,7 @@ or focus request reports a failure rather than retrying with these calls.
 ## Running it
 
 ```sh
-python3 tools/herdremote/herdremote.py
+python3 herdremote/herdremote.py
 ```
 
 Then plug the player in and open **System > Agents**. The program waits for
@@ -121,11 +119,13 @@ the times in a small state file; a restart keeps the order.
 
 ## As a user service
 
-`herdremote.service` runs it in the background and logs to the journal:
+`herdremote.service` runs it in the background and logs to the journal.
+See [User services](../README.md#user-services) for the checkout and venv paths:
 
 ```sh
-cp tools/herdremote/herdremote.service ~/.config/systemd/user/
-systemctl --user edit --full herdremote   # point ExecStart at your checkout
+mkdir -p ~/.config/systemd/user
+cp herdremote/herdremote.service ~/.config/systemd/user/
+systemctl --user daemon-reload
 systemctl --user enable --now herdremote
 journalctl --user -u herdremote -f
 ```
@@ -153,8 +153,7 @@ Use the workspace, pane, and question IDs from state events. Send `voice`
 with `release` or `cancel` after `press`. Closing that client discards
 its outstanding hold.
 `reload` applies desktop settings while the PodLink session stays open.
-See [Interface 2](../../.specifications/astrapod-desktop.md#interface-2-daemon-desktop-api-stream-b-provides-d-consumes)
-for operation arguments and result fields.
+See [the desktop API server](hrdesktop.py) for command dispatch and events.
 
 ## Hold to talk
 
@@ -229,7 +228,7 @@ unmatched releases do not stop a recording started elsewhere.
 Tests use mocked D-Bus only:
 
 ```sh
-python3 -m unittest discover -s tools/herdremote/tests -p test_voice.py -v
+python3 -m unittest discover -s herdremote/tests -p test_voice.py -v
 ```
 
 Do not use real `HoldStart`/`HoldStartRaw` as a smoke test: they open the
@@ -320,7 +319,7 @@ Success confirms the tool's exit status; it does not inspect the input
 field. The keyboard tests mock every input tool:
 
 ```sh
-python3 -m unittest discover -s tools/herdremote/tests -p test_keys.py -v
+python3 -m unittest discover -s herdremote/tests -p test_keys.py -v
 ```
 
 ## What the player shows
@@ -399,7 +398,7 @@ notice changes. No runtime service is installed or restarted by packaging.
 
 ## Navigation v2 wire contract
 
-[The protocol](../../docs/podbox/herdremote-protocol.md#navigation-v2--protocol-ready)
+[The protocol](https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/herdremote-protocol.md#navigation-v2--protocol-ready)
 contains the frozen `PROTOCOL READY` contract. No version bump is needed.
 
 - `sub <ws> [<tab_id>]` subscribes to that tab's `A` rows. Omit the tab to
@@ -436,7 +435,7 @@ Tests use a private fake herdr socket, mocked key/voice tools and pseudo
 terminals. They never focus real panes, inject real keys, or open a microphone:
 
 ```sh
-python3 -m unittest discover -s tools/herdremote/tests -v
+python3 -m unittest discover -s herdremote/tests -v
 ```
 
 These host tests do not establish on-device UI behavior or deployed-service
@@ -478,11 +477,11 @@ They are test data, never executable instructions. The parser does not add a
 new live secret filter; fixture redaction is separate from display parsing.
 
 ```sh
-python3 -m unittest discover -s tools/herdremote/tests -p test_detail.py -v
+python3 -m unittest discover -s herdremote/tests -p test_detail.py -v
 ```
 
 Deploy `hrappserver.py`, `hrsession.py`, `herdremote.py`, `hrherdr.py`,
-`hrproto.py` and the sibling `tools/podlink.py` together. Install the listed
+`hrproto.py` and the sibling `podlink.py` together. Install the listed
 Python dependencies. Keep `hrdetail.py` for the visible-only fallback. There is no change to focus,
 keyboard or voice commands and no wire-version bump.
 
@@ -495,9 +494,7 @@ or off-input cursor data falls back to the input end. When nonempty input
 has no recognized visible cursor, its end is the fallback. The adapter never
 requests merged history or moves the computer viewport. The fake herdr can
 return either the legacy record or a record containing cursor metadata.
-The approved [DETAIL-DESIGN.md](../../../ipod/DETAIL-DESIGN.md) owns all
-field order, budgets, escaping, truncation, state wording and presentation.
-The backend implements it; it does not choose alternate display rules.
+The [HerdRemote protocol](https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/herdremote-protocol.md) defines the fields and their budgets.
 
 ## Scroll latency
 
@@ -524,8 +521,8 @@ The synchronous `--once` path remains available. To measure the command path
 without touching a real desktop, use the fake-server benchmark:
 
 ```sh
-python3 tools/herdremote/tests/bench_focus_latency.py --revision 39fc19ab61 --samples 8
-python3 tools/herdremote/tests/bench_focus_latency.py --samples 8
+python3 herdremote/tests/bench_focus_latency.py --revision HEAD --samples 8
+python3 herdremote/tests/bench_focus_latency.py --samples 8
 ```
 
 `arrival_to_R` includes time waiting for the daemon to poll the fake link;
@@ -547,12 +544,12 @@ focus/keys, opens a player, starts voice, or controls the deployed service.
 | `hrherdr.py` | herdr socket client, and the model the player is sent |
 | `hrdetail.py` | Parses typed task/activity/message/steps from recent pane text |
 | `hrdetect.py` | Finds a choice question in a pane's text, and the keys that answer it |
-| `hrproto.py` | The messages; `docs/podbox/herdremote-protocol.md` describes them |
+| `hrproto.py` | The messages; [HerdRemote protocol](https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/herdremote-protocol.md) describes them |
 | `hrvoice.py` | Session-bus voice calls, hold ownership and independent stop watchdog |
 | `hrkeys.py` | Whitelisted desktop key taps, counted batches and bounded outstanding work |
 | `hrremotelog.py` | Bounded background writer for the player's remote diagnostics |
 | `hrrufin.py` | Rufin web-controller backend: discovery, token, state, lists, art (FU56) |
-| `tests/` | `python3 -m unittest discover -s tools/herdremote/tests` |
+| `tests/` | `python3 -m unittest discover -s herdremote/tests` |
 
 ## Detail stability and diagnostics
 
@@ -577,11 +574,8 @@ Playing. The existing Remote input screen's SELECT file logger is unchanged.
 Enable the PodLink USB profile and use the existing HerdRemote tty owner.
 Opening Agents is not required to stream. Do not open a second tty reader.
 
-Deploy the matching `herdremote.py` **and `hrremotelog.py`** from the package's
-`.rockbox/tools/herdremote/` with the other existing host files. This package
-does not install or restart a service. A running old process keeps its old
-code until its owner deploys/restarts it. Once the matching host is running,
-read the regular file live (no disk mode or additional device access):
+Use a HerdRemote checkout that supports remote log streaming. Read the host log
+while the daemon is running:
 
 ```sh
 tail -F ~/.local/state/podbox/remote-live.log
@@ -665,16 +659,8 @@ never queues them. A running bounded tool call may finish after release;
 an unstarted worker expires before the 150 ms IR release timeout. Error
 cleanup sends releases only, with no retry of the batch.
 
-Host files to deploy together, from this ZIP:
-- tools/usb_remote_key/usb_remote_key.py and its README.md;
-- tools/herdremote/herdremote.py, hrproto.py, hrkeys.py, new hrusagekeys.py,
-  and README.md;
-- docs/herdremote-protocol.md (this document).
-
-The existing remaining HerdRemote siblings, podlink.py, units, requirements
-and udev rules remain compatible and are bundled. The IR serial open remains
-O_RDONLY. No installation, key injection, device access or service operation
-is performed by the offline build/tests.
+Update HerdRemote and the USB remote bridge from the same AstraPod Desktop
+checkout. The IR serial port is opened read-only.
 
 ## Detail host keys and Cover Flow gestures (Follow-up 16)
 
@@ -785,9 +771,9 @@ inventory pages, offers/bytes, misses, durable fills and end-to-end art ACKs.
 The device's five-second `localdiag` records appear at INFO without enabling
 Remote Log. Full-cache progress counts rendered M+XS+S CRCs confirmed by the
 device; it is not a claim that the strict continuous-scroll gate passed.
-See `docs/podbox/cider-remote-protocol.md` and `FU30-REPORT.md` for limitations.
+See [Cider remote protocol](https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/cider-remote-protocol.md) for limitations.
 
-FU31 merged candidate also requires the matching `tools/podlink.py`: wire
+FU31 merged candidate also requires the matching `podlink.py`: wire
 liveness uses independent one-second nonce probes with a three-second deadline,
 and `localdiag-live` firmware additionally echoes Cider CH challenges without
 bulk credits. A stale tty/application or a replacement session closes and
@@ -795,10 +781,8 @@ reopens through the normal daemon loop. An idle Cider library is not inferred
 from the absence of art/page/control requests. See the Cider protocol document
 for compatibility and deadline details.
 
-When deploying the FU31 package, also deploy its
-`.rockbox/tools/usb_remote_key/usb_remote_key.py` to
-`~/.local/share/podbox-usbkey/usb_remote_key.py`. Updating only firmware leaves
-the old forwarder unable to send the FU30 previous/next/play EP0 keys.
+Use the USB remote bridge from the same desktop checkout for the
+previous/next/play EP0 keys.
 
 FU31b: snapshots now read one `/api/v2/playback` response for metadata,
 artwork, timing, modes, rate and app volume. Now Playing pages and selection
@@ -962,9 +946,8 @@ It authorizes debounced IR fallback and reuses this daemon's KeyTaps and
 HoldToTalk instances at current desktop focus. Keyboard/voice commands from
 the player are suppressed while fallback owns desktop input, including the
 EP0-failed/CDC-live case. No new network listener or dependency is added.
-Deploy it together with the matching bridge's `host_fallback.py` and the six
-runtime files listed in `docs/podbox/ir-host-fallback.md`. Both herdremote and
-podbox-usbkey require restart after the copies; FU44 performs neither action.
+Use the matching bridge from this checkout. See the
+[IR host fallback guide](../docs/ir-host-fallback.md) for deployment.
 
 ### T3 connection
 

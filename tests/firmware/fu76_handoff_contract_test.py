@@ -8,9 +8,7 @@ import subprocess
 import sys
 import time
 
-ROOT = Path(__file__).resolve().parents[2]
-SOURCE = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else ROOT
-sys.path[:0] = [str(ROOT / 'tools'), str(SOURCE / 'tools/herdremote')]
+from _support import require_firmware
 import hrhandoff
 import podlink
 
@@ -43,7 +41,7 @@ static void pcmbuf_play_start(void) {}
 def compile_firmware(root, out):
     # Share the hardware ports from the FU75 fixture. The firmware under test
     # comes from the nominated tree, including every formatter and parser.
-    fixture = ast.parse((ROOT / 'tools/tests/fu75_handoff_test.py').read_text())
+    fixture = ast.parse((root / 'tools/tests/fu75_handoff_test.py').read_text())
     ports = next(ast.literal_eval(node.value) for node in fixture.body
                  if isinstance(node, ast.Assign)
                  and any(isinstance(t, ast.Name) and t.id == 'ports' for t in node.targets))
@@ -327,10 +325,11 @@ def scenario(lib, mode):
 
 
 def main():
+    source = require_firmware(sys.argv[2] if len(sys.argv) > 2 else None)
     out = Path(sys.argv[1]).resolve()
     out.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(level=logging.INFO, format='%(message)s')
-    lib = compile_firmware(SOURCE, out)
+    lib = compile_firmware(source, out)
     modes = sys.argv[3:] or ('success', 'latency', 'busy', 'early', 'presync', 'decline',
                              'timeout', 'verify-timeout', 'unplug', 'host-fail')
     for mode in modes:

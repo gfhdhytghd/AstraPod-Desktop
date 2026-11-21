@@ -1,8 +1,10 @@
 """Compare the host provider's port against the real native parser."""
 from pathlib import Path
 import ctypes,json,random,re,subprocess,sys
-R=Path(__file__).resolve().parents[2];O=Path(sys.argv[1]).resolve();O.mkdir(parents=True,exist_ok=True)
-sys.path.insert(0,str(R/'tools/herdremote'));from hrcider_featured import featured_guests
+from _support import require_firmware
+
+R=require_firmware();O=Path(sys.argv[1]).resolve();O.mkdir(parents=True,exist_ok=True)
+from hrcider_featured import featured_guests
 subprocess.run(['cc','-shared','-fPIC','-std=gnu11','-Wall','-Wextra','-Werror','-I'+str(R/'apps-ipod/database'),str(R/'apps-ipod/database/db_featured_parse.c'),'-o',str(O/'featured.so')],check=True)
 lib=ctypes.CDLL(str(O/'featured.so'))
 class Names(ctypes.Structure):_fields_=[('count',ctypes.c_int),('name',ctypes.c_void_p*8),('length',ctypes.c_int*8)]

@@ -6,16 +6,15 @@ with serial `2543030725032a2a`. It forwards Apple (`ee 87`) Menu commands
 remote pairing ID. Left/Right/Play continue through the Dock unchanged. It never writes to or flashes the IR
 receiver. Stop any other reader of that receiver before starting this bridge.
 
-Install on the computer connected to the dock:
+Install [the Python environment](../README.md#install) on the computer
+connected to the dock. For the unit paths, see [User services](../README.md#user-services).
 
 ```sh
-python3 -m venv ~/.local/share/podbox-usbkey/venv
-~/.local/share/podbox-usbkey/venv/bin/pip install -r tools/usb_remote_key/requirements.txt
-sudo cp tools/usb_remote_key/70-podbox-usbkey.rules /etc/udev/rules.d/
+sudo cp usb_remote_key/70-podbox-usbkey.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 mkdir -p ~/.config/systemd/user
-cp tools/usb_remote_key/podbox-usbkey.service ~/.config/systemd/user/
-# Edit ExecStart if this checkout is at another path.
+cp usb_remote_key/podbox-usbkey.service ~/.config/systemd/user/
+# Edit WorkingDirectory and ExecStart for another checkout path.
 systemctl --user daemon-reload
 systemctl --user enable --now podbox-usbkey
 journalctl --user -u podbox-usbkey -f
@@ -74,11 +73,10 @@ The native button sampler merges the state with the dock button state;
 its existing queue emits `BUTTON_RC_MENU` or `BUTTON_RC_SELECT` and their
 press/repeat/release transitions. Firmware does not classify a Menu hold into Select.
 
-Run offline tests without opening either device:
+Run the host tests from AstraPod Desktop:
 
 ```sh
-python3 -m unittest discover -s tools/usb_remote_key/tests -v
-python3 tools/tests/usb_remote_key_test.py build-usbkey/probe
+python -m pytest -q usb_remote_key/tests
 ```
 
 ## Volume reports and fallback
@@ -124,9 +122,8 @@ performs no pairing. There is no measured/matched 80 ms window to calibrate.
 The LOG writer is unchanged. S2 below requires both bridge and HerdRemote
 runtime updates. No service deployment is performed by this offline task.
 
-```sh
-python3 tools/tests/agents_volume_sources_test.py build-usbkey/sources
-```
+Run [the volume source probe](https://github.com/gfhdhytghd/AstraPod/blob/master/tools/tests/agents_volume_sources_test.py)
+from the firmware checkout.
 
 ## Agents MENU exit and USB consent (Follow-up 15 S1)
 
@@ -196,16 +193,8 @@ never queues them. A running bounded tool call may finish after release;
 an unstarted worker expires before the 150 ms IR release timeout. Error
 cleanup sends releases only, with no retry of the batch.
 
-Host files to deploy together, from this ZIP:
-- tools/usb_remote_key/usb_remote_key.py and its README.md;
-- tools/herdremote/herdremote.py, hrproto.py, hrkeys.py, new hrusagekeys.py,
-  and README.md;
-- docs/herdremote-protocol.md (this document).
-
-The existing remaining HerdRemote siblings, podlink.py, units, requirements
-and udev rules remain compatible and are bundled. The IR serial open remains
-O_RDONLY. No installation, key injection, device access or service operation
-is performed by the offline build/tests.
+Update HerdRemote and the USB remote bridge from the same AstraPod Desktop
+checkout. The IR serial port is opened read-only.
 
 ## Detail host keys and Cover Flow gestures (Follow-up 16)
 
@@ -292,11 +281,7 @@ An old profile-2 host paired with new firmware keeps Dock transport without
 duplicates. A new host paired with old firmware keeps Dock transport through
 profile 1, but strict MENU/SELECT ownership requires the new firmware. The full
 compatibility table is in `docs/covers-navigation.md` in the release package
-(source: `docs/podbox/covers-navigation.md`).
-
-The package includes `disk_mode.py`, `herdremote.py`, `hrdisk.py`, and
-`podlink_disk.py` from the FU42 base revision so the forwarder has its runtime
-dependencies and the combined firmware's Disk Mode handshake remains usable.
+(see [Covers navigation](https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/covers-navigation.md)).
 
 ## FU44 host fallback
 
@@ -305,6 +290,4 @@ HerdRemote's private local API for the exact Usage keyboard/voice mapping.
 Recovery requires working EP0 plus an open PodLink session. FU43 routing is
 retained while connected. FU42 Disk Mode long-MENU eject has exclusive MENU
 priority. Six physical IR keys include centre's SELECT-tap/PLAY-hold meanings.
-See `docs/podbox/ir-host-fallback.md` in source, or
-`.rockbox/docs/ir-host-fallback.md` in the package, for all gestures, safety
-limits, tests, host files and exact service restart instructions.
+See [IR host fallback](../docs/ir-host-fallback.md) for gestures, timing and deployment.

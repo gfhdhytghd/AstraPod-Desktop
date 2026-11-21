@@ -4,7 +4,7 @@ One message is one PodLink TEXT frame of UTF-8. Records are separated by
 '\\n' and fields by '\\t'; the first field of the first record names the
 message. Field text never contains either separator or any other control
 character: encode() replaces them with spaces.
-docs/podbox/herdremote-protocol.md is the reference; tools/herdremote/tests
+AstraPod's docs/podbox/herdremote-protocol.md is the reference; herdremote/tests
 checks this module against it.
 """
 import unicodedata

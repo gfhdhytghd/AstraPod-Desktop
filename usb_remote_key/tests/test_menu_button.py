@@ -2,8 +2,8 @@
 import unittest
 import sys
 from pathlib import Path
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-import usb_remote_key as k
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
+from usb_remote_key import usb_remote_key as k
 
 class MenuButton(unittest.TestCase):
     def test_down_immediate_hold_refresh_release(self):

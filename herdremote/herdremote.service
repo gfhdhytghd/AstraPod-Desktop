@@ -1,6 +1,6 @@
 # User service for HerdRemote. Install:
 #   cp herdremote.service ~/.config/systemd/user/
-#   systemctl --user edit herdremote     (set ExecStart to your checkout)
+#   systemctl --user daemon-reload
 #   systemctl --user enable --now herdremote
 #   journalctl --user -u herdremote -f
 [Unit]
@@ -8,7 +8,8 @@ Description=HerdRemote: herdr agents on the iPod's System > Agents
 After=default.target
 
 [Service]
-ExecStart=/usr/bin/python3 %h/podbox/tools/herdremote/herdremote.py
+WorkingDirectory=%h/.local/share/astrapod/desktop
+ExecStart=%h/.local/share/astrapod/desktop/.venv/bin/python herdremote/herdremote.py
 # Without this the journal gets the log in blocks, minutes late
 Environment=PYTHONUNBUFFERED=1
 # Inherit DBUS_SESSION_BUS_ADDRESS from the graphical session's user manager.

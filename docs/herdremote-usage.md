@@ -1,8 +1,8 @@
 # HerdRemote subscription usage (computer side)
 
 Updated for Amendments 1–5 and corrected Amendment 8 on 2026-11-04. The implementation is
-`tools/herdremote/hrusage.py`; the wire shape remains `us` → `U/P/N` in
-[herdremote-protocol.md](herdremote-protocol.md). No model/prompt request is made.
+`herdremote/hrusage.py`; the wire shape remains `us` → `U/P/N` in
+[herdremote-protocol.md](https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/herdremote-protocol.md). No model/prompt request is made.
 
 ## Omarchy reference and chosen interfaces
 
@@ -177,7 +177,7 @@ Grok sessions. agy usage includes any models used through that client, under
 its Gemini service row.
 ## Price table
 
-`tools/herdremote/usage_prices.json` stores USD per million tokens, source URL,
+`herdremote/usage_prices.json` stores USD per million tokens, source URL,
 verification date, and `confirmed` for every entry. Exact known IDs and dated
 Claude snapshot suffixes are supported. Unknown or unconfirmed IDs count tokens
 but cost zero; the note says `unpriced model; cost partial`. No family substitution.
@@ -283,8 +283,8 @@ authentication location.
 ## Read-only diagnostic and tests
 
 ```
-python3 tools/herdremote/herdremote.py --usage-dump --usage-wait 120
-python3 -m unittest discover -s tools/herdremote/tests -v
+python3 herdremote/herdremote.py --usage-dump --usage-wait 120
+python3 -m unittest discover -s herdremote/tests -v
 ```
 
 The dump starts the background collectors, waits up to the chosen budget for
@@ -300,7 +300,7 @@ Updated HerdRemote and firmware advertise `disk-mode-v1` with the resident
 `DH\t1\tdisk-mode-v1` hello. Run:
 
 ```sh
-python3 tools/herdremote/podlink_disk.py --timeout 20
+python3 herdremote/podlink_disk.py --timeout 20
 ```
 
 The CLI talks only to the running daemon's private Unix socket, by default

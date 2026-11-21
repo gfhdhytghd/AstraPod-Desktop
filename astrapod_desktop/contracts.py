@@ -1,6 +1,6 @@
 """Interface 1 and 3 records, used when the real modules are not importable.
 
-They mirror the field lists in .specifications/astrapod-desktop.md; the GUI
+They mirror the library and sync records used by HerdRemote. The GUI
 reads records only by attribute, so the real classes drop in unchanged.
 """
 from __future__ import annotations

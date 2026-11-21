@@ -13,14 +13,13 @@ from pathlib import Path
 import re
 import struct
 import subprocess
-import sys
 import tempfile
 import time
 from zipfile import ZipFile
 
 from PIL import ImageChops, ImageGrab
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'herdremote'))
+from _support import require_firmware
 from hrspectrum import FRAME, RATE, WINDOW, band_levels
 
 
@@ -270,6 +269,7 @@ if __name__ == '__main__':
     parser.add_argument('paths', type=Path, nargs='*')
     args = parser.parse_args()
     if args.instrument:
-        instrument(args.instrument.resolve())
+        instrument(require_firmware(args.instrument))
     else:
+        require_firmware()
         capture(*(arg.resolve() for arg in args.paths))

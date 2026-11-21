@@ -5,9 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 import pytest
 
-sys.path.insert(0,str(Path(__file__).parents[1]))
-import host_fallback as h
-import usb_remote_key as k
+sys.path.insert(0,str(Path(__file__).parents[2]))
+from usb_remote_key import host_fallback as h
+from usb_remote_key import usb_remote_key as k
 
 
 def frame(code):return bytes([0xee,0x87,code,0x59])
@@ -138,7 +138,7 @@ def test_ep0_fresh_get_configuration_and_failure_without_any_device_io():
 
 
 def test_disk_priority_survives_ep0_failure_using_verified_volume():
-    import disk_mode
+    from usb_remote_key import disk_mode
     remote=Mock();remote.disk_status.return_value=None
     disk=disk_mode.DiskMode(remote,find=lambda:'/dev/mock-ipod1')
     disk.submit=Mock()

@@ -11,8 +11,7 @@ adapters. Cooperative service stepping is deterministic, not a scheduler test.
 """
 import argparse,collections,copy,json,os,queue,select,socket,subprocess,sys,threading,time,types
 from pathlib import Path
-R=Path(__file__).resolve().parents[2]
-sys.path[:0]=[str(R/'tools/herdremote'),str(R/'tools')]
+from _support import require_firmware
 import herdremote,hrproto,hrherdr,podlink
 
 class FakeHerdr(threading.Thread):
@@ -145,7 +144,12 @@ def run(exe,data,out,variant,iterations):
     for _ in range(3):action()
     action('ACTION_AGENTS_REMOTE_TALK','PLAY',10,True)
     action('ACTION_AGENTS_TALK_END','NONE',40,False)
-   result=action('ACTION_STD_MENU','MENU');assert result=='EXIT 0',result
+   # Menu returns from Usage or Detail through Spaces before exiting.
+   for _ in range(3):
+    result=action('ACTION_STD_MENU','MENU')
+    if result=='EXIT 0':break
+    assert result.startswith('WAIT '),result
+   assert result=='EXIT 0',result
   port.close();d.voice.stop();d.remote_log.close()
   assert not (out/'sanitizer.log').read_text(),(out/'sanitizer.log').read_text()
   summary=dict(variant=variant,entries=iterations,workspaces=len(snap['workspaces']),tabs=len(snap['tabs']),panes=len(snap['panes']),messages=len(records),max_host_text=max((x['length'] for x in records if x['direction']=='host' and x['type']==2),default=0),host_text_types=dict(collections.Counter(bytes.fromhex(x['hex']).split(b'\t')[0].decode(errors='replace') for x in records if x['direction']=='host' and x['type']==2)),voice_calls=d.voice.bus.calls,key_calls=len(tool.calls),asan_ubsan='PASS',hardware_scheduler='not simulated')
@@ -155,4 +159,5 @@ def run(exe,data,out,variant,iterations):
   (out/'messages.json').write_text(json.dumps(records,indent=2)+'\n');(out/'actions.json').write_text(json.dumps(seq,indent=2)+'\n');(out/'herdr-calls.json').write_text(json.dumps(server.calls,indent=2)+'\n');server.close()
 
 if __name__=='__main__':
+ require_firmware()
  p=argparse.ArgumentParser(description=__doc__);p.add_argument('--exe',type=Path,required=True);p.add_argument('--data',type=Path,required=True);p.add_argument('--out',type=Path,required=True);p.add_argument('--variant',choices=['captured','no-questions','stress'],default='captured');p.add_argument('--iterations',type=int,default=50);a=p.parse_args();run(a.exe.resolve(),a.data.resolve(),a.out.resolve(),a.variant,a.iterations)

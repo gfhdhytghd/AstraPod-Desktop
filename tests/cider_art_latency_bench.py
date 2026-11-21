@@ -3,8 +3,8 @@ Actual host code and wall clock; fixture CDN and 1 ms/frame transport, no device
 """
 from pathlib import Path
 import sys,io,time,threading,json,logging,statistics,zlib
-r=Path(__file__).resolve().parents[2];o=Path(sys.argv[1]).resolve();o.mkdir(parents=True,exist_ok=True)
-sys.path.insert(0,str(r/'tools/herdremote'))
+r=Path(__file__).resolve().parents[1];o=Path(sys.argv[1]).resolve();o.mkdir(parents=True,exist_ok=True)
+sys.path.insert(0,str(r/'herdremote'))
 from hrcider import Bridge,Client,render,decode_chunk
 from hrcider_cache import Cache,art_id
 from PIL import Image

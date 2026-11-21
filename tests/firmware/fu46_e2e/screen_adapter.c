@@ -5,6 +5,14 @@ extern void bridge_assert(int, const char *);
 #define CHECK(x) bridge_assert(!!(x), #x)
 extern int bridge_action(int *raw, int *held);
 extern void bridge_advance(int ticks);
+/* The fixture drives navigation and leaves the on-device keyboard closed. */
+int dialog_input(char *text, int buflen)
+{
+    (void)text;
+    (void)buflen;
+    return -1;
+}
+
 static int raw_button, held_button;
 static struct viewport test_vp = {.width=320,.height=210,.font=FONT_UI};
 struct viewport *lcd_current_viewport = &test_vp;

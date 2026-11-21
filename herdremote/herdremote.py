@@ -7,10 +7,10 @@ picture of herdr current: workspaces, tabs, the selected tab's agents,
 live pane detail, and choice questions. Commands from the player
 focus local herdr clients (all clients on older servers) or answer the question.
 
-    python3 tools/herdremote/herdremote.py            # run until stopped
-    python3 tools/herdremote/herdremote.py --once     # print the model once
+    python3 herdremote/herdremote.py            # run until stopped
+    python3 herdremote/herdremote.py --once     # print the model once
 
-Dependencies: Python 3.9+, pyserial. Logs go to stdout.
+Dependencies: Python 3.10+, pyserial and websockets. Logs go to stdout.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -27,7 +27,7 @@ import time
 import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import podlink  # noqa: E402  tools/podlink.py: the PodLink frame codec
+import podlink  # noqa: E402  podlink.py: the PodLink frame codec
 
 import hrdisk
 import hragent

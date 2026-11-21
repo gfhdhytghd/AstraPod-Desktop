@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AstraPod desktop entry point; the application is tools/astrapod_desktop/."""
+"""AstraPod desktop entry point; the application is astrapod_desktop/."""
 from __future__ import annotations
 
 from pathlib import Path

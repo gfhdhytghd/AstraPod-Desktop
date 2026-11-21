@@ -4,7 +4,7 @@
 
 Make a directory in `~/.local/share/astrapod/plugins/` or
 `$XDG_DATA_HOME/astrapod/plugins/` if you set `XDG_DATA_HOME`.
-Repository plugins go in `tools/astrapod_plugins/`. The host discovers
+Repository plugins go in `astrapod_plugins/`. The host discovers
 plugins when it is constructed. It logs invalid manifests and duplicate
 IDs. A repository plugin takes priority over a user plugin with the same ID.
 
@@ -50,7 +50,7 @@ except EOFError:
     pass
 ```
 
-From the repository, change to `tools/` and run:
+From the repository root with the virtual environment active, run:
 
 ```sh
 python -m astrapod_plugins list
@@ -149,19 +149,17 @@ launch supervision and `stop()` to release the processes.
 
 ## Migrate the systemd user service
 
-On the host connected to the dock, keep the receiver's udev rules and the
-existing `podbox-usbkey` virtual environment with PyUSB and libusb. Run the
-following from the repository root. Stop the desktop's embedded plugin
-host before enabling `apple-ir` for the service. When a second host starts,
-it reports waiting while the first host owns the plugin.
+Keep the receiver's udev rules and install libusb. Set up the checkout and
+virtual environment as described in [User services](../README.md#user-services).
+Run from that checkout. Stop the desktop's embedded plugin host before starting
+the service. If a second host starts, it reports waiting while the first host
+owns the plugin.
 
 ```sh
-install -d "$HOME/.local/share/astrapod/tools" "$HOME/.config/systemd/user"
-cp -R tools/astrapod_plugins tools/usb_remote_key "$HOME/.local/share/astrapod/tools/"
-install -m 644 tools/astrapod_plugins/astrapod-plugins.service "$HOME/.config/systemd/user/"
+install -d "$HOME/.config/systemd/user"
+install -m 644 astrapod_plugins/astrapod-plugins.service "$HOME/.config/systemd/user/"
 systemctl --user disable --now podbox-usbkey.service
-cd "$HOME/.local/share/astrapod/tools"
-"$HOME/.local/share/podbox-usbkey/venv/bin/python" -m astrapod_plugins enable apple-ir
+.venv/bin/python -m astrapod_plugins enable apple-ir
 systemctl --user daemon-reload
 systemctl --user enable --now astrapod-plugins.service
 journalctl --user -u astrapod-plugins.service -f

@@ -19,8 +19,8 @@ import time
 import types
 from unittest import mock
 
-ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / 'tools/herdremote'))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'herdremote'))
 import herdremote
 import hrherdr
 import hrproto
@@ -149,9 +149,9 @@ def load_daemon(revision):
     if not revision:
         return herdremote
     source = subprocess.check_output(['git', '-C', str(ROOT), 'show',
-                                     revision + ':tools/herdremote/herdremote.py'])
+                                     revision + ':herdremote/herdremote.py'])
     module = types.ModuleType('pinned_daemon')
-    module.__file__ = str(ROOT / 'tools/herdremote/herdremote.py')
+    module.__file__ = str(ROOT / 'herdremote/herdremote.py')
     exec(compile(source, module.__file__, 'exec'), module.__dict__)
     return module
 

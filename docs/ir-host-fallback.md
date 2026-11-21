@@ -53,9 +53,9 @@ Source evidence for the existing mappings (unchanged firmware at 527949c328):
 - `apps-ipod/input/keymap_ipod.c:127`: native PLAY start/end and LEFT repeat. `:35` defines native LEFT/RIGHT/SELECT/MENU. `firmware/drivers/button.c:71`, `:83`, `:296`, `:343` define native repeat delay, acceleration and the strictly-greater first-repeat boundary.
 - `apps-ipod/screens/system/agents_screen.c:838`: Usage has zero selectable rows. `:1967` selects the voice target, so Usage uses `-`; Detail uses its pane. `:1993` starts `vd`; `:2024` sends `vc` or `vu`; `:2049` distinguishes short remote/native holds (300/150 ms).
 - `apps-ipod/screens/system/agents_screen.c:3151` maps Usage SELECT to Enter and RIGHT to local navigation; `:3180` maps LEFT to Backspace; `:3243` makes held body SELECT one Enter; `:3250` repeats Backspace. `:2800` and `:3132` make MENU leave and discard. `:3123` gives QuickScreen priority.
-- `apps-ipod/screens/system/agents_screen.c:361` sends `vw\t1` or `vw\tdetail\t<pane>` after Detail focus is ready. `:2942` refreshes it. `tools/herdremote/hrusagekeys.py:11` defines the 750 ms lease, `:76` validates report age under 100 ms and `:101` dispatches guarded batches through `KeyTaps`.
-- `tools/usb_remote_key/usb_remote_key.py:28` names the 0.5/1/4/7 s thresholds; `:178` implements Usage batches; `:212` implements full-frame reset and first-repeat skip.
-- `tools/herdremote/herdremote.py` dispatches `k` via `key_command` and `vd/vu/vc` via `voice_command`; `tools/herdremote/hrkeys.py:149` runs the shared, bounded `KeyTaps` worker. `tools/herdremote/hrvoice.py:149` implements press, `:180` release and `:191` discard. The same configured HoldStart/HoldStartRaw, bus, max-hold watchdog and keyboard backend are used in fallback.
+- `apps-ipod/screens/system/agents_screen.c:361` sends `vw\t1` or `vw\tdetail\t<pane>` after Detail focus is ready. `:2942` refreshes it. `herdremote/hrusagekeys.py:11` defines the 750 ms lease, `:76` validates report age under 100 ms and `:101` dispatches guarded batches through `KeyTaps`.
+- `usb_remote_key/usb_remote_key.py:28` names the 0.5/1/4/7 s thresholds; `:178` implements Usage batches; `:212` implements full-frame reset and first-repeat skip.
+- `herdremote/herdremote.py` dispatches `k` via `key_command` and `vd/vu/vc` via `voice_command`; `herdremote/hrkeys.py:149` runs the shared, bounded `KeyTaps` worker. `herdremote/hrvoice.py:149` implements press, `:180` release and `:191` discard. The same configured HoldStart/HoldStartRaw, bus, max-hold watchdog and keyboard backend are used in fallback.
 
 The desktop focus is never changed by fallback. Keyboard taps target the
 current keyboard focus, as Usage does. Voice uses Usage's `-` target, so even
@@ -128,31 +128,11 @@ input delivery. No typed content or voice transcript is added to logs.
 The bridge logs one INFO `IR mode ipod` / `IR mode host-fallback` per change.
 HerdRemote logs whitelisted fallback action kinds and bounded arrow counts.
 
-## Deployment (instructions only; FU44 does not execute these)
+## Deployment
 
-Read-only `systemctl --user cat herdremote.service podbox-usbkey.service`
-confirmed the installed launch paths for this host. Both units use copied
-scripts, not this worktree. Keep the existing virtual environments, other
-runtime siblings, voice settings and units.
-
-```sh
-src=<repo>
-hr="$HOME/.local/share/podbox-herdremote/tools/herdremote"
-ir="$HOME/.local/share/podbox-usbkey"
-install -m 644 "$src/tools/herdremote/herdremote.py" "$src/tools/herdremote/hrdisk.py" "$src/tools/herdremote/hrfallback.py" "$hr/"
-install -m 644 "$src/tools/usb_remote_key/usb_remote_key.py" "$src/tools/usb_remote_key/disk_mode.py" "$src/tools/usb_remote_key/host_fallback.py" "$ir/"
-systemctl --user restart herdremote.service
-systemctl --user restart podbox-usbkey.service
-journalctl --user -u herdremote.service -u podbox-usbkey.service -n 50 --no-pager
-```
-
-Copy all six runtime files before restarting either service. Restart
-HerdRemote first so the new local API is ready before the bridge. Unit files
-are unchanged, so daemon-reload is not required. These commands are operator
-instructions, not actions performed during the task. No firmware installation
-is required. The package preserves the base firmware and version metadata.
-
-For a ZIP-based deployment, extract the package outside the mounted iPod,
-then use its `.rockbox/tools/herdremote/` and `.rockbox/tools/usb_remote_key/`
-files in the same copy commands. `.rockbox/docs/ir-host-fallback.md` contains
-this mapping and deployment guide.
+Use HerdRemote and the Apple IR plugin or standalone bridge from the same
+AstraPod Desktop checkout. See [User services](../README.md#user-services) for
+the launch paths and [input plugins](input-plugins.md#migrate-the-systemd-user-service)
+for switching from the standalone bridge to the plugin. Keep the receiver's
+udev rules and the HerdRemote voice settings. Start HerdRemote before the
+bridge so its local fallback API is available.

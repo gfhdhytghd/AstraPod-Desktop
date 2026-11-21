@@ -9,10 +9,15 @@ import sys
 
 from PIL import Image, ImageDraw
 
-TOOLS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(TOOLS / 'tests/albumart'))
-from host import ROOT, OUT, FLAGS, CC, function, run, compile_sources
-sys.path.insert(0, str(ROOT / 'tools/herdremote'))
+from _support import DESKTOP, require_firmware
+
+ROOT = require_firmware()
+# The shared firmware builder takes its root and output from env and argv.
+os.environ['ART_TEST_ROOT'] = str(ROOT)
+if len(sys.argv) == 1:
+    sys.argv.append(str(DESKTOP / 'build-remote-palette'))
+sys.path.insert(0, str(ROOT / 'tools/tests/albumart'))
+from host import OUT, FLAGS, CC, function, run, compile_sources
 import hrcider
 
 
@@ -43,12 +48,12 @@ objects = compile_sources(['apps-ipod/draw/color.c', 'apps-ipod/draw/img_filter.
                            'firmware/common/strlcpy.c', 'firmware/common/strmemccpy.c',
                            'lib/fixedpoint/fixedpoint.c',
                            'apps-ipod/screens/playback/cider_model.c'])
-run([CC, *FLAGS, '-I' + str(OUT), TOOLS / 'tests/albumart/remote_palette_probe.c',
+run([CC, *FLAGS, '-I' + str(OUT), Path(__file__).with_name('remote_palette_probe.c'),
      *objects, '-Wl,--gc-sections', '-o', probe], 'link-palette')
 
 native = OUT / 'native'
-subprocess.run([sys.executable, TOOLS / 'herdremote/build-cover-thumb.py', native],
-               check=True)
+subprocess.run([sys.executable, DESKTOP / 'herdremote/build-cover-thumb.py', native],
+               env={**os.environ, 'ASTRAPOD_FIRMWARE': str(ROOT)}, check=True)
 native = native / 'cover-thumb'
 hrcider.COVER_THUMB = native
 files = OUT / 'fixtures'
