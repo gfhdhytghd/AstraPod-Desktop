@@ -1,0 +1,15 @@
+[Unit]
+Description=AstraPod input plugins
+After=default.target
+
+[Service]
+WorkingDirectory=%h/.local/share/astrapod/tools
+ExecStart=%h/.local/share/podbox-usbkey/venv/bin/python -m astrapod_plugins run
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=2
+KillMode=mixed
+TimeoutStopSec=25
+
+[Install]
+WantedBy=default.target

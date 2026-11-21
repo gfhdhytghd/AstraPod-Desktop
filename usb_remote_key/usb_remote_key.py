@@ -233,6 +233,24 @@ class VolumeForwarder:
         self.last = now
 
 
+def find_configured_ipod(core, util):
+    """Return the verified device and serial, with its handle still open."""
+    for dev in core.find(find_all=True, idVendor=0x05AC, idProduct=0x1261):
+        verified = False
+        try:
+            serial = dev.serial_number or ''
+            verified = (IPOD_SERIAL.fullmatch(serial) is not None and
+                        dev.get_active_configuration() is not None)
+            if verified:
+                return dev, serial
+        except core.USBError:
+            pass
+        finally:
+            if not verified:
+                util.dispose_resources(dev)
+    return None, None
+
+
 class USBRemote:
     def __init__(self, core, util):
         self.core, self.util = core, util
@@ -250,20 +268,9 @@ class USBRemote:
         try:
             if self.device is None:
                 self.retry_at = now + .5
-                for dev in self.core.find(find_all=True, idVendor=0x05AC,
-                                          idProduct=0x1261):
-                    try:
-                        serial = dev.serial_number or ''
-                        if (IPOD_SERIAL.fullmatch(serial) and
-                                dev.get_active_configuration() is not None):
-                            self.device = dev
-                            LOG.info('connected to %s', serial)
-                            break
-                    except self.core.USBError:
-                        pass
-                    finally:
-                        if dev is not self.device:
-                            self.util.dispose_resources(dev)
+                self.device, serial = find_configured_ipod(self.core, self.util)
+                if self.device is not None:
+                    LOG.info('connected to %s', serial)
             if self.device is None:
                 return False
             # No configuration selection, interface claim or driver detach.
@@ -362,10 +369,17 @@ def main():
     parser.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)s %(message)s')
+    run()
+
+
+def run(observer=None):
     import usb.core
     import usb.util
-    import disk_mode
-    import host_fallback
+    if __package__:
+        from . import disk_mode, host_fallback
+    else:
+        import disk_mode
+        import host_fallback
     remote = USBRemote(usb.core, usb.util)
     disk = disk_mode.DiskMode(remote)
     forwarder = KeyForwarder(remote)
@@ -386,6 +400,8 @@ def main():
         while not stopped:
             now = time.monotonic()
             router.poll(now)
+            if observer is not None:
+                observer.poll(now, router.reported_mode)
             if fd is None:
                 if now >= retry_at:
                     retry_at = now + 1.0
@@ -395,8 +411,12 @@ def main():
                             fd = open_receiver(path)
                             decoder, buffer = NECDecoder(), b''
                             LOG.info('reading %s', path)
+                            if observer is not None:
+                                observer.receiver(path, now)
                         except OSError as exc:
                             LOG.warning('IR unavailable: %s', exc)
+                            if observer is not None:
+                                observer.receiver(None, now, str(exc))
                 time.sleep(.02)
                 continue
             try:
@@ -418,17 +438,23 @@ def main():
                     frame = decoder.line(line)
                     at = time.monotonic()
                     router.frame(frame, at, decoder.span_us / 1e6)
+                    if observer is not None and frame is not None:
+                        observer.frame(frame, at)
             except OSError as exc:
                 LOG.warning('IR unavailable: %s', exc)
                 router.release(time.monotonic())
                 os.close(fd)
                 fd, buffer, decoder = None, b'', NECDecoder()
+                if observer is not None:
+                    observer.receiver(None, time.monotonic(), str(exc))
     finally:
         router.release(time.monotonic())
         disk.close()
         remote.close()
         if fd is not None:
             os.close(fd)
+        if observer is not None:
+            observer.receiver(None, time.monotonic())
 
 
 if __name__ == '__main__':

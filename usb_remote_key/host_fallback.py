@@ -22,10 +22,16 @@ class Client:
         self.token = None
 
     def request(self, op, **fields):
+        return self.exchange(dict(op=op, **self.credentials(op), **fields))
+
+    def credentials(self, op='action'):
         self.sequence += 1
-        record = dict(op=op, id=self.identity, seq=self.sequence, sent=self.clock(), **fields)
+        fields = dict(id=self.identity, seq=self.sequence, sent=self.clock())
         if op != 'status':
-            record['token'] = self.token
+            fields['token'] = self.token
+        return fields
+
+    def exchange(self, record):
         try:
             with socket.socket(socket.AF_UNIX) as channel:
                 channel.settimeout(.05)
@@ -141,6 +147,7 @@ class Router:
         self.client = client or Client()
         self.gestures = Gestures(self.client)
         self.mode = 'ipod'
+        self.reported_mode = None
         self.next_probe = 0.0
         self.held = None
         self.last = float('-inf')
@@ -153,6 +160,7 @@ class Router:
         if now >= self.next_probe:
             self.next_probe = now + .1
             mode = self.client.status(bool(self.remote.probe(now)), bool(self.disk.active))
+            self.reported_mode = mode
             mode = 'host-fallback' if mode == 'host-fallback' else 'ipod' if mode in ('ipod','pending') else self.mode
             if mode != self.mode:
                 self.forwarder.release(now)
