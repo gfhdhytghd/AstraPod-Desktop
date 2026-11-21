@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 FIELDS = {
     "JELLYFIN_URL": ("Jellyfin HTTPS 地址", ""),
     "CIDER_API_URL": ("Cider RPC 地址", "http://127.0.0.1:10767"),
-    "CIDER_BACKEND": ("Cider 后端（auto、plugin、rpc）", "auto"),
+    "CIDER_BACKEND": ("Cider 后端（plugin、auto、rpc）", "plugin"),
     "RUFIN_API_URL": ("Rufin 地址（可留空自动识别）", ""),
     "HERDR_SOCKET_PATH": ("Agent 的 herdr 套接字", ""),
     "HERDREMOTE_VOICE_FOCUS": ("语音输入聚焦（on 或 off）", "off"),

@@ -15,7 +15,7 @@ from ..widgets import (ChevronComboBox, PasswordLineEdit, SegmentedControl, Togg
 from . import Page
 
 SETTING_CHOICES = {
-    "CIDER_BACKEND": ("auto", "plugin", "rpc"),
+    "CIDER_BACKEND": ("plugin", "auto", "rpc"),
     "HERDREMOTE_VOICE_FOCUS": ("on", "off"),
     "HERDREMOTE_KEY_TOOL": ("auto", "ydotool", "wtype"),
     "T3_CONTROL": ("on", "off"),

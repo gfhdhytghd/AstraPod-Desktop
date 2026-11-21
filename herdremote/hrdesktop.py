@@ -84,7 +84,7 @@ class LogQueue(logging.Handler):
 class CiderClient:
     """Keep the bridge's client identity when the local settings change."""
     def __init__(self):
-        self.mode = os.environ.get("CIDER_BACKEND", "auto")
+        self.mode = os.environ.get("CIDER_BACKEND", "plugin")
         client = make_clients(hrcider.Client)
         self.backend = None if self.mode == "rpc" else client
         self.rpc = client if self.backend is None else self.backend.rpc
@@ -111,7 +111,7 @@ class CiderClient:
             self.backend.close()
 
     def configure(self, env, rpc):
-        mode = env.get("CIDER_BACKEND", "auto")
+        mode = env.get("CIDER_BACKEND", "plugin")
         if mode != "rpc":
             if self.backend is None:
                 backend = make_clients(hrcider.Client, env)
@@ -535,7 +535,7 @@ def apply_settings(daemon, values, token):
         else:
             env.pop(key, None)
     agent_settings = hragent.config(env)
-    mode = env.get("CIDER_BACKEND", "auto")
+    mode = env.get("CIDER_BACKEND", "plugin")
     if mode not in ("auto", "plugin", "rpc"):
         raise ValueError("CIDER_BACKEND must be auto, plugin or rpc")
     if env.get("RUFIN_API_URL"):

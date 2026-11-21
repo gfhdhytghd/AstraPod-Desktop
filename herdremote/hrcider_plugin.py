@@ -284,7 +284,7 @@ class PluginTransport:
 
 def make_clients(rpc_class, env=os.environ):
     """Delay importing hrcider until it has finished defining Client."""
-    mode = env.get('CIDER_BACKEND', 'auto')
+    mode = env.get('CIDER_BACKEND', 'plugin')
     if mode not in ('auto', 'plugin', 'rpc'):
         raise ValueError('CIDER_BACKEND must be auto, plugin or rpc')
     rpc = rpc_class(env.get('CIDER_API_URL', 'http://127.0.0.1:10767'), env.get('CIDER_API_TOKEN'))
