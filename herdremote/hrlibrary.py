@@ -560,74 +560,100 @@ class _UploadProgress:
         return message
 
 
-def import_files(link: podlink.Link, paths, progress, skip_duplicates=True):
+def import_tag_index(link):
     matches = defaultdict(list)
-    indexed = False
+    for track in tracks(link):
+        tags = music_tags(track.title, track.artist.split(";"), track.album,
+                          track.length_ms, track.disc, track.track)
+        if tags:
+            matches[tags.key].append(tags)
+    return matches
+
+
+def import_batch(paths, progress, skip_duplicates, index, publish):
+    """Prepare and report each file identically for the two transports."""
+    matches = None
     stored = []
-    stopped = False
 
     def event(path, state, sent=0, total=0, error=None):
         if progress is not None:
             progress(dict(file=str(path), state=state, sent=sent, total=total,
                           error=error))
 
-    try:
-        for value in paths:
-            path = Path(value)
-            event(path, "probe")
+    for value in paths:
+        path = Path(value)
+        event(path, "probe")
+        try:
+            tags = _probe_tags(path)
+        except (OSError, RuntimeError, ValueError) as error:
+            event(path, "error", error=str(error))
+            continue
+
+        if skip_duplicates and tags:
+            if matches is None:
+                try:
+                    matches = index()
+                except (OSError, RuntimeError, ValueError) as error:
+                    event(path, "error", error=str(error))
+                    raise
+            if any(tags.matches(existing) for existing in matches[tags.key]):
+                event(path, "skip")
+                continue
+
+        with TemporaryDirectory(prefix="podlink-import-") as work:
             try:
-                tags = _probe_tags(path)
+                prepared, = podlink.prepare_media([path], Path(work))
+                total = prepared.upload.stat().st_size
             except (OSError, RuntimeError, ValueError) as error:
                 event(path, "error", error=str(error))
                 continue
 
+            sent = 0
+
+            def report(length):
+                nonlocal sent
+                sent = length
+                event(path, "upload", sent, total)
+
+            event(path, "upload", total=total)
+            try:
+                stored.append(publish(prepared, report))
+            except FileExistsError as error:
+                event(path, "skip" if skip_duplicates else "error", total=total,
+                      error=None if skip_duplicates else str(error))
+                continue
+            except (OSError, RuntimeError, ValueError) as error:
+                event(path, "error", sent, total, str(error))
+                raise
             if skip_duplicates and tags:
-                if not indexed:
-                    try:
-                        device_tracks = tracks(link)
-                    except (OSError, RuntimeError, ValueError) as error:
-                        event(path, "error", error=str(error))
-                        raise
-                    for track in device_tracks:
-                        existing = music_tags(track.title, track.artist.split(";"),
-                                              track.album, track.length_ms,
-                                              track.disc, track.track)
-                        if existing:
-                            matches[existing.key].append(existing)
-                    indexed = True
-                if any(tags.matches(existing) for existing in matches[tags.key]):
-                    event(path, "skip")
-                    continue
-
-            with TemporaryDirectory(prefix="podlink-import-") as work:
-                try:
-                    prepared, = podlink.prepare_media([path], Path(work))
-                    total = prepared.upload.stat().st_size
-                except (OSError, RuntimeError, ValueError) as error:
-                    event(path, "error", error=str(error))
-                    continue
-
-                event(path, "upload", total=total)
-                upload = _UploadProgress(
-                    link, lambda sent: event(path, "upload", sent, total))
-                try:
-                    stored.append(podlink.upload_media_track(upload, prepared))
-                except (OSError, RuntimeError, ValueError) as error:
-                    if upload.exists:
-                        event(path, "skip" if skip_duplicates else "error",
-                              total=total,
-                              error=None if skip_duplicates else str(error))
-                        continue
-                    stopped = True
-                    with suppress(OSError, RuntimeError, ValueError):
-                        link.send(podlink.TEXT, b"MS1 STOP")
-                        podlink.expect_media(link, b"MS1 STOPPED")
-                    event(path, "error", upload.sent, total, str(error))
-                    raise
-                if skip_duplicates and tags:
-                    matches[tags.key].append(tags)
-                event(path, "done", sent=total, total=total)
-    finally:
-        if stored and not stopped:
-            podlink.refresh_media(link)
+                matches[tags.key].append(tags)
+            event(path, "done", sent=total, total=total)
     return stored
+
+
+def import_files(link: podlink.Link, paths, progress, skip_duplicates=True):
+    changed = False
+    stopped = False
+
+    def publish(prepared, report):
+        nonlocal changed, stopped
+        upload = _UploadProgress(link, report)
+        try:
+            result = podlink.upload_media_track(upload, prepared)
+        except (OSError, RuntimeError, ValueError) as error:
+            if upload.exists:
+                raise FileExistsError(str(error)) from error
+            stopped = True
+            with suppress(OSError, RuntimeError, ValueError):
+                link.send(podlink.TEXT, b"MS1 STOP")
+                podlink.expect_media(link, b"MS1 STOPPED")
+            raise
+        changed = True
+        return result
+
+    try:
+        return import_batch(paths, progress, skip_duplicates,
+                            lambda: import_tag_index(link), publish)
+    finally:
+        if changed and not stopped:
+            podlink.refresh_media(link)

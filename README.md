@@ -42,6 +42,16 @@ PodLink Shell uses a separate USB endpoint and can run while HerdRemote is
 connected. See the [Apple IR setup][ir] and the [Cider bridge setup][cider]
 for those optional integrations.
 
+### Disk Mode for media transfers
+
+Start with the iPod connected in PodLink mode. Enable **磁盘模式** on the
+Jellyfin sync or direct import page to transfer through USB mass storage.
+Jellyfin preview and the import duplicate check still use PodLink. The app
+mounts the selected iPod's FAT volume with UDisks2, ejects it after the job,
+then queues a Rockbox database update on the restored PodLink connection.
+Keep `/Music/PodLink` inside the player's database scan roots. Disk Mode needs
+`udisksctl`, `gdbus`, `lsblk` and HerdRemote from the same desktop checkout.
+
 ## User services
 
 The supplied units expect the checkout and its `.venv` at
