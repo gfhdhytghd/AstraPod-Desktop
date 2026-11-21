@@ -227,6 +227,33 @@ def test_failed_capture_never_writes_png(tmp_path, monkeypatch, failure):
     assert not destination.exists()
 
 
+@pytest.mark.parametrize("labels", [(), ("Roll Dice",), smoke.MENU_LABELS["dice"]])
+def test_dice_checks_first_png_before_sending_keys(tmp_path, monkeypatch, labels):
+    player = Player()
+    monkeypatch.setattr(shell.time, "sleep", lambda _: None)
+    monkeypatch.setattr(shell, "screenshot",
+                        lambda _, path: path.write_text(str(len(player.keys))))
+
+    def ocr(command, **kwargs):
+        assert command[:3] == ["tesseract", str(tmp_path / "dice-before.png"), "stdout"]
+        assert not player.keys
+        return SimpleNamespace(stdout="Dice\n09:00\n" + "\n".join(labels))
+
+    monkeypatch.setattr(smoke.subprocess, "run", ocr)
+    case = next(case for case in smoke.CASES if case[0] == "dice")
+    if labels == smoke.MENU_LABELS["dice"]:
+        result = smoke.exercise(player, tmp_path, case)
+        assert result["screen_changed"]
+        assert player.keys
+    else:
+        with pytest.raises(RuntimeError, match="first screen is missing menu labels"):
+            smoke.exercise(player, tmp_path, case)
+        assert not player.keys
+        assert not (tmp_path / "dice-after.png").exists()
+    assert (tmp_path / "dice-before.png").is_file()
+    assert player.reason == 1
+
+
 def test_smoke_default_cases_and_playback(tmp_path, monkeypatch):
     player = Player()
     monkeypatch.setattr(shell, "find_player", lambda serial: player)
@@ -247,6 +274,7 @@ def test_smoke_default_cases_and_playback(tmp_path, monkeypatch):
         return {"state": "idle", "reason": "usb"}
 
     monkeypatch.setattr(shell, "screenshot", capture)
+    monkeypatch.setattr(smoke, "check_menu_labels", lambda *_: None)
     monkeypatch.setattr(smoke, "usb_takeover", usb_case)
     out = tmp_path / "evidence"
     smoke.run("test", out, "fake-disk.sock")
