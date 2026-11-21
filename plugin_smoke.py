@@ -5,7 +5,10 @@ from contextlib import suppress
 from dataclasses import asdict
 import json
 from pathlib import Path
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import time
 
@@ -24,6 +27,10 @@ CASES = (
     ("maze", (remote.SELECT, remote.RIGHT), True),
     ("rockblox1d", (remote.PLAY, remote.PLAY), False),
 )
+MENU_LABELS = {
+    "dice": ("Roll Dice", "Number of Dice", "Number of Sides", "Playback Control", "Quit"),
+    "rb_info": ("Buttons", "Button test", "Actions"),
+}
 
 
 def tap(player, key):
@@ -82,6 +89,24 @@ def capture(player, output, label):
     return path
 
 
+def check_menu_labels(name, screenshot):
+    expected = MENU_LABELS.get(name)
+    if not expected:
+        return
+    try:
+        ocr = subprocess.run(
+            ["tesseract", str(screenshot), "stdout", "--psm", "11", "-l", "eng"],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"Could not read menu labels from {screenshot}: {error}") from error
+    text = " " + " ".join(re.findall(r"[a-z]+", ocr.stdout.casefold())) + " "
+    missing = [label for label in expected if f" {label.casefold()} " not in text]
+    if missing:
+        raise RuntimeError(f"{name} first screen is missing menu labels: "
+                           f"{', '.join(missing)} ({screenshot})")
+
+
 def audio_status(player):
     flags, = struct.unpack("<I", shell.read_control(player, 5, 4))
     return flags
@@ -97,6 +122,7 @@ def exercise(player, output, case, require_playback=False):
     time.sleep(.35)  # Allow the plugin to draw its first frame.
     try:
         before = capture(player, output, name + "-before")
+        check_menu_labels(name, before)
         for key in keys:
             tap(player, key)
         after = capture(player, output, name + "-after")
@@ -210,6 +236,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True, help="New evidence directory")
     parser.add_argument("--control-socket", help="HerdRemote disk control socket")
     args = parser.parse_args()
+    if shutil.which("tesseract") is None:
+        parser.error("tesseract with English data is required to check menu labels")
     try:
         run(args.serial, args.out, args.control_socket)
     except (RuntimeError, OSError, ValueError, struct.error) as error:

@@ -24,6 +24,10 @@ the test track.
 ## Run the suite
 
 From this checkout, use the normal Desktop Python environment.
+Install Tesseract with English language data on the host.
+The script checks the actual Dice and Rockbox Info first-frame PNGs for
+menu labels before sending any keys. A title bar and cursor alone fail
+this check. The script keeps the failing PNG for inspection.
 
 ```sh
 .venv/bin/python plugin_smoke.py --serial 2AA0000000000360 --out plugin-smoke-results
