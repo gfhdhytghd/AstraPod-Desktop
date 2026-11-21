@@ -9,6 +9,7 @@ from types import ModuleType
 import unittest
 from unittest.mock import Mock, patch
 
+from astrapod_plugins.manifest import load_manifest
 from astrapod_plugins.sdk import MAX_LINE, Plugin, encode
 from usb_remote_key import disk_mode, host_fallback, usb_remote_key as bridge
 
@@ -61,6 +62,35 @@ class AppleIRTests(unittest.TestCase):
         self.assertAlmostEqual(records[3]['t'], 2.25)
         self.assertEqual(records[-1], dict(type='status', state='waiting', device=None,
                                           detail='gone', mode='pending'))
+
+    def test_aluminium_prefix_frames_name_the_remote(self):
+        records = []
+        observer = apple_ir.Observations('apple-ir', lambda r: records.append(r) or True)
+        frames = [
+            (1.0, 'ee875c59'), (1.1, 'ee870559'), (1.2, ''),   # aluminium Select, held
+            (2.0, 'ee875f59'), (2.1, 'ee870459'),              # aluminium Play/Pause
+            (3.0, 'ee870459'),                                 # plastic centre
+            (4.0, 'ee875d59'), (4.5, 'ee870459'),              # prefix too old to pair
+            (5.0, 'ee875e59'), (5.5, 'ee870259'),              # lost pair, then Menu
+        ]
+        for now, frame in frames:
+            observer.frame(bytes.fromhex(frame), now)
+        observer.poll(6., 'ipod')
+        inputs = [(r['key'], r['phase'], r.get('remote'))
+                  for r in records if r['type'] == 'input']
+        self.assertEqual(inputs, [
+            ('select', 'down', 'aluminium'), ('select', 'repeat', 'aluminium'),
+            ('select', 'up', 'aluminium'), ('play', 'down', 'aluminium'),
+            ('play', 'up', 'aluminium'), ('play', 'down', 'plastic'), ('play', 'up', 'plastic'),
+            ('play', 'down', 'plastic'), ('play', 'up', 'plastic'),
+            ('menu', 'down', None), ('menu', 'up', None)])
+
+    def test_remote_setting_is_an_enum(self):
+        manifest = load_manifest(TOOLS / 'astrapod_plugins/apple-ir/plugin.json')
+        self.assertEqual(manifest.settings({})['remote'], 'auto')
+        self.assertEqual(manifest.settings({'remote': 'plastic'})['remote'], 'plastic')
+        with self.assertRaises(ValueError):
+            manifest.settings({'remote': 'wood'})
 
     def test_reporting_setting_does_not_hide_status(self):
         records = []

@@ -16,22 +16,27 @@ import hrdisk
 UUID_PATH = '/dev/disk/by-uuid/8DD6-4F07'
 
 
+def request_disk(path, timeout, request=hrdisk.ENTER_DISK + b'\n'):
+    with socket.socket(socket.AF_UNIX) as channel:
+        channel.settimeout(timeout)
+        channel.connect(path)
+        channel.sendall(request)
+        reply = b''
+        while b'\n' not in reply and len(reply) < 256:
+            part = channel.recv(256 - len(reply))
+            if not part:
+                break
+            reply += part
+    return reply
+
+
 def enter(path, timeout, present=lambda: os.path.exists(UUID_PATH)):
     if present():
         print('Disk Mode volume already present: ' + UUID_PATH)
         return 0
     deadline = time.monotonic() + timeout
     try:
-        with socket.socket(socket.AF_UNIX) as channel:
-            channel.settimeout(min(timeout, 2.0))
-            channel.connect(path)
-            channel.sendall(b'enter-disk-v1\n')
-            reply = b''
-            while b'\n' not in reply and len(reply) < 256:
-                part = channel.recv(256 - len(reply))
-                if not part:
-                    break
-                reply += part
+        reply = request_disk(path, min(timeout, 2.0))
     except OSError as error:
         print('HerdRemote unavailable: ' + str(error), file=sys.stderr)
         return 3

@@ -86,6 +86,8 @@ class HostTests(unittest.TestCase):
             {'settings': {'key': {'type': 'integer', 'default': True}}},
             {'settings': {'bad': {'type': 'unknown', 'default': ''}}},
             {'settings': {'key': {'type': 'string', 'default': 'x' * 4096}}},
+            {'settings': {'key': {'type': 'string', 'default': 'c', 'enum': ['a', 'b']}}},
+            {'settings': {'key': {'type': 'string', 'default': 'a', 'enum': 'ab'}}},
         ]
         outside = self.root / 'outside.py'
         outside.write_text('')
@@ -204,6 +206,25 @@ plugin.receive()
         row = host.list()[0]
         self.assertEqual(row.last_event['source'], 'fake-input')
         self.assertIn('invalid input event', row.detail)
+
+    def test_host_passes_known_remote_model_only(self):
+        host = self.host()
+        events = []
+        host.subscribe(events.append)
+        self.path.with_name('plugin.py').write_text("""
+from astrapod_plugins.sdk import Plugin
+
+plugin = Plugin()
+plugin.send(dict(type='input', key='select', phase='down', t=1, remote='aluminium'))
+plugin.send(dict(type='input', key='play', phase='down', t=2, remote='wood'))
+plugin.receive()
+""")
+        host.enable('fake-input', True)
+        host.start()
+        self.wait_for(lambda: sum(event['type'] == 'input' for event in events) == 2)
+        inputs = [event for event in events if event['type'] == 'input']
+        self.assertEqual(inputs[0]['remote'], 'aluminium')
+        self.assertNotIn('remote', inputs[1])
 
     def test_force_stop_after_grace_period(self):
         self.path.with_name('plugin.py').write_text("""

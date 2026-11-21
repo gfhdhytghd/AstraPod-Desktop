@@ -9,6 +9,7 @@ API = 1
 MAX_LINE = 4096
 PHASES = ('down', 'repeat', 'up', 'tap')
 STATES = ('running', 'waiting', 'error')
+REMOTES = ('plastic', 'aluminium')  # optional input field: which Apple Remote
 
 
 def encode(record):

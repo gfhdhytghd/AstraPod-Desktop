@@ -7,13 +7,31 @@ from __future__ import annotations
 import os
 
 from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal
-from ..widgets import (ChevronComboBox, PageHeader, PasswordLineEdit, SegmentedControl,
+from ..widgets import (ChevronComboBox, PageHeader, PasswordLineEdit, SegmentedControl, ToggleSwitch,
                        button, label, make_badge, make_card, qcolor, set_badge)
 from . import Page
 
 R = QtCore.QRectF
 KIND_ROLE = Qt.ItemDataRole.UserRole + 40
 SCOPE_PREFIXES = {"all": "", "library": "音乐库：", "playlist": "播放列表："}
+
+
+def disk_mode_option(window, layout, key, action):
+    row = QtWidgets.QHBoxLayout()
+    column = QtWidgets.QVBoxLayout()
+    column.setSpacing(2)
+    column.addWidget(label("磁盘模式", "field-label"))
+    hint = f"传输更快。{action}期间，iPod 显示 USB 画面。"
+    column.addWidget(label(hint, "helper", wrap=True))
+    row.addLayout(column, 1)
+    switch = ToggleSwitch()
+    switch.setAccessibleName("磁盘模式")
+    switch.setAccessibleDescription(hint)
+    switch.setChecked(window.prefs.get(key) is True)
+    switch.toggled.connect(lambda checked: window.save_pref(key, checked))
+    row.addWidget(switch)
+    layout.addLayout(row)
+    return switch
 
 
 class DiffDelegate(QtWidgets.QStyledItemDelegate):
@@ -96,8 +114,19 @@ class SyncPage(Page):
         self.password_inputs: list[PasswordLineEdit] = []
         settings = window.settings
 
+        # Everything above the footer scrolls, so a short window never
+        # squeezes the cards.
+        self.layout_.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        host = QtWidgets.QWidget()
+        body = QtWidgets.QVBoxLayout(host)
+        body.setContentsMargins(28, 18, 28, 0)
+        body.setSpacing(14)
         self.header = PageHeader("Jellyfin 同步", "把 Jellyfin 的曲库或播放列表单向同步到 iPod")
-        self.layout_.addWidget(self.header)
+        body.addWidget(self.header)
 
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(14)
@@ -172,15 +201,16 @@ class SyncPage(Page):
         port_row = QtWidgets.QHBoxLayout()
         self.port_label = label("", "helper", wrap=True)
         port_row.addWidget(self.port_label, 1)
-        self.port_button = button("更改", "ghost", None, lambda: window.navigate("device"))
-        self.port_button.setToolTip("在设备页选择 iPod 串口")
+        self.port_button = button("更改", "ghost", None, lambda: window.navigate("settings"))
+        self.port_button.setToolTip("在设置中更改 iPod 串口")
         port_row.addWidget(self.port_button)
         scope_layout.addLayout(port_row)
         self._show_port()
         window.port_changed.connect(self._port_changed)
+        self.disk_mode = disk_mode_option(window, scope_layout, "sync_disk_mode", "同步")
         scope_layout.addStretch(1)
         scope_row = QtWidgets.QHBoxLayout()
-        scope_row.addWidget(label("iPod 需要处于 PodLink USB 模式", "helper", wrap=True), 1)
+        scope_row.addWidget(label("预览时，iPod 必须处于 PodLink USB 模式", "helper", wrap=True), 1)
         self.preview_button = button("预览", None, "sync", self.preview)
         scope_row.addWidget(self.preview_button)
         scope_layout.addLayout(scope_row)
@@ -188,7 +218,7 @@ class SyncPage(Page):
             card.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                                QtWidgets.QSizePolicy.Policy.Preferred)
         top.addWidget(scope, 2)
-        self.layout_.addLayout(top)
+        body.addLayout(top)
 
         tiles = QtWidgets.QHBoxLayout()
         tiles.setSpacing(14)
@@ -197,7 +227,7 @@ class SyncPage(Page):
         self.tile_remove = StatTile("将从 iPod 删除")
         for tile in (self.tile_add, self.tile_same, self.tile_remove):
             tiles.addWidget(tile)
-        self.layout_.addLayout(tiles)
+        body.addLayout(tiles)
 
         preview, preview_layout = make_card(8, expand=True, margins=(8, 10, 8, 8))
         filter_row = QtWidgets.QHBoxLayout()
@@ -226,7 +256,10 @@ class SyncPage(Page):
         self.preview_stack.addWidget(self.placeholder)
         self.preview_stack.addWidget(self.details)
         preview_layout.addWidget(self.preview_stack, 1)
-        self.layout_.addWidget(preview, 1)
+        self.preview_stack.setMinimumHeight(120)
+        body.addWidget(preview, 1)
+        scroll.setWidget(host)
+        self.layout_.addWidget(scroll, 1)
 
         footer = QtWidgets.QFrame()
         footer.setObjectName("FooterBar")
@@ -234,7 +267,7 @@ class SyncPage(Page):
         footer_layout.setContentsMargins(18, 12, 18, 12)
         column = QtWidgets.QVBoxLayout()
         column.setSpacing(6)
-        self.status = label("同步通过 iPod 的 PodLink USB 模式进行。", None, wrap=True)
+        self.status = label("连接 iPod 后预览同步变更。", None, wrap=True)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
@@ -245,7 +278,11 @@ class SyncPage(Page):
         self.apply_button = button("应用同步", "primary", None, self.confirm)
         self.apply_button.setMinimumWidth(116)
         footer_layout.addWidget(self.apply_button)
-        self.layout_.addWidget(footer)
+        footer_wrap = QtWidgets.QWidget()
+        wrap = QtWidgets.QVBoxLayout(footer_wrap)
+        wrap.setContentsMargins(28, 0, 28, 20)
+        wrap.addWidget(footer)
+        self.layout_.addWidget(footer_wrap)
 
         for field in (self.url, self.username, self.password, self.token):
             field.textChanged.connect(self.invalidate_source)
@@ -381,7 +418,7 @@ class SyncPage(Page):
 
     # iPod port ----------------------------------------------------------
     def port(self) -> str:
-        """The device page's port; empty means auto-detect."""
+        """The chosen port; empty means auto-detect."""
         return self.window_.prefs.get("port") or ""
 
     def _show_port(self) -> None:
@@ -396,7 +433,7 @@ class SyncPage(Page):
     def update_buttons(self) -> None:
         interactive = not self.busy and not self.restoring
         for control in (self.username, self.password, self.token, self.scope,
-                        self.port_button, self.connect_button, self.sign_out_button):
+                        self.port_button, self.connect_button, self.sign_out_button, self.disk_mode):
             control.setEnabled(interactive)
         self.url.setEnabled(interactive and self.session is None)
         self.auth_switch.set_options_enabled(interactive)
@@ -576,8 +613,11 @@ class SyncPage(Page):
 
     def sync(self, plan) -> None:
         source, port = self.source, self.port()
-        self.job("正在同步。高采样率音频会先在电脑上转换…",
-                 lambda: self.backend.apply(source, plan, port), self.sync_complete)
+        disk_mode = self.disk_mode.isChecked()
+        apply = self.backend.apply_disk if disk_mode else self.backend.apply
+        status = ("正在通过磁盘模式同步…" if disk_mode
+                  else "正在同步。高采样率音频会先在电脑上转换…")
+        self.job(status, lambda: apply(source, plan, port), self.sync_complete)
 
     def sync_complete(self, result) -> None:
         added, removed = result
@@ -589,5 +629,7 @@ class SyncPage(Page):
         for field in self.password_inputs:
             field.update_theme(tokens)
         self.scope.update_theme(tokens)
+        self.disk_mode.tokens = tokens
+        self.disk_mode.update()
         self._update_metrics(self.plan)
         self.details.viewport().update()

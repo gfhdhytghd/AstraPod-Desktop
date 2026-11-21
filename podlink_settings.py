@@ -147,16 +147,34 @@ def clear_jellyfin_session() -> None:
     settings_path().with_name(JELLYFIN_SESSION).unlink(missing_ok=True)
 
 
-def detect_ipod_port() -> str | None:
+def ipod_ports(comports=None, by_id: Path = Path("/dev/serial/by-id")) -> list[dict]:
+    """Every attached PodLink tty, sorted by device: {"port", "serial",
+    "product"}, where port is the /dev/serial/by-id path when one exists."""
     import podlink
-    from serial.tools import list_ports
 
+    if comports is None:
+        from serial.tools import list_ports
+        try:
+            comports = list_ports.comports()
+        except OSError:
+            return []
+    links = {}
     try:
-        port = podlink.find_port(list_ports.comports())
-    except (OSError, RuntimeError):
-        return None
-    target = os.path.realpath(port)
-    for candidate in sorted(Path("/dev/serial/by-id").glob("*")):
-        if candidate.is_symlink() and os.path.realpath(candidate) == target:
-            return str(candidate)
-    return port
+        for candidate in sorted(by_id.glob("*")):
+            if candidate.is_symlink():
+                links.setdefault(os.path.realpath(candidate), str(candidate))
+    except OSError:
+        pass
+    found = []
+    for info in sorted(comports, key=lambda info: info.device):
+        if info.vid == podlink.VID and info.pid == podlink.PID:
+            found.append({"port": links.get(os.path.realpath(info.device), info.device),
+                          "serial": getattr(info, "serial_number", None) or "",
+                          "product": getattr(info, "product", None) or ""})
+    return found
+
+
+def detect_ipod_port() -> str | None:
+    """The one attached iPod's port, or None when there is none or several."""
+    ports = ipod_ports()
+    return ports[0]["port"] if len(ports) == 1 else None

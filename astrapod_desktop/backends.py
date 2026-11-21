@@ -119,6 +119,10 @@ class DeviceLibrary:
         with serial_access(), hrmediasync.connect_device(self.port) as (link, identity):
             yield LibrarySession(self.module, link, identity)
 
+    def import_disk(self, paths, progress, skip_duplicates=True):
+        import hrdisksync
+        return hrdisksync.import_files(self.port, paths, progress, skip_duplicates)
+
     # The last library seen, so the window can show it before the iPod is
     # plugged in again.
     def _last_path(self) -> Path:
@@ -145,6 +149,12 @@ class DeviceLibrary:
 
     def art_path(self, serial, track, size) -> Path:
         return Path(self.cache.art_path(serial, track, size))
+
+    @staticmethod
+    def detect_ports() -> list[dict]:
+        """Every attached iPod: {"port", "serial", "product"}."""
+        import podlink_settings
+        return podlink_settings.ipod_ports()
 
     @staticmethod
     def detect_port() -> str | None:
@@ -273,6 +283,10 @@ class SyncBackend:
     def apply(self, source, plan, port):
         import hrmediasync
         return hrmediasync.apply(source, plan, port, **self._serial())
+
+    def apply_disk(self, source, plan, port):
+        import hrdisksync
+        return hrdisksync.apply(source, plan, port)
 
 
 # ----------------------------------------------------------------------

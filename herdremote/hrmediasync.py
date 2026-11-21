@@ -261,6 +261,10 @@ def connect_device(port):
                 link.close()
 
 
+def owned_name(name, identity):
+    return SYNC_NAME.fullmatch(name) is not None and name.startswith(identity)
+
+
 def inventory(link, identity):
     link.send(podlink.TEXT, b"MS2 LIST")
     try:
@@ -352,15 +356,22 @@ def wait_with_link(link, task):
     return task.result()
 
 
-def apply(source, plan, port, *, serial_access=nullcontext):
+def validate_source(source, plan):
     if plan.identity != source.identity or source.tracks(plan.scope) != plan.tracks:
         raise RuntimeError("Jellyfin changed after preview; build a new preview")
 
+
+def validate_device(link, device, plan):
+    if (device != plan.device or inventory(link, plan.identity) != plan.owned
+            or original_matches(link, plan.tracks) != plan.matched):
+        raise RuntimeError("iPod changed after preview; build a new preview")
+
+
+def apply(source, plan, port, *, serial_access=nullcontext):
+    validate_source(source, plan)
     with (serial_access(), connect_device(port) as (link, device),
           ThreadPoolExecutor(max_workers=1) as worker):
-        if (device != plan.device or inventory(link, source.identity) != plan.owned
-                or original_matches(link, plan.tracks) != plan.matched):
-            raise RuntimeError("iPod changed after preview; build a new preview")
+        validate_device(link, device, plan)
         added = set()
         for track in plan.additions:
             with TemporaryDirectory(prefix="podlink-jellyfin-") as tmp:

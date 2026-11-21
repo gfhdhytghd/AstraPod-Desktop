@@ -171,7 +171,8 @@ class SettingsPage(Page):
         device_layout.addLayout(form)
         device_layout.addWidget(self.port_help)
         device_layout.addWidget(label("读取资料库、导入和同步时，电脑会暂时从后台远程服务借用这个串口。"
-                                      "设备页也可以更改它。", "helper", wrap=True))
+                                      "连接了多台 iPod 时，也可以点右上角的 iPod 状态选择一台。",
+                                      "helper", wrap=True))
         layout.addWidget(device)
 
         media, media_layout = make_card(12)

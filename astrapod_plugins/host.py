@@ -15,7 +15,7 @@ import time
 
 from .actions import Actions, finite
 from .manifest import discover, settings_record
-from .sdk import MAX_LINE, PHASES, STATES, decode, encode
+from .sdk import MAX_LINE, PHASES, REMOTES, STATES, decode, encode
 
 
 LOG = logging.getLogger(__name__)
@@ -260,6 +260,8 @@ class PluginHost:
             if not isinstance(key, str) or not key.strip() or phase not in PHASES or not finite(stamp) or stamp < 0:
                 raise ValueError('invalid input event')
             event = dict(type='input', key=key, phase=phase, source=plugin_id, t=stamp)
+            if record.get('remote') in REMOTES:
+                event['remote'] = record['remote']
             self._publish(event, last_event=event)
         elif kind == 'status':
             state, device, detail = record.get('state'), record.get('device'), record.get('detail')

@@ -34,7 +34,10 @@ the working directory.
 Use setting names made of lowercase letters, digits, hyphens or underscores.
 Each field requires a `type` and `default`. Supported types are `string`,
 `boolean`, `integer` and `number` (integer or finite float).
-Add a `description` if the setting needs an explanation in the UI.
+Add a `description` if the setting needs an explanation in the UI, and a
+`label` to name it there. To offer a fixed set of values, list them in
+`enum`; the host refuses any other value. `labels` maps each value to the
+text the desktop app shows for it.
 
 Save this example as `example-button/plugin.py`:
 
@@ -87,7 +90,9 @@ up to 30 seconds, and resets it after a 30-second run.
 Input times are monotonic seconds. Use `down`, `repeat`, `up` or `tap` for
 the phase. Standard keys are `menu`, `select`, `play`, `left`, `right`,
 `up`, `down`, `vol_up` and `vol_down`. Use a custom key for any other
-control. Set status to `running`, `waiting` or `error`. Set `device` to
+control. An Apple Remote input can carry `remote`, `plastic` or
+`aluminium`, when the frames show which remote sent it; the host drops
+any other value. Set status to `running`, `waiting` or `error`. Set `device` to
 a displayable name or `null`, and `detail` to a short string. The host
 assigns `source` from the manifest. Status can also carry `mode` with the
 values `ipod`, `host-fallback` or `pending`.
@@ -124,8 +129,15 @@ observations. A subscriber can read them without executing any action.
 
 ## Apple IR
 
-The reference plugin publishes Menu, centre, Left, Right and volume as
-`menu`, `play`, `left`, `right`, `vol_up` and `vol_down`. Centre tap and
+The reference plugin publishes Menu, Left, Right and volume as `menu`,
+`left`, `right`, `vol_up` and `vol_down`. The plastic remote's centre
+button is `play`. The aluminium remote's centre button is `select` and its
+Play/Pause button is `play`; both send a prefix frame before the centre
+code, so these inputs carry `remote: "aluminium"` and a bare centre press
+carries `remote: "plastic"`. Other keys are the same on both remotes and
+carry no `remote`. The `remote` setting picks the remote the desktop app
+draws: `auto` follows the last `remote` seen and draws the aluminium remote
+until then. Centre tap and
 hold interpretation stays with the bridge and firmware. Each recognized
 full frame starts a hold. A repeat refreshes it. A new full frame or
 150 ms of silence ends it. The event stream includes observed volume

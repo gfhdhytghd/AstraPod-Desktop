@@ -29,7 +29,7 @@ from .widgets import (Fab, LcdDisplay, PageStack, RippleFilter, Sidebar,
 from .pages.agents import AgentsPage
 from .pages.albums import AlbumsPage
 from .pages.browse import BrowsePage
-from .pages.device import DevicePage, device_name
+from .pages.device import MODEL_NAMES, DevicePage, device_name
 from .pages.extensions import ExtensionsPage
 from .pages.importer import ImportPage
 from .pages.info import InfoDialog
@@ -48,7 +48,7 @@ DEVICES = ["device"]
 SECTIONS = [
     ("设备", [(key, "iPod", "device") for key in DEVICES]),
     ("资料库", LIBRARY_VIEWS),
-    ("添加音乐", [("import", "导入", "import"), ("sync", "Jellyfin 同步", "sync")]),
+    ("添加音乐", [("import", "直接导入", "import"), ("sync", "Jellyfin 同步", "sync")]),
     ("远程", [("agents", "Agent", "agents"), ("usage", "Usage", "usage")]),
     ("电脑", [("extensions", "扩展", "extensions"), ("logs", "日志", "logs"),
             ("settings", "设置", "settings")]),
@@ -57,7 +57,7 @@ SECTIONS = [
 
 RAIL_WIDTH = 1100
 DRAWER = 272
-RAIL = 88
+RAIL = 72
 FAB_PAGES = tuple(f"{device}.{view}" for device in DEVICES for view, _t, _i in LIBRARY_VIEWS)
 _RIPPLES: list[RippleFilter] = []
 
@@ -241,6 +241,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.library_state.changed.connect(self._library_changed)
         self.library_state.track_removed.connect(self.songs_model.remove_track)
 
+        self.ipods: list[dict] = []
+        self._link_key = None
         self._build()
         self.daemon.state_changed.connect(self._daemon_state)
         self.daemon.connection_changed.connect(lambda _c: self._daemon_state(self.daemon.state))
@@ -292,7 +294,7 @@ class MainWindow(QtWidgets.QMainWindow):
         root.setSpacing(0)
 
         self.side_panel = QtWidgets.QWidget()
-        side = QtWidgets.QVBoxLayout(self.side_panel)
+        side = self.side_layout = QtWidgets.QVBoxLayout(self.side_panel)
         side.setContentsMargins(4, 16, 4, 14)
         side.setSpacing(6)
         self.brand = QtWidgets.QHBoxLayout()
@@ -345,7 +347,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.search, 3)
         bar.addStretch(1)
         self.lcd = LcdDisplay()
-        self.lcd.clicked.connect(lambda: self.navigate("device"))
+        self.lcd.clicked.connect(self._lcd_clicked)
         bar.addWidget(self.lcd, 2)
         main.addLayout(bar)
 
@@ -550,9 +552,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._place_fab()
 
     def _apply_compact(self, compact: bool) -> None:
-        """Below RAIL_WIDTH the drawer becomes an 88 px rail."""
+        """Below RAIL_WIDTH the drawer becomes a 72 px rail, edge to edge."""
         self.compact = compact
         self.side_panel.setFixedWidth(RAIL if compact else DRAWER)
+        self.side_layout.setContentsMargins(0 if compact else 4, 16, 0 if compact else 4, 14)
         self.brand_name.setVisible(not compact)
         self.brand_icon.setVisible(not compact)
         self.sidebar.set_compact(compact)
@@ -689,6 +692,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.link_chip.title.setText("iPod 未连接")
             self.link_chip.detail.setText("用 USB 连接并打开 PodLink")
         self.link_chip.refresh_tooltip()
+        key = (bool(link.get("connected")), link.get("port"), link.get("mode"))
+        if key != self._link_key:
+            self._link_key = key
+            self.detect_ipods()
         self._update_lcd()
 
     def _update_lcd(self) -> None:
@@ -703,6 +710,53 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lcd.set_idle("AstraPod", f"资料库：{len(state.tracks):,} 首歌曲（上次读取）")
         else:
             self.lcd.set_idle("AstraPod", "连接 iPod 后开始")
+
+    # Choosing among several iPods ----------------------------------------
+    def detect_ipods(self) -> None:
+        """With more than one iPod attached, the status chip becomes a menu."""
+        detect = getattr(self.services.library, "detect_ports", None)
+        self.ipods = detect() if detect is not None else []
+        several = len(self.ipods) > 1
+        self.lcd.set_menu(several, f"检测到 {len(self.ipods)} 台 iPod，点按选择要连接的一台"
+                          if several else "")
+
+    def ipod_label(self, ipod: dict) -> str:
+        state = self.library_state
+        if state.summary is not None and ipod.get("serial") and ipod["serial"] == state.serial:
+            name = MODEL_NAMES.get(state.summary.model, "iPod")
+        else:
+            name = ipod.get("product") or "iPod"
+        return f"{name} · {ipod.get('serial') or ipod['port'].rsplit('/', 1)[-1]}"
+
+    def device_menu(self) -> QtWidgets.QMenu:
+        menu = QtWidgets.QMenu(self)
+        chosen = self.prefs.get("port") or ""
+        group = QtGui.QActionGroup(menu)
+        for ipod in self.ipods:
+            action = menu.addAction(self.ipod_label(ipod))
+            action.setCheckable(True)
+            action.setChecked(ipod["port"] == chosen)
+            action.setToolTip(ipod["port"])
+            action.triggered.connect(lambda _checked=False, port=ipod["port"]: self.choose_ipod(port))
+            group.addAction(action)
+        menu.addSeparator()
+        menu.addAction("查看设备页", lambda: self.navigate("device"))
+        return menu
+
+    def choose_ipod(self, port: str) -> None:
+        """Connect to this iPod from now on: the saved port, used by the
+        library and sync."""
+        self.save_pref("port", port)
+        self.library_state.refresh(False)
+
+    def _lcd_clicked(self) -> None:
+        self.detect_ipods()
+        if len(self.ipods) < 2:
+            self.navigate("device")
+            return
+        menu = self.device_menu()
+        menu.aboutToHide.connect(menu.deleteLater)
+        menu.popup(self.lcd.mapToGlobal(QtCore.QPoint(0, self.lcd.height() + 4)))
 
     def _activity(self, text: str, fraction) -> None:
         self.lcd.set_activity(text, fraction)

@@ -161,6 +161,9 @@ class ThemeAndNavigationTests(GuiCase):
             self.assertIs(self.window.stack.currentWidget(), self.window.pages[key])
         self.shortcut("Ctrl+,").activated.emit()
         self.assertIs(self.window.stack.currentWidget(), self.window.pages["settings"])
+        sidebar = self.window.sidebar
+        self.assertEqual(sidebar.model_.item(sidebar.rows["import"]).text(), "直接导入")
+        self.assertEqual(self.window.pages["import"].header.title.text(), "直接导入")
 
     def test_device_node_expands_into_its_library(self) -> None:
         sidebar = self.window.sidebar
@@ -199,25 +202,80 @@ class ThemeAndNavigationTests(GuiCase):
         self.assertTrue(sidebar.is_expanded("device"))
 
     def test_clicking_the_device_node_opens_it_and_toggles_it(self) -> None:
-        self.window.resize(1260, 820)
-        self.window.show()
+        for width in (1260, 900):
+            with self.subTest(width=width):
+                self.window.resize(width, 820)
+                self.window.show()
+                wait_until(self.app, lambda: self.window.compact == (width < 1100))
+                self.window.sidebar.set_expanded("device", False)
+                self.check_node_clicks()
+
+    def check_node_clicks(self) -> None:
+        sidebar = self.window.sidebar
         self.window.navigate("songs")
         self.app.processEvents()
-        sidebar = self.window.sidebar
+
+        def click(point, double=False):
+            QtTest.QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton,
+                                    Qt.KeyboardModifier.NoModifier, point)
+            if double:
+                QtTest.QTest.mouseDClick(sidebar.viewport(), Qt.MouseButton.LeftButton,
+                                         Qt.KeyboardModifier.NoModifier, point)
+            self.app.processEvents()
+
         rect = sidebar.visualRect(sidebar.model_.index(sidebar.rows["device"], 0))
-        QtTest.QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton,
-                                Qt.KeyboardModifier.NoModifier, rect.center())
+        # The label: beside the icon in the drawer, under it in the rail.
+        on_label = (QtCore.QPoint(rect.center().x(), rect.bottom() - 8) if sidebar.compact
+                    else QtCore.QPoint(rect.left() + 90, rect.center().y()))
+        click(on_label)
         self.assertIs(self.window.stack.currentWidget(), self.window.pages["device"])
-        self.assertFalse(sidebar.is_expanded("device"))
-        QtTest.QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton,
-                                Qt.KeyboardModifier.NoModifier, rect.center())
         self.assertTrue(sidebar.is_expanded("device"))
+        click(on_label)
+        self.assertFalse(sidebar.is_expanded("device"))
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["device"])
+        click(on_label, double=True)
+        self.assertTrue(sidebar.is_expanded("device"))
+        self.window.navigate("device.albums")
+        click(on_label)
+        self.assertFalse(sidebar.is_expanded("device"))
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["device"])
         self.window.navigate("songs")
         chevron = sidebar.delegate.chevron_area(QtCore.QRectF(rect)).center().toPoint()
-        QtTest.QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton,
-                                Qt.KeyboardModifier.NoModifier, chevron)
+        click(chevron)
+        self.assertTrue(sidebar.is_expanded("device"))
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["songs"])
+        click(chevron)
         self.assertFalse(sidebar.is_expanded("device"))
         self.assertIs(self.window.stack.currentWidget(), self.window.pages["songs"])
+
+    def test_sidebar_never_shows_a_scroll_bar(self) -> None:
+        sidebar = self.window.sidebar
+        self.window.show()
+        for width in (1260, 900):
+            with self.subTest(width=width):
+                self.window.resize(width, 560)
+                wait_until(self.app, lambda: self.window.compact == (width < 1100))
+                sidebar.set_expanded("device", True)
+                self.window.navigate("device")
+                self.app.processEvents()
+                bar = sidebar.verticalScrollBar()
+                self.assertEqual(sidebar.verticalScrollBarPolicy(),
+                                 Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                self.assertGreater(bar.maximum(), 0)
+                self.assertFalse(bar.isVisible())
+                self.assertEqual(sidebar.viewport().width(), sidebar.width())
+                bar.setValue(0)
+                wheel = QtGui.QWheelEvent(QtCore.QPointF(20, 20), QtCore.QPointF(20, 20),
+                                          QtCore.QPoint(), QtCore.QPoint(0, -120),
+                                          Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                                          Qt.ScrollPhase.NoScrollPhase, False)
+                self.app.sendEvent(sidebar.viewport(), wheel)
+                self.assertGreater(bar.value(), 0)
+                bar.setValue(0)
+                self.window.navigate("settings")
+                self.app.processEvents()
+                current = sidebar.visualRect(sidebar.currentIndex())
+                self.assertTrue(sidebar.viewport().rect().contains(current))
 
     def test_search_text_is_kept_per_page(self) -> None:
         self.load_library()
@@ -342,8 +400,33 @@ class RailTests(GuiCase):
         self.assertEqual(self.window.side_panel.width(), 272)
         self.window.resize(900, 700)
         wait_until(self.app, lambda: self.window.compact)
-        self.assertEqual(self.window.side_panel.width(), 88)
+        self.assertEqual(self.window.side_panel.width(), 72)
+        self.assertEqual(self.window.sidebar.width(), 72)
         self.assertTrue(self.window.sidebar.compact)
+        sidebar = self.window.sidebar
+        sidebar.set_expanded("device", True)
+        self.app.processEvents()
+
+        def row(key):
+            return sidebar.visualRect(sidebar.model_.index(sidebar.rows[key], 0))
+        self.assertEqual(row("songs").height(), 60)
+        self.assertEqual(row("device.songs").height(), 60)
+        self.assertEqual(row("device.albums").top() - row("device.songs").top(), 60)
+        # A section break adds a gap; the first section's header takes none.
+        self.assertEqual(row("songs").top() - row("device.composers").bottom() - 1, 12)
+        self.assertEqual(row("device").top(), 0)
+        delegate = sidebar.delegate
+        font = delegate.rail_font(sidebar.font())
+        for text in ("iPod classic", "Jellyfin 同步", "iPod video"):
+            lines = delegate.rail_lines(text, font, sidebar.viewport().width() - 4)
+            self.assertEqual("".join(lines).replace(" ", ""), text.replace(" ", ""))
+            self.assertTrue(all(QtGui.QFontMetrics(font).horizontalAdvance(line)
+                                <= sidebar.viewport().width() - 4 for line in lines))
+        lines = delegate.rail_lines("Jellyfin 同步", font, 44)
+        self.assertEqual(lines, ["Jellyfin", "同步"])
+        sidebar.set_text("sync", "一个很长很长很长很长的名字")
+        self.app.processEvents()
+        self.assertEqual(row("sync").height(), 74)
         self.assertFalse(self.window.brand_name.isVisible())
         self.window.sidebar.select("device.albums")
         self.assertIs(self.window.stack.currentWidget(), self.window.pages["device.albums"])
@@ -436,8 +519,34 @@ class LibraryTests(GuiCase):
         sessions = self.services.library.sessions
         self.window.art._memory.clear()
         self.window.art._none.clear()
-        self.assertIsNotNone(self.window.art.get(lead, "coverflow"))
+        wait_until(self.app, lambda: self.window.art.get(lead, "coverflow") is not None)
+        self.assertIsInstance(self.window.art.get(lead, "coverflow"), QtGui.QImage)
         self.assertEqual(self.services.library.sessions, sessions)
+
+    def test_painting_covers_reads_no_disk_and_reuses_its_pixmaps(self) -> None:
+        from astrapod_desktop import widgets
+        self.load_library()
+        self.window.resize(1260, 820)
+        self.window.show()
+        self.window.navigate("device.albums")
+        grid = self.window.pages["device.albums"].grid
+        art = self.window.art
+        leads = [album.lead for album in self.window.pages["device.albums"].model.albums[:8]]
+        wait_until(self.app, lambda: all(art.get(t, "coverflow") is not None for t in leads), 10)
+        wait_until(self.app, lambda: not self.window.busy)
+        art._memory.clear()
+        disk = []
+        with patch.object(Path, "exists", lambda path: disk.append(path) or False), \
+                patch.object(self.services.library, "art_path",
+                             lambda *args: disk.append(args) or Path("/nonexistent")):
+            grid.viewport().repaint()
+        self.assertEqual(disk, [])
+        wait_until(self.app, lambda: all(art.get(t, "coverflow") is not None for t in leads), 10)
+        grid.viewport().repaint()
+        with patch.object(widgets, "_paint_shadow", wraps=widgets._paint_shadow) as shadows, \
+                patch.object(widgets, "_paint_face", wraps=widgets._paint_face) as faces:
+            grid.viewport().repaint()
+        self.assertEqual((shadows.call_count, faces.call_count), (0, 0))
 
     def test_cover_colour_follows_the_selected_song(self) -> None:
         self.services.library.all_art = True
@@ -805,9 +914,18 @@ class JellyfinLibraryTests(GuiCase):
         wait_until(self.app, lambda: self.window.jellyfin.loaded)
         lead = self.window.pages["albums"].model.albums[0].lead
         art = self.window.jellyfin.art
-        wait_until(self.app, lambda: art.get(lead, "coverflow") is not None)
+        decoded_on = []
+        from_data = QtGui.QImage.fromData
+
+        def record(*args):
+            decoded_on.append(threading.current_thread() is threading.main_thread())
+            return from_data(*args)
+        with patch.object(QtGui.QImage, "fromData", side_effect=record):
+            wait_until(self.app, lambda: art.get(lead, "coverflow") is not None)
         self.assertIsInstance(art.get(lead, "coverflow"), QtGui.QImage)
         self.assertEqual(self.services.library.sessions, 0)
+        self.assertTrue(decoded_on)
+        self.assertNotIn(True, decoded_on)
 
     def test_reading_does_not_wait_for_the_ipod(self) -> None:
         self.sign_in()
@@ -918,23 +1036,21 @@ def backends_error(status):
 
 
 class DevicePortTests(GuiCase):
-    def test_the_port_is_chosen_on_the_device_page(self) -> None:
+    def test_the_port_is_chosen_in_settings_and_used_by_sync(self) -> None:
         device = self.window.pages["device"]
         sync = self.window.pages["sync"]
         settings = self.window.pages["settings"]
-        self.assertFalse([w for w in sync.findChildren(QtWidgets.QLineEdit)
-                          if w.accessibleName() == "iPod 串口"])
-        self.assertEqual(device.port.text(), fakes.FAKE_PORT)
-        self.assertEqual(device.port_picker.badge.text(), "自动识别")
+        for page in (device, sync):
+            self.assertFalse([w for w in page.findChildren(QtWidgets.QLineEdit)
+                              if w.accessibleName() == "iPod 串口"])
+        self.assertEqual(settings.port.text(), fakes.FAKE_PORT)
         self.assertEqual(sync.port_label.text(), "iPod 串口：自动识别")
-        device.port.setText("/dev/ttyACM5")
-        device.port.editingFinished.emit()
+        settings.port.setText("/dev/ttyACM5")
+        settings.save()
         self.assertEqual(self.window.prefs["port"], "/dev/ttyACM5")
         self.assertEqual(self.services.library.port, "/dev/ttyACM5")
         self.assertEqual(json.loads(podlink_ui_theme.ui_prefs_path().read_text())["port"],
                          "/dev/ttyACM5")
-        self.assertEqual(settings.port.text(), "/dev/ttyACM5")
-        self.assertEqual(settings.port_badge.text(), "手动指定")
         self.assertEqual(sync.port_label.text(), "iPod 串口：/dev/ttyACM5")
         sync.url.setText("https://jellyfin.example.com")
         sync.auth_switch.set_current("token", emit=True)
@@ -944,13 +1060,182 @@ class DevicePortTests(GuiCase):
         sync.preview()
         wait_until(self.app, lambda: sync.plan is not None)
         self.assertEqual(self.services.sync.calls[-1][2], "/dev/ttyACM5")
-        device.port_picker.auto_button.click()
+        settings.port_picker.auto_button.click()
+        settings.save()
         self.assertEqual(self.window.prefs["port"], "")
         self.assertIsNone(sync.plan)
-        self.assertEqual(device.port.text(), fakes.FAKE_PORT)
         self.assertEqual(settings.port_badge.text(), "自动识别")
         sync.port_button.click()
-        self.assertIs(self.window.stack.currentWidget(), device)
+        self.assertIs(self.window.stack.currentWidget(), settings)
+
+    def test_status_chip_chooses_among_several_ipods(self) -> None:
+        self.load_library()
+        self.window.show()
+        lcd = self.window.lcd
+        self.assertFalse(lcd.has_menu)
+        self.window.navigate("songs")
+        QtTest.QTest.mouseClick(lcd, Qt.MouseButton.LeftButton)
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["device"])
+        second = "/dev/serial/by-id/usb-PodBox_AstraPod_iPod_000A27001F2C9D11-if00"
+        self.services.library.detected_ports = [
+            {"port": fakes.FAKE_PORT, "serial": "000A27001F2C9D10", "product": "iPod"},
+            {"port": second, "serial": "000A27001F2C9D11", "product": "iPod"}]
+        state = fakes.fake_state()
+        state["link"]["port"] = "/dev/ttyACM1"
+        self.services.daemon.push(state)
+        self.assertTrue(lcd.has_menu)
+        self.assertIn("2 台 iPod", lcd.toolTip())
+        menu = self.window.device_menu()
+        self.addCleanup(menu.deleteLater)
+        actions = [a for a in menu.actions() if a.isCheckable()]
+        self.assertEqual([a.text() for a in actions],
+                         ["iPod classic · 000A27001F2C9D10", "iPod · 000A27001F2C9D11"])
+        self.assertFalse(any(a.isChecked() for a in actions))
+        actions[1].trigger()
+        self.assertEqual(self.window.prefs["port"], second)
+        self.assertEqual(self.services.library.port, second)
+        self.assertEqual(self.window.pages["sync"].port_label.text(), f"iPod 串口：{second}")
+        self.assertEqual(self.window.pages["settings"].port.text(), second)
+        wait_until(self.app, lambda: not self.window.busy)
+        menu = self.window.device_menu()
+        self.addCleanup(menu.deleteLater)
+        self.assertEqual([a.isChecked() for a in menu.actions() if a.isCheckable()], [False, True])
+        self.window.navigate("songs")
+        QtTest.QTest.mouseClick(lcd, Qt.MouseButton.LeftButton)
+        wait_until(self.app, lambda: isinstance(QtWidgets.QApplication.activePopupWidget(),
+                                                QtWidgets.QMenu))
+        QtWidgets.QApplication.activePopupWidget().close()
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["songs"])
+        self.services.library.detected_ports = self.services.library.detected_ports[:1]
+        self.window.detect_ipods()
+        self.assertFalse(lcd.has_menu)
+
+
+class IpodPortsTests(unittest.TestCase):
+    def test_lists_every_podlink_tty_with_its_by_id_path(self) -> None:
+        import podlink
+        from types import SimpleNamespace
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            by_id = root / "by-id"
+            by_id.mkdir()
+            ttys = [root / name for name in ("ttyACM0", "ttyACM1", "ttyUSB0")]
+            for tty in ttys:
+                tty.touch()
+            (by_id / "usb-PodBox_AstraPod_iPod_B-if00").symlink_to(ttys[1])
+            (by_id / "usb-PodBox_AstraPod_iPod_A-if00").symlink_to(ttys[0])
+            ports = [SimpleNamespace(device=str(ttys[1]), vid=podlink.VID, pid=podlink.PID,
+                                     serial_number="B", product="iPod"),
+                     SimpleNamespace(device=str(ttys[2]), vid=0x0403, pid=0x6001,
+                                     serial_number="X", product="FTDI"),
+                     SimpleNamespace(device=str(ttys[0]), vid=podlink.VID, pid=podlink.PID,
+                                     serial_number=None, product=None)]
+            found = podlink_settings.ipod_ports(ports, by_id)
+            self.assertEqual(found, [
+                {"port": str(by_id / "usb-PodBox_AstraPod_iPod_A-if00"), "serial": "",
+                 "product": ""},
+                {"port": str(by_id / "usb-PodBox_AstraPod_iPod_B-if00"), "serial": "B",
+                 "product": "iPod"}])
+            self.assertEqual(podlink_settings.ipod_ports(ports[2:], root / "missing"),
+                             [{"port": str(ttys[0]), "serial": "", "product": ""}])
+
+
+class DeviceLayoutTests(GuiCase):
+    def assert_fits(self, root: QtWidgets.QWidget) -> None:
+        """Every visible widget under root is inside its parent and at
+        least its minimum size, so nothing is cut off."""
+        for widget in root.findChildren(QtWidgets.QWidget):
+            if (not widget.isVisible() or isinstance(widget, QtWidgets.QScrollBar)
+                    or isinstance(widget.parentWidget(), QtWidgets.QLineEdit)):
+                continue
+            name = f"{type(widget).__name__} {widget.objectName() or getattr(widget, 'text', str)()}"
+            parent = widget.parentWidget()
+            inside = parent.rect().adjusted(-1, -1, 1, 1)
+            self.assertTrue(inside.contains(widget.geometry()), f"{name} outside its parent")
+            hint = widget.minimumSizeHint()
+            if hint.isValid():
+                self.assertGreaterEqual(widget.width(), hint.width(), f"{name} squeezed")
+                self.assertGreaterEqual(widget.height(), hint.height(), f"{name} squeezed")
+
+    def show_device(self, width: int, height: int):
+        self.load_library()
+        self.window.show()
+        self.window.resize(width, height)
+        self.window.navigate("device")
+        self.app.processEvents()
+        page = self.window.pages["device"]
+        wait_until(self.app, lambda: page.scroll.viewport().width() == page.scroll.widget().width())
+        return page
+
+    def test_device_page_fits_the_narrowest_window(self) -> None:
+        minimum = self.window.minimumSize()
+        page = self.show_device(minimum.width(), minimum.height())
+        host = page.scroll.widget()
+        self.assertEqual(self.window.size(), minimum)
+        self.assertLessEqual(host.minimumSizeHint().width(), page.scroll.viewport().width())
+        self.assertFalse(page.scroll.horizontalScrollBar().isVisible())
+        self.assert_fits(host)
+        self.assertEqual(page.name.text(), "iPod classic")
+        self.assertLess(page.drawing.width(), 230)
+
+    def test_device_page_draws_the_full_size_ipod_when_wide(self) -> None:
+        page = self.show_device(1300, 860)
+        self.assert_fits(page.scroll.widget())
+        self.assertEqual(page.drawing.size(), QtCore.QSize(230, 380))
+        self.assertFalse(page.scroll.verticalScrollBar().isVisible())
+
+    def test_short_window_scrolls_the_whole_device_page(self) -> None:
+        page = self.show_device(1300, 600)
+        host = page.scroll.widget()
+        bar = page.scroll.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        self.assert_fits(host)
+        self.assertEqual(page.drawing.height(), 380)
+        cards = [w for w in host.findChildren(QtWidgets.QFrame) if w.property("card")]
+        self.assertEqual(len(cards), 2)
+        for card in cards:
+            self.assertGreaterEqual(card.height(), card.minimumSizeHint().height())
+        capacity = cards[1]
+        page.scroll.ensureWidgetVisible(capacity, 0, 0)
+        self.app.processEvents()
+        top = capacity.mapTo(page.scroll.viewport(), QtCore.QPoint(0, 0)).y()
+        self.assertGreaterEqual(top, 0)
+        self.assertLessEqual(top + capacity.height(), page.scroll.viewport().height())
+        self.assertGreater(bar.value(), 0)
+
+    def test_short_window_scrolls_the_sync_page_above_its_footer(self) -> None:
+        self.window.show()
+        self.window.resize(1100, 560)
+        self.window.navigate("sync")
+        page = self.window.pages["sync"]
+        self.app.processEvents()
+        area = page.findChild(QtWidgets.QScrollArea)
+        wait_until(self.app, lambda: area.viewport().width() == area.widget().width())
+        self.assertGreater(area.verticalScrollBar().maximum(), 0)
+        self.assert_fits(area.widget())
+        self.assertFalse(area.isAncestorOf(page.apply_button))
+        self.assertTrue(page.apply_button.isVisible())
+        self.window.resize(1300, 820)
+        self.app.processEvents()
+        wait_until(self.app, lambda: area.verticalScrollBar().maximum() == 0)
+
+    def test_settings_port_row_fits_the_narrowest_window(self) -> None:
+        self.window.show()
+        self.window.resize(self.window.minimumSize())
+        self.window.navigate("settings")
+        page = self.window.pages["settings"]
+        self.app.processEvents()
+        area = page.findChild(QtWidgets.QScrollArea)
+        wait_until(self.app, lambda: area.viewport().width() == area.widget().width())
+        picker = page.port_picker
+        self.assert_fits(picker)
+        self.assertGreaterEqual(picker.badge.width(), picker.badge.sizeHint().width())
+        self.assertEqual(picker.detect_button.size(), QtCore.QSize(40, 40))
+        if picker.width() < 220 + picker.badge.width() + picker.detect_button.width() + 16:
+            self.assertEqual(picker.field.width(), picker.width())
+            self.assertGreater(picker.badge.y(), picker.field.geometry().bottom())
+        else:
+            self.assertGreaterEqual(picker.field.width(), 220)
 
 
 class SettingsTests(GuiCase):

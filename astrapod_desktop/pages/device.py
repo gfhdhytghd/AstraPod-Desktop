@@ -1,5 +1,6 @@
-"""Device: the iPod front from the Rockbox manual, its facts, the serial port
-it is reached through, and the capacity bar."""
+"""Device: the iPod front from the Rockbox manual, its facts and the
+capacity bar, scrolling as one page. Below SMALL_BELOW the drawing shrinks
+to leave the facts room."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,7 +11,6 @@ from ..qt import QtCore, QtGui, QtSvg, QtWidgets, Qt
 from ..widgets import (CapacityBar, PageHeader, button, label, make_badge,
                        make_card, set_badge)
 from . import Page
-from .port import PortPicker
 
 R = QtCore.QRectF
 P = QtCore.QPointF
@@ -18,6 +18,9 @@ MODEL_NAMES = {"ipod6g": "iPod classic", "ipodvideo": "iPod video"}
 ASSETS = Path(__file__).resolve().parent.parent / "assets"
 # The LCD within either front drawing, as fractions of its width and height.
 SCREEN = (0.0978, 0.0638, 0.9022, 0.4224)
+# The hero card's inner width below which the drawing is drawn at SMALL_SCALE.
+SMALL_BELOW = 640
+SMALL_SCALE = 0.6
 _renderers: dict = {}
 
 
@@ -47,7 +50,13 @@ class IPodDrawing(QtWidgets.QWidget):
         self.window_ = window
         self.model = "ipod6g"
         self.connected = False
+        self.scale = 1.0
         self.setFixedSize(230, 380)
+
+    def set_scale(self, scale: float) -> None:
+        self.scale = scale
+        self.setFixedSize(round(230 * scale), round(380 * scale))
+        self.update()
 
     def set_state(self, model: str, connected: bool) -> None:
         self.model = model or "ipod6g"
@@ -59,6 +68,7 @@ class IPodDrawing(QtWidgets.QWidget):
         dark = t.name == "dark"
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.scale(self.scale, self.scale)
         body = R(22, 10, 186, 314)
         # Floor shadow
         shadow = QtGui.QRadialGradient(P(body.center().x(), body.bottom() + 26), 110)
@@ -92,7 +102,7 @@ class IPodDrawing(QtWidgets.QWidget):
             painter.drawRect(screen)
             painter.setPen(QtGui.QColor("#6B6E78"))
             font = QtGui.QFont(self.font())
-            font.setPixelSize(11)
+            font.setPixelSize(round(11 / self.scale))
             painter.setFont(font)
             painter.drawText(screen, Qt.AlignmentFlag.AlignCenter, "未连接")
             painter.setPen(Qt.PenStyle.NoPen)
@@ -106,19 +116,28 @@ class DevicePage(Page):
 
     def __init__(self, window, parent=None):
         super().__init__(window, parent)
+        self.layout_.setContentsMargins(0, 0, 0, 0)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        host = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(host)
+        layout.setContentsMargins(28, 18, 28, 20)
+        layout.setSpacing(14)
         self.header = PageHeader("iPod")
         self.refresh_button = self.header.add(button("刷新", None, "refresh", self.refresh))
-        self.layout_.addWidget(self.header)
+        layout.addWidget(self.header)
 
-        hero, hero_layout = make_card(0, margins=(26, 22, 30, 22))
-        row = QtWidgets.QHBoxLayout()
+        self.hero, hero_layout = make_card(0, margins=(26, 22, 30, 22))
+        self.hero_row = row = QtWidgets.QHBoxLayout()
         row.setSpacing(34)
         self.drawing = IPodDrawing(window)
         row.addWidget(self.drawing, 0, Qt.AlignmentFlag.AlignTop)
         facts = QtWidgets.QVBoxLayout()
         facts.setSpacing(6)
         name_row = QtWidgets.QHBoxLayout()
-        self.name = label("iPod", "page-title")
+        self.name = label("iPod", "page-title", wrap=True)
         self.link_badge = make_badge("未连接")
         name_row.addWidget(self.name)
         name_row.addSpacing(6)
@@ -136,17 +155,11 @@ class DevicePage(Page):
                                             ("serial", "序列号"), ("capacity", "容量"),
                                             ("tracks", "歌曲"), ("database", "数据库"))):
             name = label(caption, "stat-label")
-            value = label("—", "card-title")
+            value = label("—", "card-title", wrap=True)
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             grid.addWidget(name, i, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             grid.addWidget(value, i, 1)
             self.values[key] = value
-        self.port_picker = PortPicker(window, autosave=True)
-        self.port = self.port_picker.field
-        grid.addWidget(label("串口", "stat-label"), 6, 0,
-                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        grid.addWidget(self.port_picker, 6, 1)
-        grid.addWidget(self.port_picker.help, 7, 1)
         grid.setColumnStretch(1, 1)
         facts.addLayout(grid)
         facts.addStretch(1)
@@ -161,7 +174,7 @@ class DevicePage(Page):
         facts.addLayout(actions)
         row.addLayout(facts, 1)
         hero_layout.addLayout(row)
-        self.layout_.addWidget(hero)
+        layout.addWidget(self.hero)
 
         cap, cap_layout = make_card(10, margins=(26, 18, 26, 18))
         cap_head = QtWidgets.QHBoxLayout()
@@ -174,12 +187,28 @@ class DevicePage(Page):
         cap_layout.addWidget(self.capacity)
         self.cap_note = label("音频按每首歌的时长和比特率估算。", "helper")
         cap_layout.addWidget(self.cap_note)
-        self.layout_.addWidget(cap)
-        self.layout_.addStretch(1)
+        layout.addWidget(cap)
+        layout.addStretch(1)
+        self.scroll.setWidget(host)
+        self.layout_.addWidget(self.scroll)
+        self.scroll.viewport().installEventFilter(self)
 
         window.library_state.changed.connect(self.update_view)
         window.daemon.state_changed.connect(lambda _s: self.update_view())
         self.update_view()
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.scroll.viewport() and event.type() == QtCore.QEvent.Type.Resize:
+            self._reflow(event.size().width())
+        return super().eventFilter(watched, event)
+
+    def _reflow(self, width: int) -> None:
+        margins = self.hero.layout().contentsMargins()
+        inner = width - 56 - margins.left() - margins.right()
+        small = inner < SMALL_BELOW
+        if (self.drawing.scale < 1) != small:
+            self.drawing.set_scale(SMALL_SCALE if small else 1.0)
+            self.hero_row.setSpacing(20 if small else 34)
 
     def refresh(self) -> None:
         self.window_.library_state.refresh(False)
@@ -240,6 +269,5 @@ class DevicePage(Page):
             self.update_view()
 
     def apply_theme(self, tokens) -> None:
-        self.port_picker.show_state(refill=False)
         self.capacity.tokens = tokens
         self.drawing.update()

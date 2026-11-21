@@ -8,6 +8,7 @@ when the animations setting is off.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
 import time
 
@@ -593,38 +594,104 @@ def mix(a: QtGui.QColor, b: QtGui.QColor, amount: float) -> QtGui.QColor:
 # ----------------------------------------------------------------------
 # Artwork
 # ----------------------------------------------------------------------
+# Covers and their shadows are painted once into pixmaps and reused; a grid
+# of covers then costs one blit per tile instead of five antialiased shadow
+# layers, a rounded clip and a smooth rescale.
+_FACES: OrderedDict = OrderedDict()
+_SHADOWS: OrderedDict = OrderedDict()
+FACE_CACHE = 120
+SHADOW_CACHE = 32
+
+
+def _cached(cache: OrderedDict, key, limit: int, make) -> QtGui.QPixmap:
+    pixmap = cache.get(key)
+    if pixmap is None:
+        pixmap = cache[key] = make()
+        while len(cache) > limit:
+            cache.popitem(last=False)
+    else:
+        cache.move_to_end(key)
+    return pixmap
+
+
+def _canvas(width: float, height: float, dpr: float) -> QtGui.QPixmap:
+    pixmap = QtGui.QPixmap(max(1, math.ceil(width * dpr)), max(1, math.ceil(height * dpr)))
+    pixmap.setDevicePixelRatio(dpr)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    return pixmap
+
+
+def _dpr(painter: QtGui.QPainter) -> float:
+    device = painter.device()
+    return device.devicePixelRatioF() if device is not None else 1.0
+
+
 def draw_art(painter: QtGui.QPainter, rect: QtCore.QRectF, image, seed: str,
              radius: float = 8.0, shadow: float = 1.0, loading: bool = False,
              tokens: ThemeTokens | None = None) -> None:
     """A cover with a soft layered shadow; a tinted note when there is none."""
-    painter.save()
-    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-    painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
     if shadow > 0:
         draw_shadow(painter, rect, radius, shadow, tokens)
+    has_image = isinstance(image, QtGui.QImage) and not image.isNull()
+    width, height = round(rect.width() * 2) / 2, round(rect.height() * 2) / 2
+    dpr = _dpr(painter)
+    face = ("image", image.cacheKey()) if has_image else ("placeholder", seed, loading)
+
+    def make() -> QtGui.QPixmap:
+        pixmap = _canvas(width, height, dpr)
+        local = QtGui.QPainter(pixmap)
+        _paint_face(local, R(0, 0, width, height), image if has_image else None, seed,
+                    radius, loading)
+        local.end()
+        return pixmap
+
+    pixmap = _cached(_FACES, (face, width, height, radius, dpr), FACE_CACHE, make)
+    painter.drawPixmap(rect.topLeft(), pixmap)
+
+
+def _paint_face(painter, rect: QtCore.QRectF, image, seed: str, radius: float,
+                loading: bool) -> None:
+    painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
     clip = QtGui.QPainterPath()
     clip.addRoundedRect(rect, radius, radius)
     painter.setClipPath(clip)
-    if isinstance(image, QtGui.QImage) and not image.isNull():
+    if image is not None:
         painter.drawImage(rect, image)
-    else:
-        first, second = placeholder_colors(seed)
-        gradient = QtGui.QLinearGradient(rect.topLeft(), rect.bottomRight())
-        gradient.setColorAt(0, first)
-        gradient.setColorAt(1, second)
-        painter.fillRect(rect, gradient)
-        glyph = min(rect.width(), rect.height()) * 0.34
-        note_rect = R(rect.center().x() - glyph / 2, rect.center().y() - glyph / 2, glyph, glyph)
-        color = QtGui.QColor(255, 255, 255, 120 if loading else 170)
-        icons.paint(painter, "disc" if loading else "note", note_rect, color)
-    painter.restore()
+        return
+    first, second = placeholder_colors(seed)
+    gradient = QtGui.QLinearGradient(rect.topLeft(), rect.bottomRight())
+    gradient.setColorAt(0, first)
+    gradient.setColorAt(1, second)
+    painter.fillRect(rect, gradient)
+    glyph = min(rect.width(), rect.height()) * 0.34
+    note_rect = R(rect.center().x() - glyph / 2, rect.center().y() - glyph / 2, glyph, glyph)
+    color = QtGui.QColor(255, 255, 255, 120 if loading else 170)
+    icons.paint(painter, "disc" if loading else "note", note_rect, color)
 
 
 def draw_shadow(painter, rect: QtCore.QRectF, radius: float, level: float = 1.0,
                 tokens: ThemeTokens | None = None) -> None:
     """An M3 elevation shadow: a tight key shadow and a soft ambient one."""
     dark = tokens is not None and tokens.name == "dark"
-    painter.save()
+    width, height = round(rect.width() * 2) / 2, round(rect.height() * 2) / 2
+    level = round(level, 2)
+    margin = math.ceil(8 * level) + 1
+    dpr = _dpr(painter)
+
+    def make() -> QtGui.QPixmap:
+        pixmap = _canvas(width + 2 * margin, height + 2 * margin, dpr)
+        local = QtGui.QPainter(pixmap)
+        local.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        _paint_shadow(local, R(margin, margin, width, height), radius, level, dark)
+        local.end()
+        return pixmap
+
+    pixmap = _cached(_SHADOWS, (width, height, radius, level, dark, dpr), SHADOW_CACHE, make)
+    painter.drawPixmap(rect.topLeft() - P(margin, margin), pixmap)
+
+
+def _paint_shadow(painter, rect: QtCore.QRectF, radius: float, level: float, dark: bool) -> None:
     painter.setPen(Qt.PenStyle.NoPen)
     for i in range(1, 6):
         spread = i * 1.6 * level
@@ -633,7 +700,6 @@ def draw_shadow(painter, rect: QtCore.QRectF, radius: float, level: float = 1.0,
         painter.setBrush(color)
         painter.drawRoundedRect(rect.adjusted(-spread * 0.4, spread * 0.5, spread * 0.4, spread * 1.0),
                                 radius + spread * 0.4, radius + spread * 0.4)
-    painter.restore()
 
 
 class ArtLabel(QtWidgets.QWidget):
@@ -691,7 +757,8 @@ class WindowSurface(QtWidgets.QWidget):
 # ----------------------------------------------------------------------
 class LcdDisplay(QtWidgets.QWidget):
     """The top bar's status capsule: a running job's progress, else the
-    iPod's link and library state. Clicking it opens the iPod page."""
+    iPod's link and library state. With a menu it shows a drop-down arrow;
+    the window decides what a click does."""
 
     clicked = Signal()
 
@@ -708,6 +775,8 @@ class LcdDisplay(QtWidgets.QWidget):
         self.fraction = None
         self.idle_line = ("AstraPod", "iPod 未连接")
         self.connected = False
+        self.has_menu = False
+        self.menu_tip = ""
         self._sweep = 0.0
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(40)
@@ -725,13 +794,20 @@ class LcdDisplay(QtWidgets.QWidget):
             self._timer.start()
         else:
             self._timer.stop()
-        self.setToolTip(text)
+        self.setToolTip(text or self.menu_tip)
         self.update()
 
     def set_idle(self, title: str, detail: str, connected: bool = False) -> None:
         self.idle_line = (title, detail)
         self.connected = connected
         self.setAccessibleDescription(f"{title}，{detail}")
+        self.update()
+
+    def set_menu(self, has_menu: bool, tip: str = "") -> None:
+        self.has_menu = has_menu
+        self.menu_tip = tip
+        if not self.activity:
+            self.setToolTip(tip)
         self.update()
 
     def mousePressEvent(self, event) -> None:
@@ -761,7 +837,8 @@ class LcdDisplay(QtWidgets.QWidget):
         painter.drawEllipse(avatar)
         icons.paint(painter, "sync" if self.activity else "device", avatar.adjusted(7, 7, -7, -7),
                     QtGui.QColor(t.on_primary_container if live else t.on_surface_variant))
-        inner = R(avatar.right() + 12, rect.top() + 5, rect.right() - avatar.right() - 32,
+        inner = R(avatar.right() + 12, rect.top() + 5,
+                  rect.right() - avatar.right() - (48 if self.has_menu else 32),
                   rect.height() - 10)
         if self.activity:
             self._paint_lines(painter, inner.adjusted(0, -2, 0, -4), self.activity, "正在处理",
@@ -781,6 +858,8 @@ class LcdDisplay(QtWidgets.QWidget):
                                           bar.height()), 2, 2)
         else:
             self._paint_lines(painter, inner, self.idle_line[0], self.idle_line[1], text, muted)
+        if self.has_menu:
+            SidebarDelegate._chevron(painter, P(rect.right() - 22, rect.center().y()), True, 9, muted)
         painter.end()
 
     def enterEvent(self, event) -> None:
@@ -1050,13 +1129,21 @@ BADGE_ROLE = Qt.ItemDataRole.UserRole + 13
 PARENT_ROLE = Qt.ItemDataRole.UserRole + 14     # a child row's node key
 EXPANDED_ROLE = Qt.ItemDataRole.UserRole + 15   # a node row: True or False
 INDENT = 20
+# Rail rows: indicator, then a one- or two-line label, with a gap between
+# destinations and a wider one between sections.
+RAIL_TOP = 5
+RAIL_LABEL_GAP = 4
+RAIL_LINE = 14
+RAIL_BOTTOM = 5
+RAIL_SECTION_GAP = 12
 
 
 class SidebarDelegate(QtWidgets.QStyledItemDelegate):
-    """Drawer rows are 48 px pills with the label beside the icon; rail
-    rows put a 56x32 indicator over a small label. The active page takes
-    the secondary container colour. A node row carries a chevron; its
-    children are indented in the drawer and sit on a tinted band in the rail."""
+    """Drawer rows are 40 px pills with the label beside the icon; rail
+    rows put a 56x32 indicator over a label of up to two lines, 60 px for
+    one. The active page takes the secondary container colour. A node row
+    carries a chevron; its children are indented in the drawer and sit on a
+    tinted band in the rail."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1067,19 +1154,56 @@ class SidebarDelegate(QtWidgets.QStyledItemDelegate):
 
     def sizeHint(self, option, index):
         if index.data(HEADER_ROLE):
-            return QtCore.QSize(option.rect.width(), 0 if self.compact else 30)
-        return QtCore.QSize(option.rect.width(), 48 if self.compact else 40)
+            gap = (0 if index.row() == 0 else RAIL_SECTION_GAP) if self.compact else 30
+            return QtCore.QSize(option.rect.width(), gap)
+        if not self.compact:
+            return QtCore.QSize(option.rect.width(), 40)
+        view = option.widget
+        width = (view.viewport().width() if view is not None else option.rect.width()) - 4
+        lines = self.rail_lines(index.data(Qt.ItemDataRole.DisplayRole) or "",
+                                self.rail_font(option.font), width)
+        return QtCore.QSize(option.rect.width(), RAIL_TOP + 32 + RAIL_LABEL_GAP
+                            + RAIL_LINE * len(lines) + RAIL_BOTTOM)
+
+    @staticmethod
+    def rail_font(base: QtGui.QFont, selected: bool = True) -> QtGui.QFont:
+        font = QtGui.QFont(base)
+        font.setPixelSize(11)
+        font.setWeight(QtGui.QFont.Weight.Bold if selected else QtGui.QFont.Weight.Medium)
+        return font
+
+    @staticmethod
+    def rail_lines(text: str, font: QtGui.QFont, width: float) -> list[str]:
+        """A rail label in one line, or broken into two with the second
+        elided. Lines are measured in the bold face, so selecting a row
+        never changes its height."""
+        metrics = QtGui.QFontMetrics(font)
+        if metrics.horizontalAdvance(text) <= width:
+            return [text]
+        layout = QtGui.QTextLayout(text, font)
+        option = QtGui.QTextOption()
+        option.setWrapMode(QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        layout.setTextOption(option)
+        layout.beginLayout()
+        line = layout.createLine()
+        line.setLineWidth(max(1.0, width))
+        layout.endLayout()
+        split = max(1, line.textLength())
+        rest = text[split:].strip()
+        if not rest:
+            return [metrics.elidedText(text, Qt.TextElideMode.ElideRight, int(width))]
+        return [text[:split].rstrip(), metrics.elidedText(rest, Qt.TextElideMode.ElideRight, int(width))]
 
     def indicator(self, rect: QtCore.QRectF, child: bool = False) -> tuple[QtCore.QRectF, float]:
         if self.compact:
-            return R(rect.center().x() - 28, rect.top(), 56, 32), 16.0
+            return R(rect.center().x() - 28, rect.top() + RAIL_TOP, 56, 32), 16.0
         return rect.adjusted(12 + (INDENT if child else 0), 1, -12, -1), 20.0
 
     def chevron_area(self, rect: QtCore.QRectF) -> QtCore.QRectF:
         """Where a node row's chevron sits and takes clicks."""
         pill, _radius = self.indicator(rect)
         if self.compact:
-            return R(pill.right(), pill.top(), max(12.0, rect.right() - pill.right()), pill.height())
+            return R(pill.right(), pill.top(), max(8.0, rect.right() - pill.right()), pill.height())
         return R(pill.right() - 40, pill.top(), 40, pill.height())
 
     @staticmethod
@@ -1089,7 +1213,7 @@ class SidebarDelegate(QtWidgets.QStyledItemDelegate):
         parent = index.data(PARENT_ROLE)
         first = index.siblingAtRow(index.row() - 1).data(PARENT_ROLE) != parent
         last = index.siblingAtRow(index.row() + 1).data(PARENT_ROLE) != parent
-        band = rect.adjusted(6, 0, -6, 0)
+        band = rect.adjusted(4, 0, -4, 0)
         path = QtGui.QPainterPath()
         path.setFillRule(Qt.FillRule.WindingFill)
         path.addRoundedRect(band, 14, 14)
@@ -1166,19 +1290,19 @@ class SidebarDelegate(QtWidgets.QStyledItemDelegate):
         if self.compact:
             icon_rect = R(pill.center().x() - 12, pill.center().y() - 12, 24, 24)
             icons.paint(painter, index.data(ICON_ROLE), icon_rect, fg)
-            font.setPixelSize(11)
-            font.setWeight(QtGui.QFont.Weight.Bold if selected else QtGui.QFont.Weight.Medium)
+            font = self.rail_font(font, selected)
             painter.setFont(font)
             painter.setPen(QtGui.QColor(t.on_surface if selected else t.on_surface_variant))
-            metrics = QtGui.QFontMetrics(font)
-            painter.drawText(R(rect.left() + 2, pill.bottom(), rect.width() - 4, 16),
-                             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
-                             metrics.elidedText(text, Qt.TextElideMode.ElideRight, int(rect.width() - 4)))
+            top = pill.bottom() + RAIL_LABEL_GAP
+            for line in self.rail_lines(text, self.rail_font(font), rect.width() - 4):
+                painter.drawText(R(rect.left() + 2, top, rect.width() - 4, RAIL_LINE),
+                                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter, line)
+                top += RAIL_LINE
             if badge:
                 self._badge(painter, font, str(badge), P(icon_rect.right() + 2, icon_rect.top() + 2), t)
             if expanded is not None:
                 area = self.chevron_area(rect)
-                self._chevron(painter, area.center(), expanded, 6,
+                self._chevron(painter, area.center(), expanded, 5,
                               QtGui.QColor(t.on_surface_variant))
         else:
             icons.paint(painter, index.data(ICON_ROLE), R(pill.left() + 16, pill.center().y() - 12, 24, 24), fg)
@@ -1218,10 +1342,11 @@ class Sidebar(QtWidgets.QListView):
     """Sections of pages; accepts files dropped on it for import.
 
     A page added with a parent is that node's child: it shows only while
-    the node is expanded. Nodes start collapsed. Clicking a node opens its
-    page; its chevron, a click on the open node, or Left and Right toggle
-    it. Opening a child expands its node. The drawer shows a scroll bar
-    when the list outgrows the window; the rail scrolls by wheel only."""
+    the node is expanded. Nodes start collapsed. A click anywhere on a node
+    toggles it and opens its page; a click on its chevron only toggles it,
+    as do Left and Right. Opening a child expands its node. Neither the
+    drawer nor the rail shows a scroll bar; both scroll by wheel and follow
+    the current row."""
 
     page_selected = Signal(str)
     files_dropped = Signal(list)
@@ -1237,7 +1362,7 @@ class Sidebar(QtWidgets.QListView):
         self.setAcceptDrops(True)
         self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setUniformItemSizes(False)
         self.setAccessibleName("导航")
@@ -1250,8 +1375,6 @@ class Sidebar(QtWidgets.QListView):
         under the icons, and the names move into tooltips."""
         self.compact = compact
         self.delegate.compact = compact
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff if compact
-                                        else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         for row in range(self.model_.rowCount()):
             item = self.model_.item(row)
             if not item.data(HEADER_ROLE):
@@ -1263,13 +1386,26 @@ class Sidebar(QtWidgets.QListView):
             item = self.model_.item(row)
             parent = item.data(PARENT_ROLE)
             if item.data(HEADER_ROLE):
-                hidden = self.compact
+                hidden = self.compact and row == 0
             else:
                 hidden = bool(parent) and not self.is_expanded(parent)
             self.setRowHidden(row, hidden)
         self.doItemsLayout()
         self.scrollTo(self.currentIndex())
         self.viewport().update()
+
+    def updateGeometries(self) -> None:
+        """Qt takes the wheel step from row 0, a header with no height in
+        the rail, so the step is fixed at the drawer's header height."""
+        super().updateGeometries()
+        self.verticalScrollBar().setSingleStep(30)
+
+    def resizeEvent(self, event) -> None:
+        """Rail labels wrap to the width, so a new width re-measures the rows."""
+        super().resizeEvent(event)
+        if self.compact and event.size().width() != event.oldSize().width():
+            self.doItemsLayout()
+            self.scrollTo(self.currentIndex())
 
     def focusInEvent(self, event) -> None:
         """The focus ring shows only for keyboard focus, as in M3."""
@@ -1340,11 +1476,20 @@ class Sidebar(QtWidgets.QListView):
         if key and index.data(EXPANDED_ROLE) is not None and event.button() == Qt.MouseButton.LeftButton:
             on_chevron = self.delegate.chevron_area(R(self.visualRect(index))).contains(
                 event.position())
-            if on_chevron or key == self.current_key():
-                self.set_expanded(key, not self.is_expanded(key))
-                event.accept()
-                return
+            self.set_expanded(key, not self.is_expanded(key))
+            if not on_chevron and key != self.current_key():
+                self.select(key)
+            event.accept()
+            return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        """The second click of a double-click on a node does not toggle it back."""
+        index = self.indexAt(event.position().toPoint())
+        if index.isValid() and index.data(EXPANDED_ROLE) is not None:
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
     def keyPressEvent(self, event) -> None:
         key = self.current_key()

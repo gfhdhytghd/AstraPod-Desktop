@@ -277,14 +277,19 @@ def _open_binary(link, command):
     return _request(link, command), False
 
 
-def _read_binary(link, size, label, progress=None, *, streaming=False, sink=None):
-    data = bytearray() if sink is None else None
-    offset = 0
-    crc = 0
+def _read_binary(link, size, label, progress=None, *, streaming=False, collect=True,
+                 pace_bytes_per_second=None, sink=None):
+    data = bytearray()
+    offset = crc = 0
     credits = STREAM_WINDOW
+    started = time.monotonic() if pace_bytes_per_second else None
     while True:
         if streaming:
             if not credits:
+                if started is not None and offset < size:
+                    wait = started + offset / pace_bytes_per_second - time.monotonic()
+                    if wait > 0:
+                        time.sleep(wait)
                 link.send(podlink.TEXT, b"MS3 CREDIT")
                 credits = STREAM_WINDOW
             reply = _receive(link, time.monotonic() + link.timeout, binary=True)
@@ -294,16 +299,16 @@ def _read_binary(link, size, label, progress=None, *, streaming=False, sink=None
         if not reply.startswith(b"MSF1"):
             if offset != size or reply != f"DONE {size} {crc:08x}".encode("ascii"):
                 raise ValueError(f"{label} length or CRC mismatch")
-            return data
+            return data if collect else crc
         if (not 8 < len(reply) <= link.max_message
                 or struct.unpack_from("<I", reply, 4)[0] != offset
                 or offset + len(reply) - 8 > size):
             raise ValueError(f"invalid {label} chunk")
         chunk = memoryview(reply)[8:]
-        if sink is None:
-            data.extend(chunk)
-        else:
+        if sink is not None:
             sink.write(chunk)
+        elif collect:
+            data.extend(chunk)
         offset += len(chunk)
         crc = crc32(chunk, crc)
         if progress is not None:
@@ -322,7 +327,7 @@ def download_sample(link, path, destination):
         with TemporaryDirectory(dir=destination.parent) as staging:
             partial = Path(staging) / "sample"
             with partial.open("wb") as output:
-                _read_binary(link, size, "sample", streaming=True, sink=output)
+                _read_binary(link, size, "sample", streaming=True, collect=False, sink=output)
             complete = True
             partial.replace(destination)
     finally:
@@ -585,74 +590,209 @@ class _UploadProgress:
         return message
 
 
-def import_files(link: podlink.Link, paths, progress, skip_duplicates=True):
+def import_tag_index(link):
     matches = defaultdict(list)
-    indexed = False
+    for track in tracks(link):
+        tags = music_tags(track.title, track.artist.split(";"), track.album,
+                          track.length_ms, track.disc, track.track)
+        if tags:
+            matches[tags.key].append(tags)
+    return matches
+
+
+def import_batch(paths, progress, skip_duplicates, index, publish):
+    """Prepare and report each file identically for the two transports."""
+    matches = None
     stored = []
-    stopped = False
 
     def event(path, state, sent=0, total=0, error=None):
         if progress is not None:
             progress(dict(file=str(path), state=state, sent=sent, total=total,
                           error=error))
 
-    try:
-        for value in paths:
-            path = Path(value)
-            event(path, "probe")
+    for value in paths:
+        path = Path(value)
+        event(path, "probe")
+        try:
+            tags = _probe_tags(path)
+        except (OSError, RuntimeError, ValueError) as error:
+            event(path, "error", error=str(error))
+            continue
+
+        if skip_duplicates and tags:
+            if matches is None:
+                try:
+                    matches = index()
+                except (OSError, RuntimeError, ValueError) as error:
+                    event(path, "error", error=str(error))
+                    raise
+            if any(tags.matches(existing) for existing in matches[tags.key]):
+                event(path, "skip")
+                continue
+
+        with TemporaryDirectory(prefix="podlink-import-") as work:
             try:
-                tags = _probe_tags(path)
+                prepared, = podlink.prepare_media([path], Path(work))
+                total = prepared.upload.stat().st_size
             except (OSError, RuntimeError, ValueError) as error:
                 event(path, "error", error=str(error))
                 continue
 
+            sent = 0
+
+            def report(length):
+                nonlocal sent
+                sent = length
+                event(path, "upload", sent, total)
+
+            event(path, "upload", total=total)
+            try:
+                stored.append(publish(prepared, report))
+            except FileExistsError as error:
+                event(path, "skip" if skip_duplicates else "error", total=total,
+                      error=None if skip_duplicates else str(error))
+                continue
+            except (OSError, RuntimeError, ValueError) as error:
+                event(path, "error", sent, total, str(error))
+                raise
             if skip_duplicates and tags:
-                if not indexed:
-                    try:
-                        device_tracks = tracks(link)
-                    except (OSError, RuntimeError, ValueError) as error:
-                        event(path, "error", error=str(error))
-                        raise
-                    for track in device_tracks:
-                        existing = music_tags(track.title, track.artist.split(";"),
-                                              track.album, track.length_ms,
-                                              track.disc, track.track)
-                        if existing:
-                            matches[existing.key].append(existing)
-                    indexed = True
-                if any(tags.matches(existing) for existing in matches[tags.key]):
-                    event(path, "skip")
-                    continue
-
-            with TemporaryDirectory(prefix="podlink-import-") as work:
-                try:
-                    prepared, = podlink.prepare_media([path], Path(work))
-                    total = prepared.upload.stat().st_size
-                except (OSError, RuntimeError, ValueError) as error:
-                    event(path, "error", error=str(error))
-                    continue
-
-                event(path, "upload", total=total)
-                upload = _UploadProgress(
-                    link, lambda sent: event(path, "upload", sent, total))
-                try:
-                    stored.append(podlink.upload_media_track(upload, prepared))
-                except (OSError, RuntimeError, ValueError) as error:
-                    if upload.exists:
-                        event(path, "skip" if skip_duplicates else "error",
-                              total=total,
-                              error=None if skip_duplicates else str(error))
-                        continue
-                    stopped = True
-                    with suppress(OSError, RuntimeError, ValueError):
-                        link.send(podlink.TEXT, b"MS1 STOP")
-                        podlink.expect_media(link, b"MS1 STOPPED")
-                    event(path, "error", upload.sent, total, str(error))
-                    raise
-                if skip_duplicates and tags:
-                    matches[tags.key].append(tags)
-                event(path, "done", sent=total, total=total)
-    finally:
-        if stored and not stopped:
-            podlink.refresh_media(link)
+                matches[tags.key].append(tags)
+            event(path, "done", sent=total, total=total)
     return stored
+
+
+_PROFILE_STAGES = ("read", "file_crc", "frame_crc", "mailbox_copy", "ring_copy",
+                   "dma_copy", "dma_active", "dma_gap")
+
+
+def profile_download(link, name, mode, *, tagcache=False, mbit=None):
+    """Time one validated stream while retaining only the current frame."""
+    if mbit is not None and not 1 <= mbit <= 480:
+        raise ValueError("rate must be in 1..480 Mbit/s")
+    if mode not in ("base", "fast"):
+        raise ValueError("mode must be base or fast")
+    if tagcache and name not in _DATABASE_FILES:
+        raise ValueError("invalid tagcache filename")
+    request = b"FILE " if tagcache else b"SAMPLE "
+    command = b"PROFILE " + mode.upper().encode("ascii")
+    for attempt in range(5):
+        try:
+            if _request(link, command) != b"PROFILE READY":
+                raise RuntimeError("Unexpected profiling acknowledgement")
+            break
+        except _MS3Error as error:
+            if error.reason != b"busy" or attempt == 4:
+                raise
+            time.sleep(.02)
+
+    original_read = link.port.read
+    read_calls = read_bytes = largest_read = read_cpu_ns = 0
+
+    def read(size):
+        nonlocal read_calls, read_bytes, largest_read, read_cpu_ns
+        start = time.thread_time_ns()
+        data = original_read(size)
+        read_cpu_ns += time.thread_time_ns() - start
+        read_calls += 1
+        read_bytes += len(data)
+        largest_read = max(largest_read, len(data))
+        return data
+
+    try:
+        link.port.read = read
+        start = time.perf_counter()
+        opened = _request(link, b"STREAM " + request + name.encode("utf-8", "surrogateescape"))
+        prefix, size = opened.split(b" ", 1)
+        if prefix != request.rstrip() or not 0 < int(size) <= 0xffffffff:
+            raise ValueError("Invalid profiling stream size")
+        size = int(size)
+        checksum = _read_binary(
+            link, size, "profiling stream", streaming=True, collect=False,
+            pace_bytes_per_second=mbit * 125000 if mbit is not None else None)
+        seconds = time.perf_counter() - start
+    except BaseException:
+        _stop(link)
+        with suppress(OSError, RuntimeError, ValueError, TimeoutError):
+            _request(link, b"PROFILE")
+        raise
+    finally:
+        link.port.read = original_read
+
+    try:
+        prefix, *samples = _request(link, b"PROFILE CPU").split()
+        if len(samples) != len(_PROFILE_STAGES) + 1:
+            raise ValueError("Invalid CPU profiling counters")
+        idle_us, wall_us = map(int, samples.pop().split(b","))
+        if not 0 <= idle_us <= wall_us:
+            raise ValueError("Invalid device idle time")
+    except _MS3Error as error:
+        if error.reason != b"command":
+            raise
+        prefix, *samples = _request(link, b"PROFILE").split()
+        idle_us = wall_us = None
+    if prefix != b"PROFILE" or len(samples) != len(_PROFILE_STAGES):
+        raise ValueError("Invalid profiling counters")
+    stages = {stage: dict(zip(("count", "bytes", "us", "max_us"),
+                            map(int, values.split(b",")), strict=True))
+              for stage, values in zip(_PROFILE_STAGES, samples, strict=True)}
+    for sample in stages.values():
+        sample["elapsed_us_per_mib"] = round(sample["us"] * (1 << 20) / size)
+    return dict(mode=mode, limit_mbit=mbit, bytes=size, seconds=seconds,
+                bytes_per_second=size / seconds,
+                crc32=f"{checksum:08x}", tty_read_calls=read_calls,
+                tty_bytes=read_bytes, tty_max_read=largest_read,
+                tty_read_cpu_us=read_cpu_ns // 1000, device=stages,
+                device_idle_us=idle_us, device_wall_us=wall_us,
+                device_idle_percent=100 * idle_us / wall_us if wall_us else None)
+
+
+def _profile_main():
+    import argparse
+    from hrmediasync import borrow_serial, connect_device
+
+    parser = argparse.ArgumentParser(description="Profile a PodLink MS3 download")
+    parser.add_argument("name", help="music path or tagcache basename")
+    parser.add_argument("--tagcache", action="store_true")
+    parser.add_argument("--mode", choices=("base", "fast"), default="fast")
+    parser.add_argument("--port")
+    parser.add_argument("--mbit", type=float, help="pace credits to this rate in Mbit/s")
+    args = parser.parse_args()
+    try:
+        with borrow_serial(), connect_device(args.port) as (link, _):
+            result = profile_download(link, args.name, args.mode, tagcache=args.tagcache,
+                                      mbit=args.mbit)
+            print(json.dumps(result, indent=2))
+    except (OSError, RuntimeError, ValueError) as error:
+        parser.exit(1, f"PodLink profile: {error}\n")
+
+
+def import_files(link: podlink.Link, paths, progress, skip_duplicates=True):
+    changed = False
+    stopped = False
+
+    def publish(prepared, report):
+        nonlocal changed, stopped
+        upload = _UploadProgress(link, report)
+        try:
+            result = podlink.upload_media_track(upload, prepared)
+        except (OSError, RuntimeError, ValueError) as error:
+            if upload.exists:
+                raise FileExistsError(str(error)) from error
+            stopped = True
+            with suppress(OSError, RuntimeError, ValueError):
+                link.send(podlink.TEXT, b"MS1 STOP")
+                podlink.expect_media(link, b"MS1 STOPPED")
+            raise
+        changed = True
+        return result
+
+    try:
+        return import_batch(paths, progress, skip_duplicates,
+                            lambda: import_tag_index(link), publish)
+    finally:
+        if changed and not stopped:
+            podlink.refresh_media(link)
+
+
+if __name__ == "__main__":
+    _profile_main()
