@@ -121,7 +121,7 @@ class FakeLink:
                 f"MS3 SUMMARY ipod6g\tbuild\t80000000000\t9000000000\t"
                 f"{len(self.rows)}\t51\t1\t0".encode())
             return b"MS3 MORE"
-        if command == b"FILES":
+        if command == b"FILES" or command.startswith(b"ARTBIN "):
             return b"MS3 ERR command"
         if command == b"DB":
             self.pending.append(b"MS3 MORE")
@@ -253,7 +253,11 @@ class LibraryTests(unittest.TestCase):
         self.assertIsNone(library.artwork(link, TRACK))
         link.art_reply = b"MS3 PLACEHOLDER"
         self.assertIsNone(library.artwork(link, TRACK))
-        self.assertEqual(len(link.requests), 2)
+        self.assertEqual(link.requests, [
+            command + TRACK.path.encode()
+            for _ in range(2)
+            for command in (b"MS3 ARTBIN coverflow ", b"MS3 ART coverflow ")
+        ])
 
     def test_artwork_rejects_truncated_stream(self):
         link = FakeLink()
@@ -393,6 +397,31 @@ class BulkLink(FakeLink):
 
 
 class BulkLibraryTests(unittest.TestCase):
+    def test_bulk_artwork(self):
+        class ArtLink(BulkLink):
+            def library_command(self, command):
+                if command == b"ARTBIN list " + TRACK.path.encode():
+                    self.selected = "art"
+                    self.offset = 0
+                    return b"MS3 ARTBIN 20 20 columns"
+                return super().library_command(command)
+
+        # A column of red, followed by nineteen columns of blue.
+        pixels = bytes.fromhex("00 f8") * 20 + bytes.fromhex("1f 00") * 380
+        link = ArtLink({"art": pixels})
+        image = library.artwork(link, TRACK, "list")
+        self.assertEqual(image.rgb888, (b"\xff\0\0" + b"\0\0\xff" * 19) * 20)
+        self.assertEqual(link.requests.count(b"MS3 NEXT"), 3)
+        self.assertNotIn(b"MS3 STOP", link.requests)
+
+        for field in ("offset_error", "crc_error"):
+            with self.subTest(field=field):
+                setattr(link, field, 1)
+                with self.assertRaisesRegex(RuntimeError, "Invalid iPod artwork"):
+                    library.artwork(link, TRACK, "list")
+                self.assertEqual(link.requests[-1], b"MS3 STOP")
+                setattr(link, field, 0)
+
     def test_parser_matches_real_firmware_walk(self):
         expected = fixture_walk()
         self.assertEqual(library.parse_tagcache(tagcache_fixture(), expected_commit=1), expected)

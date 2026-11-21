@@ -258,39 +258,46 @@ def _manifest(reply):
     return (int(commit), int(generation), int(removed), int(stats)), files
 
 
+def _read_binary(link, size, label, progress=None):
+    data = bytearray()
+    crc = 0
+    while True:
+        reply = _request(link, b"NEXT", binary=True)
+        if not reply.startswith(b"MSF1"):
+            if len(data) != size or reply != f"DONE {size} {crc:08x}".encode("ascii"):
+                raise ValueError(f"{label} length or CRC mismatch")
+            return data
+        if (not 8 < len(reply) <= link.max_message
+                or struct.unpack_from("<I", reply, 4)[0] != len(data)
+                or len(data) + len(reply) - 8 > size):
+            raise ValueError(f"invalid {label} chunk")
+        chunk = reply[8:]
+        data.extend(chunk)
+        crc = crc32(chunk, crc)
+        if progress is not None:
+            progress(len(data))
+
+
 def _bulk_tracks(link, manifest, byte_progress, expected_commit):
     snapshot, sizes = _manifest(manifest)
     if expected_commit is not None and snapshot[0] != expected_commit:
         raise ValueError("database changed")
     files = {}
     done, total = 0, sum(sizes.values())
+
+    def progress(received):
+        byte_progress(done + received, total)
+
     for name, size in sizes.items():
         complete = False
         try:
             opened = _request(link, b"FILE " + name.encode("ascii"))
             if opened != f"FILE {size}".encode("ascii"):
                 raise ValueError("database file length changed")
-            data = bytearray()
-            crc = 0
-            while True:
-                reply = _request(link, b"NEXT", binary=True)
-                if reply.startswith(b"MSF1"):
-                    if (not 8 < len(reply) <= link.max_message
-                            or struct.unpack_from("<I", reply, 4)[0] != len(data)
-                            or len(data) + len(reply) - 8 > size):
-                        raise ValueError("invalid database chunk")
-                    chunk = reply[8:]
-                    data.extend(chunk)
-                    crc = crc32(chunk, crc)
-                    done += len(chunk)
-                    if byte_progress is not None:
-                        byte_progress(done, total)
-                else:
-                    if len(data) != size or reply != f"DONE {size} {crc:08x}".encode("ascii"):
-                        raise ValueError("database file length or CRC mismatch")
-                    complete = True
-                    break
-            files[name] = data
+            files[name] = _read_binary(
+                link, size, "database", progress if byte_progress is not None else None)
+            done += size
+            complete = True
         finally:
             if not complete:
                 _stop(link)
@@ -365,23 +372,35 @@ def detail(link: podlink.Link, track: DeviceTrack) -> TrackDetail:
 def artwork(link: podlink.Link, track: DeviceTrack, size="coverflow") -> Artwork | None:
     if size not in ART_DIMENSIONS:
         raise ValueError("Expected list, coverflow or wps artwork")
-    reply = _request(link, b"ART " + size.encode("ascii") + b" " + _path(track))
+    args = size.encode("ascii") + b" " + _path(track)
+    command = b"ARTBIN"
+    try:
+        reply = _request(link, command + b" " + args)
+    except _MS3Error as error:
+        if error.reason != b"command":
+            raise
+        command = b"ART"
+        reply = _request(link, command + b" " + args)
     if reply in (b"NOART", b"PLACEHOLDER"):
         return None
-    pixels = bytearray()
     ended = False
     try:
         kind, w, h, layout = reply.split(b" ")
         width, height = int(w), int(h)
-        if (kind != b"ART" or layout not in (b"rows", b"columns")
+        if (kind != command or layout not in (b"rows", b"columns")
                 or not 0 < width <= ART_DIMENSIONS[size]
                 or not 0 < height <= ART_DIMENSIONS[size]):
             raise ValueError("invalid artwork dimensions or layout")
         expected = width * height * 2
-        while not ended:
-            ended = _append_data(_request(link, b"NEXT"), pixels, expected)
-        if len(pixels) != expected:
-            raise ValueError("truncated artwork")
+        if command == b"ARTBIN":
+            pixels = _read_binary(link, expected, "artwork")
+            ended = True
+        else:
+            pixels = bytearray()
+            while not ended:
+                ended = _append_data(_request(link, b"NEXT"), pixels, expected)
+            if len(pixels) != expected:
+                raise ValueError("truncated artwork")
     except ValueError as error:
         raise RuntimeError("Invalid iPod artwork reply") from error
     finally:

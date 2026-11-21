@@ -73,7 +73,7 @@ class ArtStore(QtCore.QObject):
                 return NO_ART
         if not self.enabled or self.serial is None:
             return NO_ART
-        if key not in self._inflight:
+        if (self.serial, key) not in self._inflight:
             self._queued[key] = track
             if not self._timer.isActive():
                 self._timer.start()
@@ -88,15 +88,15 @@ class ArtStore(QtCore.QObject):
     def _fetch(self) -> None:
         if not self._queued:
             return
+        serial = self.serial
         batch = list(self._queued.items())[: self.BATCH]
         for key, _track in batch:
             self._queued.pop(key, None)
-            self._inflight.add(key)
-        serial = self.serial
+            self._inflight.add((serial, key))
         library = self.library
+        remaining = {key for key, _track in batch}
 
         def work(job):
-            results = []
             with library.session() as session:
                 for key, track in batch:
                     if job.cancelled:
@@ -106,33 +106,38 @@ class ArtStore(QtCore.QObject):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     if art is None:
                         path.with_suffix(".none").touch()
-                        results.append((key, None))
+                        image = None
                     else:
                         image = artwork_to_image(art)
                         image.save(str(path), "PNG")
-                        results.append((key, image))
-            return results
+                    job.progress(data=(key, image))
 
-        def done(results):
-            for key, image in results:
-                self._inflight.discard(key)
-                if image is None:
-                    self._none.add(key)
-                else:
-                    self._remember(key, image)
-                self.art_ready.emit(key[0])
-            for key, _track in batch:
-                self._inflight.discard(key)
+        def progress(_fraction, _text, result):
+            key, image = result
+            remaining.discard(key)
+            self._inflight.discard((serial, key))
+            if self.serial != serial:
+                return
+            if image is None:
+                self._none.add(key)
+            else:
+                self._remember(key, image)
+            self.art_ready.emit(key[0])
+
+        def done(_result):
+            self._inflight.difference_update((serial, key) for key in remaining)
             if self._queued and not self._timer.isActive():
                 self._timer.start()
 
         def failed(_error):
-            for key, _track in batch:
-                self._inflight.discard(key)
-                self._none.add(key)
-                self.art_ready.emit(key[0])
+            done(None)
+            if self.serial == serial:
+                self._none.update(remaining)
+                for key in remaining:
+                    self.art_ready.emit(key[0])
 
-        self.runner.run("读取插图", work, done, failed, device=True, foreground=False)
+        self.runner.run("读取插图", work, done, failed, device=True, foreground=False,
+                        on_progress=progress)
 
 
 def placeholder_colors(seed: str) -> tuple[QtGui.QColor, QtGui.QColor]:
