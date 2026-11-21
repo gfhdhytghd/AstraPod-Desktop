@@ -2,7 +2,9 @@
 from collections import deque
 from pathlib import Path
 import json
+import os
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -34,8 +36,11 @@ class Harness:
         self.decoder = podlink.Decoder()
         self.from_host = deque()
         self.seq = 1
+        self.max_message = podlink.MAX_MESSAGE
 
     def send(self, kind, payload):
+        if len(payload) > self.max_message:
+            raise ValueError("message exceeds negotiated maximum")
         raw = podlink.encode(kind, self.seq, payload)
         self.seq += 1
         decoded, = self.decoder.feed(raw)
@@ -216,6 +221,48 @@ def test_echo_file_round_trip(bridged):
     assert pulled == file_data
 
 
+def test_firmware_peer_round_trip(bridged, tmp_path):
+    peer = os.environ.get("ASTRAPOD_FIRMWARE_APL_PEER")
+    if not peer:
+        pytest.skip("set ASTRAPOD_FIRMWARE_APL_PEER to the firmware podlink_apl fixture")
+    harness, directory = bridged
+    device_root = tmp_path / "device"
+    rockbox = device_root / ".rockbox"
+    rockbox.mkdir(parents=True)
+    fixture = bytes(i % 251 for i in range(5000))
+    (rockbox / "podlink-echo.in").write_bytes(fixture)
+
+    with subprocess.Popen([peer, "--peer", str(device_root)], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        os.set_blocking(process.stdout.fileno(), False)
+        pending = b""
+        deadline = time.monotonic() + 15
+        try:
+            while time.monotonic() < deadline:
+                pending += process.stdout.read1(8192)
+                *records, pending = pending.split(b"\n")
+                for record in records:
+                    harness.device(Packet.decode(bytes.fromhex(record.decode("ascii"))))
+                if process.poll() is not None:
+                    break
+                harness.bridge.poll(harness)
+                while harness.from_host:
+                    packet = harness.from_host.popleft()
+                    process.stdin.write(packet.encode().hex().encode("ascii") + b"\n")
+                    process.stdin.flush()
+                time.sleep(.005)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+        assert process.returncode == 0, process.stderr.read().decode(errors="replace")
+
+    assert (directory / "from-ipod.bin").read_bytes() == fixture
+    assert (rockbox / "podlink-echo.out").read_bytes() == fixture
+    assert not list(directory.glob(".apl1-*"))
+    assert not list(rockbox.glob("*.apl-*"))
+
+
 def test_link_loss_aborts_and_reopens(bridged):
     harness, directory = bridged
     result = directory / "prior.bin"
@@ -235,6 +282,23 @@ def test_link_loss_aborts_and_reopens(bridged):
     harness.expect(Op.OPEN_OK)
     harness.device(Packet(Op.BINARY, CHANNEL, data=b"new session"))
     assert harness.expect(Op.BINARY) == b"new session"
+
+
+def test_negotiated_limit_closes_only_plugin_channel(bridged):
+    harness, directory = bridged
+    (directory / "large.bin").write_bytes(bytes(MAX_DATA))
+    harness.max_message = 512
+    harness.device(Packet(Op.OPEN, CHANNEL, data=NAME))
+    harness.expect(Op.OPEN_OK)
+    harness.device(Packet(Op.PULL, CHANNEL, 1, b"large.bin"))
+    assert harness.expect(Op.ACCEPT, 1) == U32.pack(MAX_DATA)
+    harness.device(Packet(Op.CREDIT, CHANNEL, 1, b"\x01"))
+    assert harness.expect(Op.CLOSE) == U16.pack(Status.LIMIT)
+
+    harness.device(Packet(Op.OPEN, CHANNEL + 1, data=NAME))
+    harness.expect(Op.OPEN_OK, channel=CHANNEL + 1)
+    harness.device(Packet(Op.BINARY, CHANNEL + 1, data=b"still connected"))
+    assert harness.expect(Op.BINARY, channel=CHANNEL + 1) == b"still connected"
 
 
 def test_unmatched_duplicate_and_stale_tokens():

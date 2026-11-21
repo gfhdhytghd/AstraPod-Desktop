@@ -209,4 +209,8 @@ class PluginLink:
             self._release(Status.TIMEOUT, notify_device=True, notify_peer=True)
         if link is not None and self.out and link.best_effort_delay() is not None:
             packet = self.out.popleft()
-            link.send(podlink.BINARY, packet.encode())
+            payload = packet.encode()
+            if len(payload) <= link.max_message:
+                link.send(podlink.BINARY, payload)
+            elif self.binding is not None and packet.channel == self.binding.channel:
+                self._release(Status.LIMIT, notify_device=True, notify_peer=True)

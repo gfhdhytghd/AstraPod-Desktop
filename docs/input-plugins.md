@@ -229,6 +229,9 @@ Use `Packet` and `Op` from `astrapod_plugins.podlink_wire`. Reply to
 `Op.OPEN` with `Packet(Op.OPEN_OK, packet.channel)`. Then accept
 `Op.TEXT` and `Op.BINARY`. The payload limit is 2,048 bytes. TEXT's
 payload is UTF-8. Each receive contains one complete message.
+When the negotiated PodLink frame limit cannot hold a queued payload,
+the bridge closes the channel with `Status.LIMIT`. The resident link
+stays open.
 
 Use `PodLinkFiles(directory)` from `astrapod_plugins.podlink_files`
 to serve file requests. Pass received packets to `handle(token, packet)`
@@ -251,3 +254,12 @@ The bundled companion uses
 Use its `directory` setting to select another folder. Device PUSH creates
 the object named by the device in that folder. Device PULL of that name
 returns the same bytes. Keep the companion running through both operations.
+
+To test the real companion and daemon bridge against the firmware peer,
+build the firmware's `podlink_apl` fixture and run this from the desktop
+repository. Use its absolute path.
+
+```sh
+ASTRAPOD_FIRMWARE_APL_PEER=/absolute/path/to/podlink_apl \
+  python -m pytest -q astrapod_plugins/tests/test_podlink_channels.py
+```
