@@ -1,17 +1,16 @@
 """Extensions: input plugins, their settings, and a live input monitor."""
 from __future__ import annotations
 
+from pathlib import Path
 import time
 
 from .. import icons
-from ..qt import QtCore, QtGui, QtWidgets, Qt
+from ..qt import QtCore, QtGui, QtSvg, QtWidgets, Qt
 from ..widgets import (ChevronComboBox, PageHeader, ToggleSwitch, button, discard, label,
-                       make_badge, make_card, qcolor, set_badge)
+                       make_badge, make_card, set_badge)
 from . import Page
 from .songs import EmptyState
 
-R = QtCore.QRectF
-P = QtCore.QPointF
 STATE = {"running": ("运行中", "success"), "waiting": ("等待设备", "busy"),
          "error": ("出错", "danger"), "disabled": ("已停用", "neutral")}
 PERMISSIONS = {"usb": "USB 设备", "serial": "串口", "ep0": "iPod 按键通道",
@@ -19,6 +18,13 @@ PERMISSIONS = {"usb": "USB 设备", "serial": "串口", "ep0": "iPod 按键通�
 KEYS = {"menu": "菜单", "select": "确定", "play": "播放/暂停", "left": "上一首",
         "right": "下一首", "up": "上", "down": "下", "vol_up": "音量 +", "vol_down": "音量 −"}
 PHASES = {"down": "按下", "repeat": "长按", "up": "松开", "tap": "轻按"}
+ASSETS = Path(__file__).resolve().parent.parent / "assets"
+REMOTES = {"aluminium": "铝合金（第二代）", "plastic": "塑料（第一代）"}
+RING = {"key-right": 0, "key-vol_up": 90, "key-left": 180, "key-vol_down": 270}
+REMOTE_PLUGIN = "apple-ir"
+GLYPHS = {"key-menu": "glyph-menu", "key-play": "glyph-play"}  # drawn over the highlight
+HOLD_SECONDS = 0.6  # a held button stays lit this long after its last repeat
+_remote_svgs: dict = {}
 
 
 def normalize_schema(schema) -> list[dict]:
@@ -41,6 +47,8 @@ def normalize_schema(schema) -> list[dict]:
     for spec in fields:
         if "choices" not in spec and "enum" in spec:
             spec["choices"] = spec["enum"]
+        if not isinstance(spec.get("labels"), dict):
+            spec.pop("labels", None)
         kind = str(spec.get("type") or "").lower()
         if spec.get("choices"):
             kind = "enum"
@@ -57,101 +65,130 @@ def normalize_schema(schema) -> list[dict]:
 
 
 class RemotePad(QtWidgets.QWidget):
-    """An Apple Remote drawn in code; keys light up as events arrive."""
+    """The Apple Remote the user owns, on its side with the IR window to the right
+    so that, at its real proportions, MENU stays legible in a short card. Each
+    button lights while it is held and is outlined once it repeats."""
 
     def __init__(self, page):
         super().__init__(page)
         self.page = page
+        self.model = "aluminium"
         self.lit: dict[str, float] = {}
+        self.held: dict[str, float] = {}
+        self.long: set[str] = set()
         self.last = None
-        self.setMinimumSize(110, 150)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed,
-                           QtWidgets.QSizePolicy.Policy.Expanding)
+        self.setMinimumSize(300, 120)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Fixed)
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(30)
         self._timer.timeout.connect(self._fade)
 
     def sizeHint(self) -> QtCore.QSize:
-        return QtCore.QSize(180, 250)
+        return QtCore.QSize(640, 170)
+
+    def renderer(self):
+        if self.model not in _remote_svgs:
+            _remote_svgs[self.model] = QtSvg.QSvgRenderer(
+                str(ASSETS / f"apple-remote-{self.model}.svg"))
+        return _remote_svgs[self.model]
+
+    def set_model(self, model: str) -> None:
+        model = model if model in REMOTES else "aluminium"
+        if model != self.model:
+            self.model = model
+            self.lit.clear()
+            self.held.clear()
+            self.long.clear()
+            self.update()
+        self.setAccessibleName(f"Apple Remote：{REMOTES[model]}")
+
+    def element(self, key) -> str | None:
+        """The SVG id of the button that sends `key` on this model."""
+        if self.model == "plastic" and key == "select":
+            key = "play"
+        element = f"key-{key}"
+        return element if self.renderer().elementExists(element) else None
 
     def flash(self, key: str, phase: str) -> None:
-        self.lit[key] = 1.0
         self.last = (key, phase)
+        element = self.element(key)
+        if element is None:
+            return
+        self.lit[element] = 1.0
+        if phase in ("down", "repeat"):
+            self.held[element] = time.monotonic()
+            if phase == "repeat":
+                self.long.add(element)
+        else:
+            self.held.pop(element, None)
         self._timer.start()
         self.update()
 
     def _fade(self) -> None:
-        for key in list(self.lit):
-            self.lit[key] -= 0.04
-            if self.lit[key] <= 0:
-                del self.lit[key]
+        now = time.monotonic()
+        for element in list(self.lit):
+            if now - self.held.get(element, -HOLD_SECONDS) < HOLD_SECONDS:
+                continue
+            self.held.pop(element, None)
+            self.lit[element] -= 0.06
+            if self.lit[element] <= 0:
+                del self.lit[element]
+                self.long.discard(element)
         if not self.lit:
             self._timer.stop()
         self.update()
 
+    def _shape(self, renderer, element) -> QtGui.QPainterPath:
+        path = QtGui.QPainterPath()
+        if element not in RING:
+            path.addEllipse(renderer.boundsOnElement(element))
+            return path
+        outer = renderer.boundsOnElement("ring")
+        centre = "key-play" if self.model == "plastic" else "key-select"
+        inner = renderer.boundsOnElement(centre)
+        angle = RING[element]
+        path.arcMoveTo(outer, angle - 45)
+        path.arcTo(outer, angle - 45, 90)
+        path.arcTo(inner, angle + 45, -90)
+        path.closeSubpath()
+        return path
+
+    def scale_for(self, view) -> float:
+        return min((self.width() - 8) / view.height(), (self.height() - 8) / view.width())
+
+    def view_transform(self, view, scale) -> QtGui.QTransform:
+        """SVG (portrait, IR end up) to widget: turned a quarter clockwise, centred."""
+        transform = QtGui.QTransform()
+        transform.translate(self.width() / 2, self.height() / 2)
+        transform.rotate(90)
+        transform.scale(scale, scale)
+        transform.translate(-view.center().x(), -view.center().y())
+        return transform
+
     def paintEvent(self, _event) -> None:
-        t = self.page.tokens
+        renderer = self.renderer()
+        view = renderer.viewBoxF()
+        scale = self.scale_for(view)
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-        scale = min(self.width() / 180, self.height() / 250)
-        painter.translate((self.width() - 180 * scale) / 2, 0)
-        painter.scale(scale, scale)
-        body = R(45, 4, 90, 240)
-        gradient = QtGui.QLinearGradient(body.topLeft(), body.bottomRight())
-        dark = t.name == "dark"
-        gradient.setColorAt(0, QtGui.QColor("#D9DBDF" if not dark else "#3B3D44"))
-        gradient.setColorAt(1, QtGui.QColor("#B8BBC2" if not dark else "#25262B"))
-        painter.setPen(QtGui.QPen(qcolor(t.hairline), 1))
-        painter.setBrush(gradient)
-        painter.drawRoundedRect(body, 22, 22)
-        ring_center = P(body.center().x(), body.top() + 70)
-        painter.setBrush(QtGui.QColor("#F4F5F7" if not dark else "#1C1D21"))
-        painter.drawEllipse(ring_center, 38, 38)
-        accent = QtGui.QColor(t.accent)
-        spots = {"vol_up": P(0, -26), "vol_down": P(0, 26), "left": P(-26, 0), "right": P(26, 0),
-                 "up": P(0, -26), "down": P(0, 26), "select": P(0, 0)}
-        for key, offset in spots.items():
-            glow = self.lit.get(key, 0.0)
-            if glow:
-                color = QtGui.QColor(accent)
-                color.setAlphaF(0.8 * glow)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(color)
-                painter.drawEllipse(ring_center + offset, 12 if key != "select" else 15,
-                                    12 if key != "select" else 15)
-        painter.setPen(QtGui.QPen(qcolor(t.hairline), 1))
-        painter.setBrush(QtGui.QColor("#E4E6EA" if not dark else "#2A2B30"))
-        painter.drawEllipse(ring_center, 14, 14)
-        glyph = QtGui.QColor(t.text_muted)
-        font = QtGui.QFont(self.font())
-        font.setPixelSize(13)
-        font.setWeight(QtGui.QFont.Weight.Bold)
-        painter.setFont(font)
-        painter.setPen(glyph)
-        painter.drawText(R(ring_center.x() - 10, ring_center.y() - 36, 20, 18), Qt.AlignmentFlag.AlignCenter, "+")
-        painter.drawText(R(ring_center.x() - 10, ring_center.y() + 18, 20, 18), Qt.AlignmentFlag.AlignCenter, "−")
-        icons.paint(painter, "prev", R(ring_center.x() - 33, ring_center.y() - 6, 12, 12), glyph)
-        icons.paint(painter, "next", R(ring_center.x() + 21, ring_center.y() - 6, 12, 12), glyph)
-        for key, y, text in (("menu", body.top() + 140, "MENU"), ("play", body.top() + 180, "")):
-            glow = self.lit.get(key, 0.0)
-            rect = R(body.center().x() - 20, y - 12, 40, 24)
-            painter.setPen(QtGui.QPen(qcolor(t.hairline), 1))
-            color = QtGui.QColor("#F4F5F7" if not dark else "#1C1D21")
-            painter.setBrush(color)
-            painter.drawEllipse(rect.center(), 15, 15)
-            if glow:
-                lit = QtGui.QColor(accent)
-                lit.setAlphaF(0.85 * glow)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(lit)
-                painter.drawEllipse(rect.center(), 15, 15)
-            painter.setPen(glyph)
-            if text:
-                font.setPixelSize(8)
-                painter.setFont(font)
-                painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
-            else:
-                icons.paint(painter, "play", R(rect.center().x() - 7, rect.center().y() - 6, 12, 12), glyph)
+        painter.setTransform(self.view_transform(view, scale))
+        renderer.render(painter, view)
+        accent = QtGui.QColor(self.page.tokens.accent)
+        for element, glow in self.lit.items():
+            fill = QtGui.QColor(accent)
+            fill.setAlphaF(0.6 * glow)
+            shape = self._shape(renderer, element)
+            painter.setBrush(fill)
+            painter.setPen(Qt.PenStyle.NoPen)
+            if element in self.long:
+                edge = QtGui.QColor(accent)
+                edge.setAlphaF(glow)
+                painter.setPen(QtGui.QPen(edge, 3 / scale))
+            painter.drawPath(shape)
+            glyph = GLYPHS.get(element, element if element in RING else None)
+            if glyph:
+                renderer.render(painter, glyph, renderer.boundsOnElement(glyph))
         painter.end()
 
 
@@ -163,6 +200,7 @@ class ExtensionsPage(Page):
         self.plugins = window.services.plugins
         self.infos: list = []
         self.fields: dict[str, QtWidgets.QWidget] = {}
+        self.detected = None
         self.header = PageHeader("扩展", "电脑上的输入设备：红外接收器、手柄等，以插件方式接入")
         self.host_badge = self.header.add(make_badge(""))
         self.layout_.addWidget(self.header)
@@ -234,16 +272,20 @@ class ExtensionsPage(Page):
         self.last_key = label("按一下遥控器试试", "helper")
         monitor_head.addWidget(self.last_key)
         monitor_layout.addLayout(monitor_head)
-        monitor_row = QtWidgets.QHBoxLayout()
         self.pad = RemotePad(self)
-        monitor_row.addWidget(self.pad)
+        monitor_layout.addWidget(self.pad)
         self.events = QtWidgets.QListWidget()
         self.events.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.events.setAccessibleName("最近的输入事件")
-        monitor_row.addWidget(self.events, 1)
-        monitor_layout.addLayout(monitor_row)
+        self.events.setMinimumHeight(120)
+        monitor_layout.addWidget(self.events, 1)
         right.addWidget(monitor, 1)
-        split.addWidget(right_host)
+        right_scroll = QtWidgets.QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setWidget(right_host)
+        split.addWidget(right_scroll)
         split.setSizes([280, 720])
         split.setStretchFactor(1, 1)
         self.empty = EmptyState("extensions", "插件宿主不可用",
@@ -284,6 +326,7 @@ class ExtensionsPage(Page):
         if self.infos:
             self.list.setCurrentRow(min(max(0, current), len(self.infos) - 1))
         self.show_plugin()
+        self.show_remote()
         self._daemon_state(self.window_.daemon.state)
 
     def current(self):
@@ -332,10 +375,14 @@ class ExtensionsPage(Page):
             elif kind == "enum":
                 widget = ChevronComboBox()
                 widget.update_theme(self.tokens)
+                labels = spec.get("labels") or {}
                 for choice in spec.get("choices") or []:
-                    widget.addItem(str(choice), choice)
+                    widget.addItem(str(labels.get(choice, choice)), choice)
                 index = widget.findData(value)
                 widget.setCurrentIndex(max(0, index))
+                if info.id == REMOTE_PLUGIN and key == "remote":
+                    widget.currentIndexChanged.connect(
+                        lambda _i, w=widget: self.show_remote(w.currentData()))
             elif kind == "int":
                 widget = QtWidgets.QSpinBox()
                 widget.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
@@ -403,9 +450,26 @@ class ExtensionsPage(Page):
         self.form_status.setText("已保存。插件会用新设置重新启动。")
         self.window_.flash(f"已保存 {info.name} 的设置")
 
+    def show_remote(self, choice=None) -> None:
+        """Draw the saved (or previewed) model; "auto" follows the remote seen last."""
+        if choice is None:
+            try:
+                choice = self.plugins.settings(REMOTE_PLUGIN).get("remote", "auto")
+            except (OSError, RuntimeError, ValueError, KeyError):
+                choice = "auto"
+        auto = choice not in REMOTES
+        model = (self.detected or "aluminium") if auto else choice
+        self.pad.set_model(model)
+        note = "自动识别" if auto and self.detected else "未识别，按铝合金画" if auto else "手动选择"
+        self.pad.setToolTip(f"{REMOTES[model]}（{note}）")
+
     def on_event(self, message: dict) -> None:
         if message.get("type") == "input":
             key, phase = message.get("key"), message.get("phase")
+            remote = message.get("remote")
+            if message.get("source") == REMOTE_PLUGIN and remote in REMOTES and remote != self.detected:
+                self.detected = remote
+                self.show_remote()
             self.pad.flash(key, phase)
             text = f"{KEYS.get(key, key)}，{PHASES.get(phase, phase)}"
             self.last_key.setText(f"最后一次：{text}")

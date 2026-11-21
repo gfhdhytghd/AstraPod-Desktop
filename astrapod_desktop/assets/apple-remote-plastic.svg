@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Apple Remote, first generation (white plastic, 2005), drawn from photographs: 32 x 83 mm. -->
+<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" viewBox="-12 -8 344 852" width="344" height="852">
+  <defs>
+    <linearGradient id="plastic-body" x1="0" y1="0" x2="320" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d4d4d0"/><stop offset="0.1" stop-color="#eeeeeb"/>
+      <stop offset="0.5" stop-color="#fcfcfb"/><stop offset="0.9" stop-color="#eeeeeb"/>
+      <stop offset="1" stop-color="#d0d0cc"/>
+    </linearGradient>
+    <linearGradient id="plastic-cap" x1="0" y1="0" x2="0" y2="44" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4a4a4d"/><stop offset="0.35" stop-color="#18181a"/>
+      <stop offset="1" stop-color="#050506"/>
+    </linearGradient>
+    <radialGradient id="plastic-ring" cx="160" cy="185" r="141" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#ececea"/>
+    </radialGradient>
+    <radialGradient id="plastic-key" cx="160" cy="195" r="86" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#f1f1ef"/>
+    </radialGradient>
+  </defs>
+  <rect x="-4" y="6" width="328" height="834" rx="44" fill="#000" opacity="0.07"/><rect x="-1.5" y="4" width="323" height="831.5" rx="41.5" fill="#000" opacity="0.12"/>
+  <rect id="body" x="0" y="0" width="320" height="830" rx="40" fill="url(#plastic-body)" stroke="#b9b9b5" stroke-width="1.5"/>
+  <path id="ir-window" d="M0,44V40A40,40 0 0 1 40,0H280A40,40 0 0 1 320,40V44Z" fill="url(#plastic-cap)"/>
+  <rect x="40" y="5" width="240" height="3" rx="1.5" fill="#fff" opacity="0.18"/>
+  <circle id="ring" cx="160" cy="215" r="111" fill="url(#plastic-ring)" stroke="#c8c8c4" stroke-width="2"/>
+  <circle cx="160" cy="215" r="108" fill="none" stroke="#fff" stroke-width="2" opacity="0.9"/>
+  <circle id="key-play" cx="160" cy="215" r="66" fill="url(#plastic-key)" stroke="#c4c4c0" stroke-width="2"/>
+  <path id="key-vol_up" d="M157.9,115.5h4.2v8.9h8.9v4.2h-8.9v8.9h-4.2v-8.9h-8.9v-4.2h8.9Z" fill="#a6a6a2"/>
+  <path id="key-vol_down" d="M149,301.4h22v4.2h-22Z" fill="#a6a6a2"/>
+  <path id="key-left" d="M80.6,208.5L72.54,215L80.6,221.5ZM72.54,208.5L64.48,215L72.54,221.5ZM62.4,208.5h2.08V221.5h-2.08Z" fill="#a6a6a2"/>
+  <path id="key-right" d="M239.4,208.5L247.46,215L239.4,221.5ZM247.46,208.5L255.52,215L247.46,221.5ZM255.52,208.5h2.08V221.5h-2.08Z" fill="#a6a6a2"/>
+  <path id="glyph-play" d="M140.26,204.5L158.32,215L140.26,225.5ZM165.46,204.5h5.04V225.5h-5.04ZM174.7,204.5h5.04V225.5h-5.04Z" fill="#a6a6a2"/>
+  <circle id="key-menu" cx="160" cy="432" r="53" fill="url(#plastic-key)" stroke="#c4c4c0" stroke-width="2"/>
+  <path id="glyph-menu" d="M128.07,439.75V424.25L135.66,435.41L143.26,424.25V439.75M158.14,424.25H147.91V439.75H158.14M147.91,432H156.91M162.79,439.75V424.25L175.19,439.75V424.25M179.84,424.25V433.7A6.04,6.04 0 0 0 191.93,433.7V424.25" fill="none" stroke="#a6a6a2" stroke-width="3.1" stroke-linejoin="miter"/>
+</svg>

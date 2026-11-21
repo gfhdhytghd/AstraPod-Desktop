@@ -44,6 +44,8 @@ class Manifest:
             types = TYPES[schema[key]['type']]
             if type(value) not in types or (type(value) is float and not math.isfinite(value)):
                 raise ValueError(f'{self.id}: wrong type for setting {key}')
+            if 'enum' in schema[key] and value not in schema[key]['enum']:
+                raise ValueError(f'{self.id}: {key} must be one of its enum values')
         encode(settings_record(self.id, values))
         return values
 
@@ -79,7 +81,8 @@ def load_manifest(path):
     for key, field in schema.items():
         if (not ID.fullmatch(key.replace('_', '-')) or not isinstance(field, dict)
                 or not isinstance(field.get('type'), str) or field['type'] not in TYPES
-                or 'default' not in field):
+                or 'default' not in field
+                or not isinstance(field.get('enum', []), list)):
             raise ValueError(f'invalid settings field {key!r}')
     manifest = Manifest(plugin_id, raw['name'], raw['version'], raw['description'],
                         entry, tuple(permissions), schema)

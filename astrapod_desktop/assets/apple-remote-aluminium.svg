@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Apple Remote, second generation (aluminium, 2009), drawn from photographs: about 30 x 118 mm. -->
+<svg xmlns="http://www.w3.org/2000/svg" version="1.2" baseProfile="tiny" viewBox="-12 -8 324 1202" width="324" height="1202">
+  <defs>
+    <linearGradient id="alu-body" x1="0" y1="0" x2="300" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#b3b5b9"/><stop offset="0.18" stop-color="#d3d5d8"/>
+      <stop offset="0.55" stop-color="#e2e3e5"/><stop offset="0.85" stop-color="#cdcfd2"/>
+      <stop offset="1" stop-color="#aeb0b4"/>
+    </linearGradient>
+    <linearGradient id="alu-sheen" x1="0" y1="0" x2="0" y2="1180" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="0.35" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0.7" stop-color="#000000" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.2"/>
+    </linearGradient>
+    <radialGradient id="alu-ring" cx="150" cy="210" r="173" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#303033"/><stop offset="1" stop-color="#131315"/>
+    </radialGradient>
+    <radialGradient id="alu-select" cx="135" cy="225" r="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e6e7e9"/><stop offset="1" stop-color="#bfc1c5"/>
+    </radialGradient>
+  </defs>
+  <rect x="-4" y="6" width="308" height="1184" rx="32" fill="#000" opacity="0.07"/><rect x="-1.5" y="4" width="303" height="1181.5" rx="29.5" fill="#000" opacity="0.12"/>
+  <rect id="body" x="0" y="0" width="300" height="1180" rx="28" fill="url(#alu-body)" stroke="#8d8f94" stroke-width="1.5"/>
+  <rect x="0" y="0" width="300" height="1180" rx="28" fill="url(#alu-sheen)"/>
+  <rect x="2.5" y="2.5" width="295" height="1175" rx="25.5" fill="none" stroke="#f6f6f7" stroke-width="1.6" opacity="0.85"/>
+  <rect id="ir-window" x="104" y="1.5" width="92" height="8" rx="4" fill="#1a1a1c" opacity="0.85"/>
+  <circle id="ring" cx="150" cy="250" r="133" fill="url(#alu-ring)"/>
+  <circle id="key-vol_up" cx="150" cy="150.0" r="4.5" fill="#e9e9ea"/>
+  <circle id="key-vol_down" cx="150" cy="350.0" r="4.5" fill="#e9e9ea"/>
+  <circle id="key-left" cx="50.0" cy="250" r="4.5" fill="#e9e9ea"/>
+  <circle id="key-right" cx="250.0" cy="250" r="4.5" fill="#e9e9ea"/>
+  <circle id="key-select" cx="150" cy="250" r="67" fill="url(#alu-select)" stroke="#0c0c0d" stroke-width="1.5"/>
+  <circle id="key-menu" cx="70" cy="472" r="57" fill="#1c1c1e"/>
+  <path id="glyph-menu" d="M39.1,479.5V464.5L46.45,475.3L53.8,464.5V479.5M68.2,464.5H58.3V479.5H68.2M58.3,472H67.01M72.7,479.5V464.5L84.7,479.5V464.5M89.2,464.5V473.65A5.85,5.85 0 0 0 100.9,473.65V464.5" fill="none" stroke="#f1f1f2" stroke-width="3" stroke-linejoin="miter"/>
+  <circle id="key-play" cx="230" cy="472" r="57" fill="#1c1c1e"/>
+  <path id="glyph-play" d="M215.9,464.5L228.8,472L215.9,479.5ZM233.9,464.5h3.6V479.5h-3.6ZM240.5,464.5h3.6V479.5h-3.6Z" fill="#f1f1f2"/>
+</svg>

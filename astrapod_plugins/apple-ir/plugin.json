@@ -11,6 +11,14 @@
       "type": "boolean",
       "default": true,
       "description": "Publish decoded IR input events to the plugin host."
+    },
+    "remote": {
+      "type": "string",
+      "default": "auto",
+      "enum": ["auto", "aluminium", "plastic"],
+      "label": "遥控器型号",
+      "labels": {"auto": "自动识别", "aluminium": "铝合金（第二代）", "plastic": "塑料（第一代）"},
+      "description": "输入监视器画哪一款 Apple Remote。自动识别要等按一下中间键或播放键；识别之前按铝合金画。"
     }
   },
   "permissions": ["usb", "serial", "ep0", "keys", "voice"]
