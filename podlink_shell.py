@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Open the PodLink shell on a connected iPod Classic."""
 import argparse
+import errno
 from pathlib import Path
 import shlex
 import struct
@@ -14,7 +15,7 @@ COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4, "open-bench": 5}
 REQUEST, INDEX = 0x5D, 0x4951
 RECORD_START = {"line-in": 6, "mic": 7}
 RECORD_STOP = 8
-RECORD_ACTIVE, RECORD_READY = 1, 2
+RECORD_ACTIVE, RECORD_READY, RECORD_ERROR = 1, 2, 3
 RECORD_STATES = (
     "idle", "recording", "saved", "capture failed", "input unsupported",
     "recorder busy",
@@ -46,6 +47,21 @@ def record_status(player):
     if revision not in (0, 1) or state >= len(RECORD_STATES):
         raise RuntimeError("Invalid recording status")
     return revision, state, path.split(b"\0", 1)[0].decode("utf-8")
+
+
+def record_error(player):
+    try:
+        stage, status, pcm_error, fs_error, dma_blocks = struct.unpack(
+            "<5I", player.ctrl_transfer(0xC0, REQUEST, 2, INDEX, 20, timeout=1000)
+        )
+    except usb.core.USBError as error:
+        if error.errno != errno.EPIPE:
+            raise
+        return " diagnostics=unavailable"
+    stages = ("none", "dir", "filename", "init", "start", "capture", "save")
+    name = stages[stage] if stage < len(stages) else str(stage)
+    return (f" stage={name} audio_status=0x{status:08x} "
+            f"pcm_error=0x{pcm_error:08x} fs_errno={fs_error} dma_blocks={dma_blocks}")
 
 
 def record_fetch(serial, path, destination):
@@ -84,8 +100,9 @@ def execute(serial, action, argument=None):
         revision, state, path = record_status(player)
         if action == "record-info":
             inputs = "line-in,mic" if revision else "line-in"
+            details = record_error(player) if state == RECORD_ERROR else ""
             print(f"hw_revision={revision} inputs={inputs} "
-                  f"state={RECORD_STATES[state]} path={path}")
+                  f"state={RECORD_STATES[state]} path={path}{details}")
             return
         if not argument:
             raise ValueError("record-fetch requires an output WAV path")
@@ -135,7 +152,8 @@ def execute(serial, action, argument=None):
             if expected_record_state is not None:
                 _, state, path = record_status(current)
                 if state != expected_record_state:
-                    raise RuntimeError(f"{action}: {RECORD_STATES[state]}")
+                    details = record_error(current) if state == RECORD_ERROR else ""
+                    raise RuntimeError(f"{action}: {RECORD_STATES[state]}{details}")
                 print(f"{action}: {path if state == RECORD_READY else 'recording'}")
                 return
             print(f"{action}: {'re-enumerated' if action == 'reboot' else 'processed'}")

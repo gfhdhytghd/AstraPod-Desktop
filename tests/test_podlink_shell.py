@@ -64,3 +64,22 @@ def test_record_start_reports_unavailable_mic(monkeypatch):
     monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
     with pytest.raises(RuntimeError, match="input unsupported"):
         shell.execute("serial", "record-start", "mic")
+
+
+def test_record_info_reports_pcm_allocation_failure(monkeypatch, capsys):
+    class FailedPlayer(Player):
+        def ctrl_transfer(self, direction, request, value, index, length, *, timeout):
+            if direction == 0xC0 and value == 2:
+                assert (request, index, length) == (0x5D, 0x4951, 20)
+                return struct.pack("<5I", 3, 0x10, 0x80400000, 0, 0)
+            return super().ctrl_transfer(
+                direction, request, value, index, length, timeout=timeout
+            )
+
+    player = FailedPlayer(1)
+    player.state = 3
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    shell.execute("serial", "record-info")
+    assert "stage=init audio_status=0x00000010 pcm_error=0x80400000 fs_errno=0 dma_blocks=0" in (
+        capsys.readouterr().out
+    )
