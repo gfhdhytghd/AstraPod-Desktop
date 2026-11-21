@@ -4,7 +4,8 @@ AstraPod Desktop is the Linux companion for [AstraPod iPod Classic firmware][fir
 The desktop app browses the iPod library, imports music, and syncs Jellyfin media.
 HerdRemote owns the PodLink USB session and connects the iPod's Agents screen,
 remote music and input plugins to the computer. This repository also includes
-the PodLink CLI, Apple IR bridge and Cider renderer plugin.
+the PodLink CLI and the Apple IR bridge. The Cider plugin that HerdRemote uses
+by default lives in [AstraPod-Cider][cider].
 
 ## Install
 
@@ -71,11 +72,12 @@ export XDG_RUNTIME_DIR="$(mktemp -d -p /tmp)"
 .venv/bin/python -m pytest -q herdremote/tests
 .venv/bin/python -m pytest -q astrapod_plugins/tests usb_remote_key/tests tests/test_podlink.py
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q tests/test_podlink_gui.py
-node --test cider-plugin/core.test.mjs cider-plugin/renderer.test.mjs
 ```
 
 Some HerdRemote tests use Node.js for the Cider peer and the system
-`ffmpeg`/`ffprobe` executables for media fixtures.
+`ffmpeg`/`ffprobe` executables for media fixtures. The Cider peer tests need
+an AstraPod-Cider checkout: set `ASTRAPOD_CIDER_PLUGIN`, or place it at
+`../AstraPod-Cider`. Without it they are skipped.
 
 The [firmware contract probes](tests/firmware/README.md) require firmware
 sources. Set `ASTRAPOD_FIRMWARE` to that checkout, or place it at
@@ -98,4 +100,4 @@ AstraPod Desktop is licensed under GPL-2.0-or-later. See [LICENSE](LICENSE).
 [herdremote]: herdremote/README.md
 [ir]: usb_remote_key/README.md
 [plugins]: docs/input-plugins.md
-[cider]: cider-plugin/README.md
+[cider]: https://github.com/gfhdhytghd/AstraPod-Cider

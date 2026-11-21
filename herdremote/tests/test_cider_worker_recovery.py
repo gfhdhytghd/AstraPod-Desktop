@@ -13,6 +13,9 @@ import pytest
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import hrcider
 from hrcider_plugin import Backend, PluginTransport
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
+from firmware_checkout import MISSING_CIDER_PLUGIN, find_cider_plugin
+CIDER_PLUGIN=find_cider_plugin()
 
 KEYS={'id','repeat5','title','artist','album','composer','duration','position','rate','volume',
       'repeat','shuffle','art','template','bg'}
@@ -111,8 +114,9 @@ def test_unknown_optional_values_default_and_foreign_top_level_keys_do_not_escap
     assert (unknown['volume'],unknown['rate'],unknown['repeat'],unknown['shuffle'])==(0,1000,0,0)
 
 
+@pytest.mark.skipif(CIDER_PLUGIN is None, reason=MISSING_CIDER_PLUGIN)
 def test_real_js_adapter_wire_snapshot_normalizes_to_rpc(tmp_path):
-    fixture=Path(__file__).resolve().parents[2]/'cider-plugin/mock-host.mjs'
+    fixture=CIDER_PLUGIN/'mock-host.mjs'
     script='import {makeHost} from '+json.dumps(fixture.as_uri())+';process.stdout.write(JSON.stringify(makeHost().host.snapshot()));'
     wire=json.loads(subprocess.check_output(['node','--input-type=module','-e',script],text=True))
     rpc=hrcider.Client();rpc.request=Mock(return_value={'data':wire})

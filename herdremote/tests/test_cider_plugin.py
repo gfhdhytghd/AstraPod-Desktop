@@ -1,6 +1,5 @@
 """FU38 offline bridge acceptance. No live Cider/profile/device access."""
 import concurrent.futures
-import importlib.util
 import json
 from pathlib import Path
 import queue
@@ -13,6 +12,9 @@ import pytest
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import hrcider
 from hrcider_plugin import Backend, PluginError, PluginTransport, install_secret, make_clients
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
+from firmware_checkout import MISSING_CIDER_PLUGIN, find_cider_plugin
+CIDER_PLUGIN=find_cider_plugin()
 from websockets.sync.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
@@ -168,35 +170,12 @@ def test_config_switch_rpc_never_creates_secret(tmp_path):
     with pytest.raises(ValueError):make_clients(hrcider.Client,{'CIDER_BACKEND':'typo'})
 
 
-def test_installer_temporary_profile_backup_and_no_asset_secret(tmp_path,capsys):
-    source=Path(__file__).resolve().parents[2]/'cider-plugin/install.py'
-    spec=importlib.util.spec_from_file_location('fu38_installer',source)
-    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-    profile=tmp_path/'profile';secret=tmp_path/'config/key'
-    import hashlib,shutil
-    staged=tmp_path/'source';shutil.copytree(source.parent,staged)
-    module.SOURCE=staged
-    assets=tmp_path/'assets';assets.mkdir()
-    (assets/'fixture.js').write_text('offline asset')
-    (staged/'host-assets.json').write_text(json.dumps({'fixture.js':hashlib.sha256((assets/'fixture.js').read_bytes()).hexdigest()}))
-    module.install(profile,secret,10768,assets)
-    target=profile/'plugins'/module.IDENTIFIER
-    value=secret.read_text().strip()
-    assert value not in (target/'connection.mjs').read_text()
-    (target/'existing-file').write_text('keep me')
-    module.install(profile,secret,10768,assets)
-    backups=list((profile/'podbox-backups').iterdir())
-    assert len(backups)==1 and (backups[0]/'existing-file').read_text()=='keep me'
-    assert secret.stat().st_mode&0o777==0o600
-    assert value not in capsys.readouterr().out
-    with pytest.raises(FileNotFoundError):module.install(profile,secret,10768,tmp_path/'wrong-assets')
-
-
+@pytest.mark.skipif(CIDER_PLUGIN is None, reason=MISSING_CIDER_PLUGIN)
 def test_python_interface_to_real_node_plugin_adapter():
     transport=PluginTransport('a'*64,port=0,origins=[None])
     transport.start()
     import subprocess
-    source=Path(__file__).resolve().parents[2]/'cider-plugin/integration-peer.mjs'
+    source=CIDER_PLUGIN/'integration-peer.mjs'
     node=subprocess.Popen(['node',str(source)],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
     node.stdin.write(json.dumps({'url':f'ws://127.0.0.1:{transport.port}/','secret':'a'*64}));node.stdin.close()
     # Node's built-in WebSocket has no browser Origin. This test explicitly
@@ -285,24 +264,3 @@ def test_explicit_renderer_origin_handshake_and_wrong_plugin_origin_rejected():
             ws.send(json.dumps(dict(v=1,type='hello',secret='a'*64,state=STATE)))
             assert json.loads(ws.recv(timeout=1))['ok'] is True
     finally:transport.close()
-
-
-def test_installer_prefers_active_ota_and_rejects_changed_bytes(tmp_path):
-    import hashlib,shutil,zipfile
-    source=Path(__file__).resolve().parents[2]/'cider-plugin/install.py'
-    spec=importlib.util.spec_from_file_location('fu38_ota_installer',source)
-    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-    staged=tmp_path/'source';shutil.copytree(source.parent,staged);module.SOURCE=staged
-    profile=tmp_path/'profile';profile.mkdir();secret=tmp_path/'secret'
-    raw=b'known active renderer entry'
-    (staged/'host-assets.json').write_text(json.dumps({'index-fixture.js':hashlib.sha256(raw).hexdigest()}))
-    with zipfile.ZipFile(profile/'update.cup','w') as z:z.writestr('spa/assets/index-fixture.js',raw)
-    module.install(profile,secret,10768)
-    target=profile/'plugins'/module.IDENTIFIER
-    assert (target/'renderer.mjs').exists()
-    assert 'index-fixture.js' in (target/'connection.mjs').read_text()
-    with zipfile.ZipFile(profile/'update.cup','w') as z:z.writestr('spa/assets/index-fixture.js',b'changed')
-    before=(target/'plugin.js').read_bytes()
-    with pytest.raises(ValueError,match='Unsupported Cider'):module.install(profile,secret,10768)
-    assert (target/'plugin.js').read_bytes()==before
-    assert not (profile/'podbox-backups').exists()
