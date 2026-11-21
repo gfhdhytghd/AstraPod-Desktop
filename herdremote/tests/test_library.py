@@ -399,7 +399,7 @@ class BulkLink(FakeLink):
 class StreamLink(BulkLink):
     """A peer that queues a window behind the legacy metadata."""
     def send(self, kind, payload):
-        if payload.startswith(b"MS3 STREAM FILE "):
+        if payload.startswith((b"MS3 STREAM FILE ", b"MS3 STREAM SAMPLE ")):
             super().send(kind, b"MS3 " + payload[11:])
             self.requests[-1] = payload
         elif payload == b"MS3 CREDIT":
@@ -442,6 +442,28 @@ class BulkLibraryTests(unittest.TestCase):
             library.tracks(link)
         self.assertEqual(link.requests[-1], b"MS3 STOP")
         self.assertFalse(link.frames)
+
+    def test_profile_download_validates_and_discards_sample(self):
+        class ProfileLink(StreamLink):
+            def library_command(self, command):
+                if command == b"PROFILE FAST":
+                    return b"MS3 PROFILE READY"
+                if command == b"PROFILE CPU":
+                    return b"MS3 PROFILE" + b" 1,2,3,4" * 8 + b" 20,50"
+                if command == b"SAMPLE /Music/PodLink/sample.flac":
+                    self.selected = "sample"
+                    self.offset = 0
+                    return f"MS3 SAMPLE {len(self.files['sample'])}".encode()
+                return super().library_command(command)
+
+        sample = bytes(range(251)) * 4
+        link = ProfileLink({"sample": sample})
+        link.port = SimpleNamespace(read=lambda n: b"")
+        result = library.profile_download(link, "/Music/PodLink/sample.flac", "fast")
+        self.assertEqual(result["bytes"], len(sample))
+        self.assertEqual(result["crc32"], f"{zlib.crc32(sample):08x}")
+        self.assertEqual(result["device"]["dma_gap"]["max_us"], 4)
+        self.assertEqual(result["device_idle_percent"], 40)
 
     def test_bulk_artwork(self):
         class ArtLink(BulkLink):
