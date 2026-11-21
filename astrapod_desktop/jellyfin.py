@@ -13,7 +13,7 @@ import calendar
 import time
 
 from . import contracts
-from .artwork import NO_ART, SIZES
+from .artwork import NO_ART, SIZES, newest, requeue
 from .models import SongsModel
 from .qt import QtCore, QtGui, Signal
 
@@ -132,7 +132,7 @@ class JellyfinArt(QtCore.QObject):
         if key in self._none or self.library.connection is None:
             return NO_ART
         if key not in self._inflight:
-            self._queued[key] = track
+            requeue(self._queued, key, track)
             if not self._timer.isActive():
                 self._timer.start()
         return None
@@ -142,10 +142,8 @@ class JellyfinArt(QtCore.QObject):
         if not self._queued or connection is None:
             return
         generation = self._generation
-        batch = list(self._queued.items())[: self.BATCH]
-        for key, _track in batch:
-            self._queued.pop(key, None)
-            self._inflight.add(key)
+        batch = newest(self._queued, self.BATCH)
+        self._inflight.update(key for key, _track in batch)
         backend = self.library.backend
 
         def work(job):
@@ -156,14 +154,13 @@ class JellyfinArt(QtCore.QObject):
                     data = backend.album_art(connection, track, SIZES.get(key[1], 128))
                 except OSError:
                     data = None
-                job.progress(data=(key, data))
+                job.progress(data=(key, QtGui.QImage.fromData(data) if data else QtGui.QImage()))
 
         def progress(_fraction, _text, result):
             if generation != self._generation:
                 return
-            key, data = result
+            key, image = result
             self._inflight.discard(key)
-            image = QtGui.QImage.fromData(data) if data else QtGui.QImage()
             if image.isNull():
                 self._none.add(key)
             else:

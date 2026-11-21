@@ -253,7 +253,7 @@ class ImportPage(Page):
         super().__init__(window, parent)
         self.job = None
         self.duplicate_index: dict = {}
-        self.header = PageHeader("导入", "把电脑上的 FLAC、M4A 和 MP3 加入 iPod")
+        self.header = PageHeader("直接导入", "把电脑上的 FLAC、M4A 和 MP3 加入 iPod")
         self.add_files_button = self.header.add(button("添加文件…", None, "plus", self.add_files))
         self.add_folder_button = self.header.add(button("添加文件夹…", None, "folder", self.add_folder))
         self.clear_button = self.header.add(button("清空列表", "ghost", None, self.clear))

@@ -147,6 +147,12 @@ class DeviceLibrary:
         return Path(self.cache.art_path(serial, track, size))
 
     @staticmethod
+    def detect_ports() -> list[dict]:
+        """Every attached iPod: {"port", "serial", "product"}."""
+        import podlink_settings
+        return podlink_settings.ipod_ports()
+
+    @staticmethod
     def detect_port() -> str | None:
         """The iPod's /dev/serial/by-id path, or None when none is plugged in."""
         import podlink_settings

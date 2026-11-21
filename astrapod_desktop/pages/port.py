@@ -1,4 +1,4 @@
-"""The iPod serial port picker, on the device page and in Settings.
+"""The iPod serial port picker in Settings.
 
 The field shows the auto-detected port in a muted colour; typing another path
 makes it a manual override. The saved choice is the window's "port" pref,
@@ -11,33 +11,42 @@ from ..qt import QtWidgets
 from ..widgets import button, label, make_badge, set_badge
 
 PORT_EXAMPLE = "例如 /dev/serial/by-id/usb-…-if00"
+# Narrower than this beside the badge and buttons, the field takes the whole
+# row and they move under it.
+FIELD_MIN = 220
 
 
 class PortPicker(QtWidgets.QWidget):
     """Field, state badge, "use auto-detect" and re-detect buttons; `help`
-    is a separate label for the caller to place. With autosave the choice
-    is saved as soon as editing finishes."""
+    is a separate label for the caller to place. When narrow, the badge
+    and buttons wrap under the field."""
 
-    def __init__(self, window, autosave: bool = False, parent=None):
+    def __init__(self, window, parent=None):
         super().__init__(parent)
         self.window_ = window
-        self.autosave = autosave
-        row = QtWidgets.QHBoxLayout(self)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
+        self.row = QtWidgets.QBoxLayout(QtWidgets.QBoxLayout.Direction.LeftToRight, self)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.setSpacing(8)
         self.field = QtWidgets.QLineEdit()
         self.field.setAccessibleName("iPod 串口")
         self.field.textChanged.connect(self._typed)
         self.field.editingFinished.connect(self._editing_finished)
-        row.addWidget(self.field, 1)
+        self.row.addWidget(self.field, 1)
+        tools = QtWidgets.QHBoxLayout()
+        tools.setSpacing(8)
         self.badge = make_badge("")
-        row.addWidget(self.badge)
+        tools.addWidget(self.badge)
         self.auto_button = button("改用自动识别", "ghost", None, self.use_auto)
-        row.addWidget(self.auto_button)
+        tools.addWidget(self.auto_button)
         self.detect_button = button("", None, "refresh", self.detect)
         self.detect_button.setToolTip("重新检测 iPod 串口")
         self.detect_button.setAccessibleName("重新检测 iPod 串口")
-        row.addWidget(self.detect_button)
+        self.detect_button.setStyleSheet("QPushButton { padding: 0px; }")
+        self.detect_button.setFixedSize(40, 40)
+        self.detect_button.setProperty("ripple_radius", 20)
+        tools.addWidget(self.detect_button)
+        tools.addStretch(1)
+        self.row.addLayout(tools)
         self.help = label("", "helper", wrap=True)
         self.detected = None
         self._filling = False
@@ -47,6 +56,18 @@ class PortPicker(QtWidgets.QWidget):
         window.daemon.state_changed.connect(self._link_changed)
         window.port_changed.connect(self._saved_changed)
         self.detect()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reflow()
+
+    def _reflow(self) -> None:
+        tools = [w for w in (self.badge, self.auto_button, self.detect_button) if not w.isHidden()]
+        need = FIELD_MIN + sum(w.sizeHint().width() + 8 for w in tools)
+        direction = (QtWidgets.QBoxLayout.Direction.LeftToRight if self.width() >= need
+                     else QtWidgets.QBoxLayout.Direction.TopToBottom)
+        if self.row.direction() != direction:
+            self.row.setDirection(direction)
 
     def _saved_changed(self, _port: str) -> None:
         self.load_saved(detect=False)
@@ -69,16 +90,10 @@ class PortPicker(QtWidgets.QWidget):
         self.manual = False
         self._fill(self.detected or "")
         self.show_state()
-        if self.autosave:
-            self.commit()
 
     def override(self) -> str:
         """The explicit port to save; empty means auto-detect."""
         return self.field.text().strip() if self.manual else ""
-
-    def commit(self) -> None:
-        if self.override() != (self.window_.prefs.get("port") or ""):
-            self.window_.save_pref("port", self.override())
 
     def _fill(self, text: str) -> None:
         self._filling = True
@@ -96,8 +111,6 @@ class PortPicker(QtWidgets.QWidget):
 
     def _editing_finished(self) -> None:
         self.show_state()
-        if self.autosave:
-            self.commit()
 
     def show_state(self, refill: bool = True) -> None:
         detected = self.detected
@@ -121,6 +134,7 @@ class PortPicker(QtWidgets.QWidget):
             set_badge(self.badge, "未检测到", "neutral")
             self.help.setText("没有检测到 iPod。用 USB 连接并打开 PodLink 后点刷新，"
                               "或手动填写串口。")
+        self._reflow()
 
     @staticmethod
     def _link_state_key(state: dict):

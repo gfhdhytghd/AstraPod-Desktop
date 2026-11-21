@@ -235,8 +235,17 @@ class FakeLibrary:
         self.cache = FallbackLibraryCache(self.cache_dir)
         self.sessions = 0
         self.detected_port = FAKE_PORT
+        self.detected_ports = None      # a list here stands for several iPods
+
+    def detect_ports(self):
+        if self.detected_ports is not None:
+            return list(self.detected_ports)
+        return ([{"port": self.detected_port, "serial": self.serial, "product": "iPod"}]
+                if self.detected_port else [])
 
     def detect_port(self):
+        if self.detected_ports is not None:
+            return self.detected_ports[0]["port"] if len(self.detected_ports) == 1 else None
         return self.detected_port
 
     def _bump(self):
@@ -606,7 +615,7 @@ class FakePluginHost:
         self.running = False
         self.values = {
             "apple-ir": {"target": "ipod", "repeat_delay_ms": 350, "voice_on_hold": True,
-                         "receiver": ""},
+                         "receiver": "", "remote": "auto"},
             "gamepad": {"deadzone": 0.25, "device": ""},
         }
         self.enabled = {"apple-ir": True, "gamepad": False}
@@ -625,6 +634,10 @@ class FakePluginHost:
                  "default": True},
                 {"key": "receiver", "type": "string", "label": "接收器 USB ID",
                  "default": "", "placeholder": "留空自动识别，例如 05ac:8242"},
+                {"key": "remote", "type": "string", "label": "遥控器型号", "default": "auto",
+                 "enum": ["auto", "aluminium", "plastic"],
+                 "labels": {"auto": "自动识别", "aluminium": "铝合金（第二代）",
+                            "plastic": "塑料（第一代）"}},
             ],
             "gamepad": [
                 {"key": "deadzone", "type": "float", "label": "摇杆死区", "default": 0.25,
@@ -678,9 +691,11 @@ class FakePluginHost:
         self._send({"type": "status", "source": plugin_id, "state": info.state,
                     "device": info.device, "detail": info.detail})
 
-    def emit_input(self, key, phase="tap", source="apple-ir"):
+    def emit_input(self, key, phase="tap", source="apple-ir", remote=None):
         event = {"type": "input", "key": key, "phase": phase, "source": source,
                  "t": time.monotonic()}
+        if remote is not None:
+            event["remote"] = remote
         with self._lock:
             self.events.append(event)
         self._send(event)

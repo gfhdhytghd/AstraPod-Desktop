@@ -96,8 +96,19 @@ class SyncPage(Page):
         self.password_inputs: list[PasswordLineEdit] = []
         settings = window.settings
 
+        # Everything above the footer scrolls, so a short window never
+        # squeezes the cards.
+        self.layout_.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        host = QtWidgets.QWidget()
+        body = QtWidgets.QVBoxLayout(host)
+        body.setContentsMargins(28, 18, 28, 0)
+        body.setSpacing(14)
         self.header = PageHeader("Jellyfin 同步", "把 Jellyfin 的曲库或播放列表单向同步到 iPod")
-        self.layout_.addWidget(self.header)
+        body.addWidget(self.header)
 
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(14)
@@ -172,8 +183,8 @@ class SyncPage(Page):
         port_row = QtWidgets.QHBoxLayout()
         self.port_label = label("", "helper", wrap=True)
         port_row.addWidget(self.port_label, 1)
-        self.port_button = button("更改", "ghost", None, lambda: window.navigate("device"))
-        self.port_button.setToolTip("在设备页选择 iPod 串口")
+        self.port_button = button("更改", "ghost", None, lambda: window.navigate("settings"))
+        self.port_button.setToolTip("在设置中更改 iPod 串口")
         port_row.addWidget(self.port_button)
         scope_layout.addLayout(port_row)
         self._show_port()
@@ -188,7 +199,7 @@ class SyncPage(Page):
             card.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                                QtWidgets.QSizePolicy.Policy.Preferred)
         top.addWidget(scope, 2)
-        self.layout_.addLayout(top)
+        body.addLayout(top)
 
         tiles = QtWidgets.QHBoxLayout()
         tiles.setSpacing(14)
@@ -197,7 +208,7 @@ class SyncPage(Page):
         self.tile_remove = StatTile("将从 iPod 删除")
         for tile in (self.tile_add, self.tile_same, self.tile_remove):
             tiles.addWidget(tile)
-        self.layout_.addLayout(tiles)
+        body.addLayout(tiles)
 
         preview, preview_layout = make_card(8, expand=True, margins=(8, 10, 8, 8))
         filter_row = QtWidgets.QHBoxLayout()
@@ -226,7 +237,10 @@ class SyncPage(Page):
         self.preview_stack.addWidget(self.placeholder)
         self.preview_stack.addWidget(self.details)
         preview_layout.addWidget(self.preview_stack, 1)
-        self.layout_.addWidget(preview, 1)
+        self.preview_stack.setMinimumHeight(120)
+        body.addWidget(preview, 1)
+        scroll.setWidget(host)
+        self.layout_.addWidget(scroll, 1)
 
         footer = QtWidgets.QFrame()
         footer.setObjectName("FooterBar")
@@ -245,7 +259,11 @@ class SyncPage(Page):
         self.apply_button = button("应用同步", "primary", None, self.confirm)
         self.apply_button.setMinimumWidth(116)
         footer_layout.addWidget(self.apply_button)
-        self.layout_.addWidget(footer)
+        footer_wrap = QtWidgets.QWidget()
+        wrap = QtWidgets.QVBoxLayout(footer_wrap)
+        wrap.setContentsMargins(28, 0, 28, 20)
+        wrap.addWidget(footer)
+        self.layout_.addWidget(footer_wrap)
 
         for field in (self.url, self.username, self.password, self.token):
             field.textChanged.connect(self.invalidate_source)
@@ -381,7 +399,7 @@ class SyncPage(Page):
 
     # iPod port ----------------------------------------------------------
     def port(self) -> str:
-        """The device page's port; empty means auto-detect."""
+        """The chosen port; empty means auto-detect."""
         return self.window_.prefs.get("port") or ""
 
     def _show_port(self) -> None:
