@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import threading
 from tempfile import TemporaryDirectory
 import time
 import unittest
@@ -107,6 +108,17 @@ class ThemeAndNavigationTests(GuiCase):
         self.assertEqual(self.theme.tokens.name, "light")
         settings = self.window.pages["settings"]
         self.assertEqual(settings.theme_switch.current(), "light")
+
+    def test_device_screen_follows_the_link(self) -> None:
+        page = self.window.pages["device"]
+        state = self.window.library_state
+        state.summary, state.tracks, state.source = None, [], "none"
+        self.window.daemon.state["link"] = {"connected": False}
+        page.update_view()
+        self.assertFalse(page.drawing.connected)
+        self.window.daemon.state["link"] = {"connected": True, "mode": "podlink"}
+        page.update_view()
+        self.assertTrue(page.drawing.connected)
 
     def test_sidebar_and_shortcuts_switch_pages(self) -> None:
         for key in ("device", "albums", "import", "sync", "agents", "usage",
@@ -509,6 +521,18 @@ class SyncTests(GuiCase):
         saved = podlink_settings.settings_path()
         self.assertFalse(saved.exists() and "secret" in saved.read_text())
 
+    def test_sign_in_does_not_wait_for_the_ipod(self) -> None:
+        page = self.page()
+        gate = threading.Event()
+        self.window.runner.run("iPod busy", lambda _job: gate.wait(5), device=True)
+        page.username.setText("alice")
+        page.password.setText("secret")
+        page.connect_source()
+        try:
+            wait_until(self.app, lambda: page.source is not None)
+        finally:
+            gate.set()
+
     def test_preview_confirm_and_apply(self) -> None:
         page = self.page()
         page.auth_switch.set_current("token", emit=True)
@@ -589,7 +613,7 @@ class SyncTests(GuiCase):
         self.assertIn("bob", page.account_label.text())
         wait_until(self.app, lambda: page.source is not None and not page.restoring)
         self.assertIn(("restore", "https://jf.example.com", "tok"), self.services.sync.calls)
-        self.assertEqual(page.connection_badge.text(), "已连接，4 个范围")
+        self.assertEqual(page.connection_badge.text(), "已连接")
         self.assertEqual(page.scope.currentIndex(), 3)
         self.assertTrue(page.preview_button.isEnabled())
 
@@ -705,10 +729,16 @@ class AgentControlTests(GuiCase):
         self.assertEqual(page.agent_control.current(), "herdr")
         self.assertIsNone(page.t3_switch)
         self.assertIn("herdr", page.agent_control_help.text())
-        self.assertIn("只在选择 T3 Code 时使用", page.t3_usage.text())
+        self.assertTrue(page.t3_card.isHidden())
+        self.assertTrue(page.agent_form.isRowVisible(page.entries["HERDR_SOCKET_PATH"]))
         page.agent_control.set_current("t3", emit=True)
         self.assertIn("T3 Code 的项目和线程", page.agent_control_help.text())
-        self.assertIn("已选择 T3 Code", page.t3_usage.text())
+        self.assertFalse(page.t3_card.isHidden())
+        self.assertFalse(page.agent_form.isRowVisible(page.entries["HERDR_SOCKET_PATH"]))
+        self.assertFalse(page.agent_form.isRowVisible(page.entries["HERDREMOTE_VOICE_FOCUS"]))
+        saved = json.loads(podlink_settings.settings_path().read_text())
+        self.assertEqual(saved["AGENT_CONTROL"], "t3")
+        self.assertEqual(self.services.daemon.requests[-1], ("reload", {}))
         page.save()
         self.assertEqual(self.errors, [])
         saved = json.loads(podlink_settings.settings_path().read_text())

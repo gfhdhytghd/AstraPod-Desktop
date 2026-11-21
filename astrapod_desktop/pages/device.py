@@ -6,7 +6,7 @@ from pathlib import Path
 from .. import fmt
 from ..artwork import NO_ART
 from ..qt import QtCore, QtGui, QtSvg, QtWidgets, Qt
-from ..widgets import (CapacityBar, PageHeader, button, draw_art, label, make_badge,
+from ..widgets import (CapacityBar, PageHeader, button, label, make_badge,
                        make_card, set_badge)
 from . import Page
 
@@ -19,6 +19,13 @@ SCREEN = (0.0978, 0.0638, 0.9022, 0.4224)
 _renderers: dict = {}
 
 
+def _home_screen() -> QtGui.QImage:
+    """The AstraPod home menu, captured from the simulator at 320x240."""
+    if "home" not in _renderers:
+        _renderers["home"] = QtGui.QImage(str(ASSETS / "home-screen.png"))
+    return _renderers["home"]
+
+
 def _front_renderer(model: str):
     if model not in _renderers:
         _renderers[model] = QtSvg.QSvgRenderer(str(ASSETS / f"{model}-front.svg"))
@@ -26,20 +33,18 @@ def _front_renderer(model: str):
 
 
 class IPodDrawing(QtWidgets.QWidget):
-    """Front view of the player; the screen shows three covers in Cover Flow."""
+    """Front view of the player; the screen shows the home menu while connected."""
 
     def __init__(self, window, parent=None):
         super().__init__(parent)
         self.window_ = window
         self.model = "ipod6g"
         self.connected = False
-        self.covers: list = []
         self.setFixedSize(230, 380)
 
-    def set_state(self, model: str, connected: bool, covers: list) -> None:
+    def set_state(self, model: str, connected: bool) -> None:
         self.model = model or "ipod6g"
         self.connected = connected
-        self.covers = covers[:3]
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -85,61 +90,8 @@ class IPodDrawing(QtWidgets.QWidget):
             painter.drawText(screen, Qt.AlignmentFlag.AlignCenter, "未连接")
             painter.setPen(Qt.PenStyle.NoPen)
             return
-        gradient = QtGui.QLinearGradient(screen.topLeft(), screen.bottomLeft())
-        gradient.setColorAt(0, QtGui.QColor(t.primary).darker(260))
-        gradient.setColorAt(1, QtGui.QColor("#050506"))
-        painter.setBrush(gradient)
-        painter.drawRect(screen)
-        side = screen.height() * 0.6
-        cy = screen.top() + screen.height() * 0.42
-        painter.save()
-        painter.setClipRect(screen)
-        order = [(1, -1), (2, 1), (0, 0)]
-        for i, direction in order:
-            if i >= len(self.covers):
-                continue
-            track = self.covers[i]
-            image = self.window_.art.get(track, "coverflow")
-            image = image if isinstance(image, QtGui.QImage) else None
-            source = QtGui.QPolygonF([P(0, 0), P(side, 0), P(side, side), P(0, side)])
-            if direction == 0:
-                x0 = screen.center().x() - side / 2
-                target = QtGui.QPolygonF([P(x0, cy - side / 2), P(x0 + side, cy - side / 2),
-                                          P(x0 + side, cy + side / 2), P(x0, cy + side / 2)])
-            else:
-                near = screen.center().x() + direction * side * 0.62
-                far = near + direction * side * 0.42
-                lift = side * 0.1
-                target = QtGui.QPolygonF([P(near, cy - side / 2), P(far, cy - side / 2 + lift),
-                                          P(far, cy + side / 2 - lift), P(near, cy + side / 2)])
-            transform = QtGui.QTransform()
-            if not QtGui.QTransform.quadToQuad(source, target, transform):
-                continue
-            painter.save()
-            painter.setTransform(transform, True)
-            painter.setOpacity(1.0 if direction == 0 else 0.8)
-            draw_art(painter, R(0, 0, side, side), image, track.album, 2, 0, tokens=t)
-            painter.restore()
-        painter.restore()
-        if self.covers:
-            lead = self.covers[0]
-            font = QtGui.QFont(self.font())
-            font.setPixelSize(9)
-            font.setWeight(QtGui.QFont.Weight.DemiBold)
-            painter.setFont(font)
-            painter.setPen(QtGui.QColor("#FFFFFF"))
-            text_rect = R(screen.left(), screen.bottom() - 22, screen.width(), 12)
-            metrics = QtGui.QFontMetrics(font)
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter,
-                             metrics.elidedText(lead.album, Qt.TextElideMode.ElideRight,
-                                                int(screen.width() - 8)))
-            font.setWeight(QtGui.QFont.Weight.Normal)
-            painter.setFont(font)
-            painter.setPen(QtGui.QColor("#A8AAB2"))
-            painter.drawText(text_rect.translated(0, 11), Qt.AlignmentFlag.AlignCenter,
-                             metrics.elidedText(lead.album_artist or lead.artist,
-                                                Qt.TextElideMode.ElideRight, int(screen.width() - 8)))
-        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawImage(screen, _home_screen())
 
 
 class DevicePage(Page):
@@ -213,7 +165,6 @@ class DevicePage(Page):
 
         window.library_state.changed.connect(self.update_view)
         window.daemon.state_changed.connect(lambda _s: self.update_view())
-        window.art.art_ready.connect(lambda _k: self.drawing.update())
         self.update_view()
 
     def refresh(self) -> None:
@@ -267,15 +218,7 @@ class DevicePage(Page):
         else:
             self.capacity.set_usage(1, 0, 0, 1, animate=False)
             self.cap_total.setText("")
-        covers = []
-        seen = set()
-        for track in sorted(state.tracks, key=lambda t: t.last_played, reverse=True):
-            if track.album not in seen:
-                seen.add(track.album)
-                covers.append(track)
-            if len(covers) == 3:
-                break
-        self.drawing.set_state(model, connected and summary is not None, covers)
+        self.drawing.set_state(model, connected)
 
     def shown(self) -> None:
         state = self.window_.library_state

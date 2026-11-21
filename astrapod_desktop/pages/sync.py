@@ -389,7 +389,7 @@ class SyncPage(Page):
         if self.busy:
             set_badge(self.connection_badge, "处理中…", "busy")
         elif self.source is not None:
-            set_badge(self.connection_badge, f"已连接，{len(self.scopes)} 个范围", "success")
+            set_badge(self.connection_badge, "已连接", "success")
         elif self.restoring:
             set_badge(self.connection_badge, "已登录，正在连接…", "busy")
         elif self.session is not None:
@@ -419,12 +419,12 @@ class SyncPage(Page):
         self._update_metrics(None)
         self.update_buttons()
 
-    def job(self, status: str, action, success) -> None:
+    def job(self, status: str, action, success, *, device: bool = True) -> None:
         self.busy = True
         self.status.setText(status)
         self.update_buttons()
         self.window_.runner.run(status, lambda _job: action(), lambda r: self._finish(success, r),
-                                self._failed, device=True)
+                                self._failed, device=device)
 
     def _finish(self, success, result) -> None:
         self.busy = False
@@ -464,7 +464,8 @@ class SyncPage(Page):
             status = "正在读取 Jellyfin 曲库和播放列表…"
         self.source = None
         self.invalidate_plan()
-        self.job(status, action, self.signed_in)
+        # Signing in never touches the iPod, so it does not queue behind it.
+        self.job(status, action, self.signed_in, device=False)
 
     def signed_in(self, result) -> None:
         source, scopes, record = result

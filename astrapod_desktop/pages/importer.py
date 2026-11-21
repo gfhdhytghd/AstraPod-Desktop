@@ -615,7 +615,6 @@ class DropTarget(QtWidgets.QWidget):
         glyph = R(center.x() - 30, center.y() - 70, 60, 60)
         icons.paint(painter, "import", glyph, QtGui.QColor(t.accent) if hovering else qcolor(t.text_muted))
         font = QtGui.QFont(self.font())
-        font.setFamilies(["Source Han Serif CN", "Noto Serif CJK SC", "serif"])
         font.setPixelSize(22)
         font.setWeight(QtGui.QFont.Weight.DemiBold)
         painter.setFont(font)

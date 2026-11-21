@@ -100,9 +100,10 @@ def _sync(p, c):
     _stroke(p, c)
     p.drawArc(R(4.5, 4.5, 15, 15), 30 * 16, 150 * 16)
     p.drawArc(R(4.5, 4.5, 15, 15), 210 * 16, 150 * 16)
-    for (x, y), (dx, dy) in (((18.5, 8.2), (-3, 0.3)), ((5.5, 15.8), (3, -0.3))):
-        p.drawLine(P(x, y), P(x + dx, y + dy))
-        p.drawLine(P(x, y), P(x + dy * 8, y - abs(dx)))
+    # Each arc runs anticlockwise; its arrowhead sits where it ends.
+    for x, y, d in ((4.5, 12, -1), (19.5, 12, 1)):
+        p.drawLine(P(x, y), P(x - 2.6, y + d * 2.6))
+        p.drawLine(P(x, y), P(x + 2.6, y + d * 2.6))
 
 
 def _agents(p, c):

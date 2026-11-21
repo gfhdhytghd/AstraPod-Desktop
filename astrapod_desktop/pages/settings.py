@@ -29,6 +29,8 @@ AGENT_CONTROL_HELP = {
 }
 PORT_EXAMPLE = "例如 /dev/serial/by-id/usb-…-if00"
 MEDIA_SETTING_KEYS = ("JELLYFIN_URL", "CIDER_API_URL", "CIDER_BACKEND", "RUFIN_API_URL")
+# Shown only while Agent control is set to herdr.
+HERDR_ONLY_KEYS = ("HERDR_SOCKET_PATH", "HERDREMOTE_VOICE_FOCUS")
 AGENT_SETTING_KEYS = ("HERDR_SOCKET_PATH", "HERDREMOTE_VOICE_FOCUS",
                       "HERDREMOTE_USAGE_CACHE_DIR", "HERDREMOTE_KEY_TOOL")
 SETTING_PLACEHOLDERS = {
@@ -214,15 +216,19 @@ class SettingsPage(Page):
 
         agent_keys = [k for k in AGENT_SETTING_KEYS if k in podlink_settings.FIELDS]
         self.agent_control = None
+        self.agent_form = None
         if agent_keys or "AGENT_CONTROL" in podlink_settings.FIELDS:
             agents, agents_layout = make_card(12)
             agents_layout.addWidget(label("Agent、语音与 Usage", "card-title"))
             if "AGENT_CONTROL" in podlink_settings.FIELDS:
                 agents_layout.addLayout(self._agent_control_row())
             if agent_keys:
-                agents_layout.addLayout(self._settings_form(agent_keys))
+                self.agent_form = self._settings_form(agent_keys)
+                agents_layout.addLayout(self.agent_form)
             layout.addWidget(agents)
-        layout.addWidget(self._t3_card())
+        self.t3_card = self._t3_card()
+        layout.addWidget(self.t3_card)
+        self._agent_control_changed()
         if "AGENT_QUICK_REPLIES" in podlink_settings.FIELDS:
             layout.addWidget(self._quick_reply_card())
         known = set(MEDIA_SETTING_KEYS) | set(AGENT_SETTING_KEYS) | {
@@ -351,14 +357,35 @@ class SettingsPage(Page):
         value = self.window_.settings.get("AGENT_CONTROL",
                                           os.environ.get("AGENT_CONTROL") or "herdr")
         self.agent_control.set_current(value if value in AGENT_CONTROL_LABELS else "herdr")
-        self.agent_control.changed.connect(lambda _k: self._agent_control_changed())
+        self.agent_control.changed.connect(lambda _k: self._apply_agent_control())
         row.addWidget(self.agent_control)
         self.entries["AGENT_CONTROL"] = self.agent_control
         self.agent_control_help.setText(AGENT_CONTROL_HELP[self.agent_control.current()])
         return row
 
+    def _apply_agent_control(self) -> None:
+        """Agent control takes effect at once, without the rest of the form."""
+        self._agent_control_changed()
+        try:
+            values = podlink_settings.load()
+            values["AGENT_CONTROL"] = self.agent_control.current()
+            podlink_settings.save(values)
+        except (OSError, ValueError) as error:
+            self.window_.show_error(error)
+            return
+        self.window_.settings_saved({**self.window_.settings,
+                                     "AGENT_CONTROL": values["AGENT_CONTROL"]})
+
     def _agent_control_changed(self) -> None:
-        self.agent_control_help.setText(AGENT_CONTROL_HELP[self.agent_control.current()])
+        if self.agent_control is None:
+            return
+        control = self.agent_control.current()
+        self.agent_control_help.setText(AGENT_CONTROL_HELP[control])
+        if self.agent_form is not None:
+            for key in HERDR_ONLY_KEYS:
+                if key in self.entries:
+                    self.agent_form.setRowVisible(self.entries[key], control == "herdr")
+        self.t3_card.setVisible(control == "t3")
         self._t3_update()
 
     # T3 Code ------------------------------------------------------------
@@ -423,6 +450,8 @@ class SettingsPage(Page):
     def _t3_update(self) -> None:
         t3 = self.window_.daemon.state.get("t3") or {}
         connected = bool(t3.get("connected"))
+        session = bool(t3.get("session_label"))
+        saved = (self.window_.daemon.state.get("agents") or {}).get("control") == "t3"
         if not t3:
             set_badge(self.t3_badge, "未连接", "neutral")
             self.t3_status.setText("后台远程服务还没有报告 T3 的状态。")
@@ -435,23 +464,25 @@ class SettingsPage(Page):
             if t3.get("session_label"):
                 parts.append(f"会话：{t3['session_label']}")
             self.t3_status.setText("，".join(parts))
+        elif session and not saved:
+            set_badge(self.t3_badge, "未连接", "neutral")
+            self.t3_status.setText("已为 iPod 签发 T3 会话，正在切换 Agent 控制。")
+        elif session:
+            set_badge(self.t3_badge, "正在连接", "busy")
+            self.t3_status.setText("已为 iPod 签发 T3 会话，正在连接 T3。")
         else:
             set_badge(self.t3_badge, "未连接", "neutral")
             self.t3_status.setText("还没有为 iPod 签发 T3 会话。")
         allowed = self.t3_switch is None or self.t3_switch.isChecked()
         if self.agent_control is not None:
-            selected = self.agent_control.current() == "t3"
-            self.t3_usage.setText(
-                "Agent 控制已选择 T3 Code。连接后，iPod 的 Agents 显示 T3 项目和线程。"
-                if selected else
-                "当前 Agent 控制为 herdr。下面的 T3 设置只在选择 T3 Code 时使用。")
+            self.t3_usage.setText("连接后，iPod 的 Agents 显示 T3 项目和线程。")
         else:
             self.t3_usage.setText("连接后，iPod 的 Agents 中会出现 T3 项目和线程。电脑端只保存连接。")
         if self.t3_follow_switch is not None:
             self.t3_follow_switch.setEnabled(allowed)
         online = self.window_.daemon.connected
-        self.t3_connect_button.setEnabled(online and allowed and not connected and not self.t3_busy)
-        self.t3_disconnect_button.setEnabled(online and connected and not self.t3_busy)
+        self.t3_connect_button.setEnabled(online and allowed and not session and not self.t3_busy)
+        self.t3_disconnect_button.setEnabled(online and session and not self.t3_busy)
 
     def _t3_request(self, op: str, done_text: str) -> None:
         if self.t3_busy:
@@ -472,7 +503,7 @@ class SettingsPage(Page):
         self.window_.daemon.request(op, finished)
 
     def t3_connect(self) -> None:
-        self._t3_request("t3_connect", "已连接 T3")
+        self._t3_request("t3_connect", "已为 iPod 签发 T3 会话")
 
     def t3_disconnect(self) -> None:
         self._t3_request("t3_disconnect", "已断开 T3，iPod 上的会话已撤销")
