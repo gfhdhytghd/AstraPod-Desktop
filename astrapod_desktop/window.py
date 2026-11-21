@@ -1,7 +1,11 @@
 """The main window: a navigation drawer that folds into a rail below
 RAIL_WIDTH, a top app bar with the search bar and status chip, the page
 stack, the import FAB and the snackbar. The theme's seed follows the
-desktop's accent colour unless the owner chose cover colours or a swatch."""
+desktop's accent colour unless the owner chose cover colours or a swatch.
+
+The drawer's 资料库 pages browse Jellyfin. Each device is a node under 设备:
+the node opens its device page, and expanding it lists the same five views
+of that device's own library, keyed "<device>.<view>"."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -14,17 +18,18 @@ from podlink_ui_theme import DEFAULT_SEED, make_app_icon, ui_prefs_path
 from . import icons
 from .artwork import NO_ART, ArtStore
 from .contracts import album_key
+from .jellyfin import JellyfinLibrary
 from .jobs import JobRunner
 from .library import LibraryState
 from .models import SongsModel
-from .qt import QtCore, QtGui, QtWidgets, Qt
+from .qt import QtCore, QtGui, QtWidgets, Qt, Signal
 from .widgets import (Fab, LcdDisplay, PageStack, RippleFilter, Sidebar,
                       StatusDot, WindowSurface, emphasized, label, refresh_button_icons,
                       set_motion)
 from .pages.agents import AgentsPage
 from .pages.albums import AlbumsPage
 from .pages.browse import BrowsePage
-from .pages.device import DevicePage
+from .pages.device import DevicePage, device_name
 from .pages.extensions import ExtensionsPage
 from .pages.importer import ImportPage
 from .pages.info import InfoDialog
@@ -34,11 +39,15 @@ from .pages.songs import SongsPage
 from .pages.sync import SyncPage
 from .pages.usage import UsagePage
 
+LIBRARY_VIEWS = [("songs", "歌曲", "songs"), ("albums", "专辑", "albums"),
+                 ("artists", "艺人", "artists"), ("genres", "类型", "genres"),
+                 ("composers", "作曲者", "composers")]
+# The devices the backend knows; each is a sidebar node with LIBRARY_VIEWS
+# of its own library under it.
+DEVICES = ["device"]
 SECTIONS = [
-    ("设备", [("device", "iPod", "device")]),
-    ("资料库", [("songs", "歌曲", "songs"), ("albums", "专辑", "albums"),
-              ("artists", "艺人", "artists"), ("genres", "类型", "genres"),
-              ("composers", "作曲者", "composers")]),
+    ("设备", [(key, "iPod", "device") for key in DEVICES]),
+    ("资料库", LIBRARY_VIEWS),
     ("添加音乐", [("import", "导入", "import"), ("sync", "Jellyfin 同步", "sync")]),
     ("远程", [("agents", "Agent", "agents"), ("usage", "Usage", "usage")]),
     ("电脑", [("extensions", "扩展", "extensions"), ("logs", "日志", "logs"),
@@ -49,7 +58,7 @@ SECTIONS = [
 RAIL_WIDTH = 1100
 DRAWER = 272
 RAIL = 88
-FAB_PAGES = ("songs", "albums", "artists", "genres", "composers")
+FAB_PAGES = tuple(f"{device}.{view}" for device in DEVICES for view, _t, _i in LIBRARY_VIEWS)
 _RIPPLES: list[RippleFilter] = []
 
 
@@ -178,6 +187,8 @@ class LinkChip(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    port_changed = Signal(str)          # the saved iPod port; empty is auto-detect
+
     def __init__(self, theme_manager, services: Services, parent=None):
         super().__init__(parent)
         self.theme_manager = theme_manager
@@ -216,9 +227,15 @@ class MainWindow(QtWidgets.QMainWindow):
         services.library.port = self.prefs.get("port", "")
         self.runner = JobRunner(self)
         self.art = ArtStore(services.library, self.runner, self)
-        self.art.art_ready.connect(self._ambient_art_ready)
+        self.art.art_ready.connect(lambda key: self._ambient_art_ready(key, self.art))
         self.library_state = LibraryState(services.library, self.runner, self.art, self)
         self.songs_model = SongsModel(self)
+        self.library_state.songs_model = self.songs_model
+        self.jellyfin = JellyfinLibrary(services.sync, self.runner,
+                                        lambda: self.navigate("sync"), self)
+        self.jellyfin.art.art_ready.connect(
+            lambda key: self._ambient_art_ready(key, self.jellyfin.art))
+        self._ambient_art = self.art
         self.daemon = services.daemon
         self.runner.activity.connect(self._activity)
         self.library_state.changed.connect(self._library_changed)
@@ -258,10 +275,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_timer.start()
 
     def save_pref(self, key: str, value) -> None:
+        changed = self.prefs.get(key) != value
         self.prefs[key] = value
         if key == "port":
             self.services.library.port = value
         self.save_prefs()
+        if key == "port" and changed:
+            self.port_changed.emit(value)
 
     # Layout -------------------------------------------------------------
     def _build(self) -> None:
@@ -290,6 +310,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sidebar.add_header(header)
             for key, text, icon_name in pages:
                 self.sidebar.add_page(key, text, icon_name)
+                if key in DEVICES:
+                    for view, view_text, view_icon in LIBRARY_VIEWS:
+                        self.sidebar.add_page(f"{key}.{view}", view_text, view_icon, parent=key)
+        expanded = self.prefs.get("sidebar_expanded")
+        for key in expanded if isinstance(expanded, list) else ():
+            self.sidebar.set_expanded(key, True)
+        self.sidebar.expanded_changed.connect(self._node_expanded)
         self.sidebar.page_selected.connect(self.navigate)
         self.sidebar.files_dropped.connect(self.import_paths)
         side.addWidget(self.sidebar, 1)
@@ -324,13 +351,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.stack = PageStack()
         self.pages = {}
-        for page in (DevicePage(self), SongsPage(self), AlbumsPage(self),
-                     BrowsePage(self, "artists"), BrowsePage(self, "genres"),
-                     BrowsePage(self, "composers"), ImportPage(self), SyncPage(self),
+        for page in (DevicePage(self), *self._library_pages(self.library_state, "device."),
+                     *self._library_pages(self.jellyfin), ImportPage(self), SyncPage(self),
                      AgentsPage(self), UsagePage(self),
                      ExtensionsPage(self), LogsPage(self), SettingsPage(self)):
             self.pages[page.key] = page
             self.stack.addWidget(page)
+        sync = self.pages["sync"]
+        sync.source_state.connect(lambda: self.jellyfin.follow(sync))
+        self.jellyfin.follow(sync)
         main.addWidget(self.stack, 1)
         root.addLayout(main, 1)
         self.fab = Fab("导入音乐", "import", self.surface)
@@ -339,7 +368,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.toast = Toast(self.surface)
 
         for sequence, slot in (("Ctrl+F", self.focus_search), ("Ctrl+O", self._add_files),
-                               ("Ctrl+R", lambda: self.library_state.refresh(False)),
+                               ("Ctrl+R", self.refresh_library),
                                ("Ctrl+,", lambda: self.navigate("settings"))):
             shortcut = QtGui.QShortcut(QtGui.QKeySequence(sequence), self)
             shortcut.activated.connect(slot)
@@ -347,6 +376,17 @@ class MainWindow(QtWidgets.QMainWindow):
         for number, key in enumerate(keys[:9], 1):
             shortcut = QtGui.QShortcut(QtGui.QKeySequence(f"Ctrl+{number}"), self)
             shortcut.activated.connect(lambda k=key: self.navigate(k))
+
+    def _library_pages(self, library, prefix: str = "") -> list:
+        """The five views of one library, keyed prefix + view."""
+        return [SongsPage(self, library, prefix + "songs"),
+                AlbumsPage(self, library, prefix + "albums"),
+                *(BrowsePage(self, view, library, prefix + view)
+                  for view in ("artists", "genres", "composers"))]
+
+    def _node_expanded(self, _key: str, _expanded: bool) -> None:
+        self.prefs["sidebar_expanded"] = [key for key in DEVICES if self.sidebar.is_expanded(key)]
+        self.save_prefs_later()
 
     # Navigation --------------------------------------------------------
     def navigate(self, key: str) -> None:
@@ -364,8 +404,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.search.setText(self.searches.get(key, ""))
         self.search.blockSignals(blocked)
         self.search.setEnabled(page.searchable)
-        self.search.setPlaceholderText({"logs": "筛选日志"}.get(key, "搜索资料库") if page.searchable
-                                       else "")
+        self.search.setPlaceholderText(
+            ("筛选日志" if key == "logs" else getattr(page, "search_hint", "搜索资料库"))
+            if page.searchable else "")
         self.fab.setVisible(key in FAB_PAGES)
         self._place_fab()
         page.shown()
@@ -375,6 +416,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def current_page(self):
         return self.stack.currentWidget()
+
+    def refresh_library(self) -> None:
+        """Re-read the library the current page shows; the iPod's elsewhere."""
+        library = getattr(self.current_page(), "library", None) or self.library_state
+        library.refresh(False)
 
     def focus_search(self) -> None:
         if self.search.isEnabled():
@@ -445,23 +491,25 @@ class MainWindow(QtWidgets.QMainWindow):
         seed = podlink_m3.seed_from_pixels(pixels)
         self._queue_seed(podlink_m3.argb_to_hex(seed) if seed is not None else self.base_seed())
 
-    def show_track_art(self, track) -> None:
-        """With the cover source, the theme follows this track's cover;
-        otherwise, or without a cover, the base seed holds."""
+    def show_track_art(self, track, art=None) -> None:
+        """With the cover source, the theme follows this track's cover,
+        read from art (the iPod's by default); otherwise, or without a
+        cover, the base seed holds."""
         self._ambient_track = track
+        self._ambient_art = art or self.art
         if self.color_source != "cover" or track is None:
             self._queue_seed(self.base_seed())
             return
-        image = self.art.get(track, "coverflow")
+        image = self._ambient_art.get(track, "coverflow")
         if isinstance(image, QtGui.QImage):
             self.set_ambient_image(image)
         elif image is NO_ART:
             self._queue_seed(self.base_seed())
 
-    def _ambient_art_ready(self, key) -> None:
+    def _ambient_art_ready(self, key, art) -> None:
         track = self._ambient_track
-        if track is not None and key == album_key(track):
-            self.show_track_art(track)
+        if track is not None and key == album_key(track) and art is self._ambient_art:
+            self.show_track_art(track, self._ambient_art)
 
     def _queue_seed(self, seed: str) -> None:
         self._pending_seed = seed
@@ -478,7 +526,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.theme_manager.color_source = source
         self.save_pref("color_source", source)
         self.pages["settings"].show_color_source()
-        self.show_track_art(self._ambient_track)
+        self.show_track_art(self._ambient_track, self._ambient_art)
 
     def set_fallback_seed(self, seed: str) -> None:
         """Picking a swatch also selects the swatch source."""
@@ -487,11 +535,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.color_source != "swatch":
             self.set_color_source("swatch")
         else:
-            self.show_track_art(self._ambient_track)
+            self.show_track_art(self._ambient_track, self._ambient_art)
 
     def _system_appearance_changed(self) -> None:
         self.pages["settings"].show_color_source()
-        self.show_track_art(self._ambient_track)
+        self.show_track_art(self._ambient_track, self._ambient_art)
 
     # Navigation width ----------------------------------------------------
     def resizeEvent(self, event) -> None:
@@ -530,6 +578,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.show_track_art(None)
         if state.error and not state.loading:
             self.flash(f"读取 iPod 失败：{state.error}")
+        for key in DEVICES:
+            self.sidebar.set_text(key, device_name(state.summary))
         self._update_lcd()
 
     def track_detail(self, track, callback) -> None:

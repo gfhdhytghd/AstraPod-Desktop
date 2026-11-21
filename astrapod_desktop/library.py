@@ -9,6 +9,9 @@ class LibraryState(QtCore.QObject):
     failed = Signal(str)
     track_removed = Signal(object)
 
+    editable = True
+    search_hint = "搜索 iPod 资料库"
+
     def __init__(self, library, runner, art, parent=None):
         super().__init__(parent)
         self.library = library
@@ -20,6 +23,7 @@ class LibraryState(QtCore.QObject):
         self.source = "none"          # none | cache | device
         self.loading = False
         self.error = ""
+        self.songs_model = None         # the window's SongsModel of these tracks
 
     def load_cached(self) -> None:
         last = self.library.last()
@@ -75,6 +79,27 @@ class LibraryState(QtCore.QObject):
         self.error = str(error) or type(error).__name__
         self.changed.emit()
         self.failed.emit(self.error)
+
+    def status_line(self) -> str:
+        if self.loading:
+            return "正在从 iPod 读取…"
+        if self.source == "device":
+            return "来自已连接的 iPod"
+        if self.source == "cache":
+            return "上次读取的资料库；iPod 连接后可重新读取"
+        if self.error:
+            return f"读取失败：{self.error}"
+        return "iPod 上的全部歌曲"
+
+    def empty_content(self, kind: str, noun: str) -> tuple:
+        """(title, text, action, slot) for a page with nothing to show."""
+        read = ("读取 iPod 资料库", lambda: self.refresh(True))
+        if kind == "songs":
+            return ("还没有资料库", "用 USB 连接 iPod 并进入 PodLink 模式，然后读取资料库。"
+                    "读取过的资料库会保存在电脑上，下次打开时直接显示。", *read)
+        if kind == "albums":
+            return "还没有专辑", "读取 iPod 资料库后，专辑和插图会显示在这里。", *read
+        return f"还没有{noun}", f"读取 iPod 资料库后可以按{noun}浏览歌曲。", *read
 
     def delete(self, track, done=None) -> None:
         library = self.library

@@ -1,4 +1,5 @@
-"""Device: the iPod front from the Rockbox manual, its facts, and the capacity bar."""
+"""Device: the iPod front from the Rockbox manual, its facts, the serial port
+it is reached through, and the capacity bar."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,6 +10,7 @@ from ..qt import QtCore, QtGui, QtSvg, QtWidgets, Qt
 from ..widgets import (CapacityBar, PageHeader, button, label, make_badge,
                        make_card, set_badge)
 from . import Page
+from .port import PortPicker
 
 R = QtCore.QRectF
 P = QtCore.QPointF
@@ -17,6 +19,11 @@ ASSETS = Path(__file__).resolve().parent.parent / "assets"
 # The LCD within either front drawing, as fractions of its width and height.
 SCREEN = (0.0978, 0.0638, 0.9022, 0.4224)
 _renderers: dict = {}
+
+
+def device_name(summary) -> str:
+    """The sidebar name of a device: its model, or plain iPod."""
+    return MODEL_NAMES.get(summary.model, "iPod") if summary is not None else "iPod"
 
 
 def _home_screen() -> QtGui.QImage:
@@ -134,13 +141,20 @@ class DevicePage(Page):
             grid.addWidget(name, i, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             grid.addWidget(value, i, 1)
             self.values[key] = value
+        self.port_picker = PortPicker(window, autosave=True)
+        self.port = self.port_picker.field
+        grid.addWidget(label("串口", "stat-label"), 6, 0,
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        grid.addWidget(self.port_picker, 6, 1)
+        grid.addWidget(self.port_picker.help, 7, 1)
         grid.setColumnStretch(1, 1)
         facts.addLayout(grid)
         facts.addStretch(1)
         actions = QtWidgets.QHBoxLayout()
         self.read_button = button("读取资料库", "primary", "songs",
                                   lambda: window.library_state.refresh(True))
-        self.songs_button = button("查看歌曲", None, None, lambda: window.navigate("songs"))
+        self.songs_button = button("查看歌曲", None, None,
+                                   lambda: window.navigate(f"{self.key}.songs"))
         actions.addWidget(self.read_button)
         actions.addWidget(self.songs_button)
         actions.addStretch(1)
@@ -226,5 +240,6 @@ class DevicePage(Page):
             self.update_view()
 
     def apply_theme(self, tokens) -> None:
+        self.port_picker.show_state(refill=False)
         self.capacity.tokens = tokens
         self.drawing.update()

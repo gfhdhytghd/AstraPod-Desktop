@@ -17,6 +17,7 @@ import time
 
 from . import contracts
 from .backends import FallbackLibraryCache, ProbedFile, empty_state
+from .jellyfin import JellyfinTrack
 from .qt import QtCore, QtGui, Signal
 
 ARTISTS = [
@@ -295,6 +296,20 @@ class FakePlan:
                                    "Okara Quartet — Nocturne No. 2.flac"})
 
 
+def fake_jellyfin_tracks(seed: int = 19) -> list:
+    """The demo Jellyfin library: the demo artists with other songs, plus
+    an artist only Jellyfin has."""
+    rows = fake_tracks(seed=seed) + [
+        replace(t, artist="Aurora Field", album_artist="Aurora Field", album="Northern Rooms",
+                genre="Folk") for t in fake_tracks(seed=seed + 1)[:9]]
+    return [JellyfinTrack(**{**contracts.track_record(t), "index": i,
+                             "path": t.path.replace("/Music/PodLink/", "/srv/music/"),
+                             "managed": False},
+                          item_id=f"{i:032x}", album_id=hashlib.sha1(
+                              "\0".join(contracts.album_key(t)).encode()).hexdigest()[:32])
+            for i, t in enumerate(rows)]
+
+
 class FakeJellyfinError(OSError):
     def __init__(self, reason, status=None):
         super().__init__(reason)
@@ -312,6 +327,7 @@ class FakeSync:
         self.source = object()
         self.stored_session = session
         self.reject_token = False
+        self.library_value = fake_jellyfin_tracks()
 
     def load_session(self):
         return dict(self.stored_session) if self.stored_session else None
@@ -354,6 +370,22 @@ class FakeSync:
         self.calls.append(("token", url, token))
         self._wait()
         return self.source, self.scopes()
+
+    def library_tracks(self, source, progress=None):
+        self.calls.append(("library", source))
+        self._wait()
+        if progress is not None:
+            progress(len(self.library_value), len(self.library_value))
+        return list(self.library_value)
+
+    def album_art(self, source, track, pixels):
+        if _no_art(track.album):
+            return None
+        buffer = QtCore.QBuffer()
+        buffer.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+        generated_cover("jellyfin\0" + "\0".join(contracts.album_key(track)), pixels).save(
+            buffer, "PNG")
+        return bytes(buffer.data())
 
     def preview(self, source, scope, port):
         self.calls.append(("preview", scope, port))

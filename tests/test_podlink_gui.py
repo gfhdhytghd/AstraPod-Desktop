@@ -27,6 +27,9 @@ from astrapod_desktop.backends import ProbedFile  # noqa: E402
 from astrapod_desktop.jobs import JobRunner  # noqa: E402
 from astrapod_desktop.pages.extensions import normalize_schema  # noqa: E402
 from podlink_ui_theme import QtCore, QtWidgets  # noqa: E402
+from astrapod_desktop.qt import QtGui  # noqa: E402
+import importlib  # noqa: E402
+QtTest = importlib.import_module(f"{podlink_ui_theme.QT_BINDING}.QtTest")
 from astrapod_desktop.qt import QtNetwork, Qt  # noqa: E402
 
 
@@ -120,29 +123,113 @@ class ThemeAndNavigationTests(GuiCase):
         page.update_view()
         self.assertTrue(page.drawing.connected)
 
+    def shortcut(self, sequence: str):
+        wanted = QtGui.QKeySequence(sequence)
+        return next(s for s in self.window.findChildren(QtGui.QShortcut) if s.key() == wanted)
+
+    def test_capacity_bar_moves_from_what_it_shows(self) -> None:
+        from astrapod_desktop.widgets import MOTION, CapacityBar
+        bar = CapacityBar()
+        self.addCleanup(bar.deleteLater)
+        with patch.dict(MOTION, {"on": True}):
+            bar.set_usage(100, 40, 10, 50, animate=False)
+            bar.set_usage(100, 40, 10, 50)
+            self.assertEqual(bar._drawn(), (0.4, 0.1))
+            bar.set_usage(100, 60, 10, 30)
+            self.assertEqual(bar._drawn(), (0.4, 0.1))
+
     def test_sidebar_and_shortcuts_switch_pages(self) -> None:
         for key in ("device", "albums", "import", "sync", "agents", "usage",
-                    "extensions", "settings", "logs", "artists"):
+                    "extensions", "settings", "logs", "artists", "device.songs",
+                    "device.composers"):
             self.window.navigate(key)
             self.assertIs(self.window.stack.currentWidget(), self.window.pages[key])
             self.assertEqual(self.window.sidebar.current_key(), key)
         self.window.sidebar.select("songs")
         self.assertIs(self.window.stack.currentWidget(), self.window.pages["songs"])
         self.assertTrue(self.window.search.isEnabled())
+        self.assertEqual(self.window.search.placeholderText(), "搜索 Jellyfin 资料库")
+        self.window.navigate("device.albums")
+        self.assertEqual(self.window.search.placeholderText(), "搜索 iPod 资料库")
         self.window.navigate("usage")
         self.assertFalse(self.window.search.isEnabled())
         self.assertNotIn("nowplaying", self.window.pages)
         self.assertFalse(hasattr(self.window, "transport"))
+        for number, key in enumerate(("device", "songs", "albums", "artists", "genres",
+                                      "composers", "import", "sync", "agents"), 1):
+            self.shortcut(f"Ctrl+{number}").activated.emit()
+            self.assertIs(self.window.stack.currentWidget(), self.window.pages[key])
+        self.shortcut("Ctrl+,").activated.emit()
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["settings"])
+
+    def test_device_node_expands_into_its_library(self) -> None:
+        sidebar = self.window.sidebar
+        rows = sidebar.rows
+        children = [f"device.{view}" for view in ("songs", "albums", "artists", "genres",
+                                                    "composers")]
+        self.assertEqual(sidebar.children("device"), children)
+        self.assertFalse(sidebar.is_expanded("device"))
+        self.assertTrue(all(sidebar.isRowHidden(rows[key]) for key in children))
+        self.window.navigate("device.genres")
+        self.assertTrue(sidebar.is_expanded("device"))
+        self.assertFalse(any(sidebar.isRowHidden(rows[key]) for key in children))
+        self.assertEqual(self.window.prefs["sidebar_expanded"], ["device"])
+        self.load_library()
+        self.assertEqual(sidebar.model_.item(rows["device"]).text(), "iPod classic")
+        self.window.navigate("device.genres")
+        self.assertFalse(self.window.fab.isHidden())
+        self.window.navigate("genres")
+        self.assertTrue(self.window.fab.isHidden())
+        self.window.navigate("device.genres")
+        sidebar.set_expanded("device", False)
+        self.assertTrue(all(sidebar.isRowHidden(rows[key]) for key in children))
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["device"])
+        self.assertEqual(self.window.prefs["sidebar_expanded"], [])
+        self.window.navigate("device.songs")
+        self.assertTrue(sidebar.is_expanded("device"))
+        self.assertEqual(sidebar.current_key(), "device.songs")
+        self.app.sendEvent(sidebar, QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress,
+                                                    Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier))
+        self.assertEqual(sidebar.current_key(), "device")
+        self.app.sendEvent(sidebar, QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress,
+                                                    Qt.Key.Key_Left, Qt.KeyboardModifier.NoModifier))
+        self.assertFalse(sidebar.is_expanded("device"))
+        self.app.sendEvent(sidebar, QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress,
+                                                    Qt.Key.Key_Right, Qt.KeyboardModifier.NoModifier))
+        self.assertTrue(sidebar.is_expanded("device"))
+
+    def test_clicking_the_device_node_opens_it_and_toggles_it(self) -> None:
+        self.window.resize(1260, 820)
+        self.window.show()
+        self.window.navigate("songs")
+        self.app.processEvents()
+        sidebar = self.window.sidebar
+        rect = sidebar.visualRect(sidebar.model_.index(sidebar.rows["device"], 0))
+        QtTest.QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton,
+                                Qt.KeyboardModifier.NoModifier, rect.center())
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["device"])
+        self.assertFalse(sidebar.is_expanded("device"))
+        QtTest.QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton,
+                                Qt.KeyboardModifier.NoModifier, rect.center())
+        self.assertTrue(sidebar.is_expanded("device"))
+        self.window.navigate("songs")
+        chevron = sidebar.delegate.chevron_area(QtCore.QRectF(rect)).center().toPoint()
+        QtTest.QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton,
+                                Qt.KeyboardModifier.NoModifier, chevron)
+        self.assertFalse(sidebar.is_expanded("device"))
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["songs"])
 
     def test_search_text_is_kept_per_page(self) -> None:
         self.load_library()
-        self.window.navigate("songs")
+        self.window.navigate("device.songs")
         self.window.search.setText("Harbor")
-        self.window.navigate("albums")
+        self.window.navigate("device.albums")
         self.assertEqual(self.window.search.text(), "")
         self.window.navigate("songs")
+        self.assertEqual(self.window.search.text(), "")
+        self.window.navigate("device.songs")
         self.assertEqual(self.window.search.text(), "Harbor")
-        tracks = self.window.pages["songs"].table.proxy.tracks()
+        tracks = self.window.pages["device.songs"].table.proxy.tracks()
         self.assertTrue(tracks)
         self.assertTrue(all("harbor" in f"{t.title} {t.artist} {t.album}".casefold() for t in tracks))
 
@@ -258,9 +345,11 @@ class RailTests(GuiCase):
         self.assertEqual(self.window.side_panel.width(), 88)
         self.assertTrue(self.window.sidebar.compact)
         self.assertFalse(self.window.brand_name.isVisible())
-        self.window.sidebar.select("albums")
-        self.assertIs(self.window.stack.currentWidget(), self.window.pages["albums"])
+        self.window.sidebar.select("device.albums")
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["device.albums"])
         self.assertTrue(self.window.fab.isVisible())
+        self.window.sidebar.select("albums")
+        self.assertFalse(self.window.fab.isVisible())
         self.window.navigate("settings")
         self.assertFalse(self.window.fab.isVisible())
         self.window.resize(1260, 820)
@@ -327,9 +416,9 @@ class LibraryTests(GuiCase):
         self.load_library()
         count = len(self.services.library.tracks_value)
         self.assertEqual(self.window.songs_model.rowCount(), count)
-        self.assertIn(f"{count} 首歌曲", self.window.pages["songs"].status.text())
-        self.assertGreater(self.window.pages["albums"].model.rowCount(), 10)
-        artists = self.window.pages["artists"]
+        self.assertIn(f"{count} 首歌曲", self.window.pages["device.songs"].status.text())
+        self.assertGreater(self.window.pages["device.albums"].model.rowCount(), 10)
+        artists = self.window.pages["device.artists"]
         self.assertGreater(artists.values.rowCount(), 5)
         artists.value_view.setCurrentIndex(artists.values.index(1))
         value = artists.values.values[0][0]
@@ -341,8 +430,8 @@ class LibraryTests(GuiCase):
 
     def test_album_art_is_fetched_lazily_and_cached_on_disk(self) -> None:
         self.load_library()
-        self.window.navigate("albums")
-        lead = self.window.pages["albums"].model.albums[0].lead
+        self.window.navigate("device.albums")
+        lead = self.window.pages["device.albums"].model.albums[0].lead
         wait_until(self.app, lambda: self.window.art.get(lead, "coverflow") is not None)
         sessions = self.services.library.sessions
         self.window.art._memory.clear()
@@ -360,8 +449,8 @@ class LibraryTests(GuiCase):
         fallback = self.window.base_seed()
         self.assertEqual(fallback, "#3584E4")
         wait_until(self.app, lambda: self.theme.seed == fallback)
-        self.window.navigate("songs")
-        table = self.window.pages["songs"].table
+        self.window.navigate("device.songs")
+        table = self.window.pages["device.songs"].table
         table.setCurrentIndex(table.proxy.index(3, 0))
         wait_until(self.app, lambda: self.theme.seed != fallback)
         self.assertNotEqual(self.theme.tokens.primary, podlink_ui_theme.tokens_for(
@@ -380,8 +469,8 @@ class LibraryTests(GuiCase):
         prefs = json.loads(podlink_ui_theme.ui_prefs_path().read_text())
         self.assertEqual((prefs["color_source"], prefs["seed"]), ("swatch", "#1E6FD9"))
         wait_until(self.app, lambda: self.theme.seed == "#1E6FD9")
-        self.window.navigate("songs")
-        table = self.window.pages["songs"].table
+        self.window.navigate("device.songs")
+        table = self.window.pages["device.songs"].table
         table.setCurrentIndex(table.proxy.index(3, 0))
         deadline = time.monotonic() + 0.6
         while time.monotonic() < deadline:
@@ -643,6 +732,225 @@ class SyncTests(GuiCase):
         box, cancel, apply = self.window.pages["sync"].build_confirm_dialog(plan)
         self.assertIs(box.defaultButton(), cancel)
         self.assertEqual(apply.property("variant"), "danger")
+
+
+class JellyfinLibraryTests(GuiCase):
+    def sign_in(self):
+        page = self.window.pages["sync"]
+        page.url.setText("https://jellyfin.example.com")
+        page.auth_switch.set_current("token", emit=True)
+        page.token.setText("tok")
+        page.connect_source()
+        wait_until(self.app, lambda: page.source is not None and not page.busy)
+        return page
+
+    def library_calls(self) -> int:
+        return sum(1 for call in self.services.sync.calls if call[0] == "library")
+
+    def test_signed_out_pages_point_to_the_sync_page(self) -> None:
+        for key in ("songs", "albums", "artists", "genres", "composers"):
+            self.window.navigate(key)
+            page = self.window.pages[key]
+            self.assertEqual(page.empty.title.text(), "没有登录 Jellyfin")
+            self.assertFalse(page.empty.action.isHidden())
+        self.assertEqual(self.window.pages["songs"].header.subtitle.text(), "没有登录 Jellyfin")
+        self.assertEqual(self.library_calls(), 0)
+        self.window.pages["songs"].empty.action.click()
+        self.assertIs(self.window.stack.currentWidget(), self.window.pages["sync"])
+
+    def test_library_pages_browse_jellyfin_not_the_ipod(self) -> None:
+        self.sign_in()
+        self.window.navigate("songs")
+        page = self.window.pages["songs"]
+        wait_until(self.app, lambda: self.window.jellyfin.loaded)
+        expected = self.services.sync.library_value
+        self.assertEqual(page.table.proxy.rowCount(), len(expected))
+        self.assertEqual(page.header.subtitle.text(), "来自 Jellyfin，只能浏览")
+        self.assertIn(f"{len(expected)} 首歌曲", page.status.text())
+        self.assertEqual(self.services.library.sessions, 0)
+        self.assertEqual(self.window.pages["device.songs"].table.proxy.rowCount(), 0)
+        artists = self.window.pages["artists"]
+        self.assertIn("Aurora Field", [label for _v, label, _c in artists.values.values])
+        self.window.navigate("albums")
+        self.assertGreater(self.window.pages["albums"].model.rowCount(), 5)
+        self.window.search.setText("Aurora")
+        self.assertEqual([a.artist for a in self.window.pages["albums"].model.albums],
+                         ["Aurora Field"])
+        self.window.navigate("songs")
+        self.assertEqual(self.window.search.text(), "")
+        self.assertEqual(self.library_calls(), 1)
+
+    def test_jellyfin_rows_are_read_only(self) -> None:
+        self.sign_in()
+        self.window.navigate("songs")
+        wait_until(self.app, lambda: self.window.jellyfin.loaded)
+        page = self.window.pages["songs"]
+        self.assertFalse(hasattr(page, "info_button"))
+        table = page.table
+        requested = []
+        table.info_requested.connect(requested.append)
+        table.delete_requested.connect(requested.append)
+        table.selectRow(0)
+        for key in (Qt.Key.Key_Delete, Qt.Key.Key_Return):
+            table.keyPressEvent(QtGui.QKeyEvent(QtCore.QEvent.Type.KeyPress, key,
+                                                Qt.KeyboardModifier.NoModifier))
+        table.doubleClicked.emit(table.proxy.index(0, 0))
+        self.assertEqual(requested, [])
+        self.assertFalse(self.window.pages["albums"].detail.info_button.isVisibleTo(
+            self.window.pages["albums"].detail))
+
+    def test_covers_come_from_jellyfin(self) -> None:
+        self.sign_in()
+        self.window.navigate("albums")
+        wait_until(self.app, lambda: self.window.jellyfin.loaded)
+        lead = self.window.pages["albums"].model.albums[0].lead
+        art = self.window.jellyfin.art
+        wait_until(self.app, lambda: art.get(lead, "coverflow") is not None)
+        self.assertIsInstance(art.get(lead, "coverflow"), QtGui.QImage)
+        self.assertEqual(self.services.library.sessions, 0)
+
+    def test_reading_does_not_wait_for_the_ipod(self) -> None:
+        self.sign_in()
+        gate = threading.Event()
+        self.window.runner.run("iPod busy", lambda _job: gate.wait(5), device=True)
+        try:
+            self.window.navigate("genres")
+            wait_until(self.app, lambda: self.window.jellyfin.loaded)
+        finally:
+            gate.set()
+
+    def test_sign_out_and_failure(self) -> None:
+        sync = self.sign_in()
+        self.window.navigate("composers")
+        wait_until(self.app, lambda: self.window.jellyfin.loaded)
+        self.assertEqual(self.window.pages["composers"].body.currentIndex(), 0)
+        sync.sign_out()
+        page = self.window.pages["composers"]
+        self.assertEqual(page.body.currentIndex(), 1)
+        self.assertEqual(page.empty.title.text(), "没有登录 Jellyfin")
+        self.services.sync.fail = OSError("server unavailable")
+        sync.auth_switch.set_current("token", emit=True)
+        self.services.sync.fail = None
+        self.sign_in()
+        self.services.sync.fail = OSError("server unavailable")
+        self.window.navigate("songs")
+        wait_until(self.app, lambda: self.window.jellyfin.error)
+        songs = self.window.pages["songs"]
+        self.assertEqual(songs.empty.title.text(), "读取 Jellyfin 资料库失败")
+        self.assertEqual(songs.empty.action.text(), "重试")
+        self.services.sync.fail = None
+        songs.empty.action.click()
+        wait_until(self.app, lambda: self.window.jellyfin.loaded)
+        self.assertIs(songs.stack.currentWidget(), songs.table)
+
+    def test_saved_session_fills_the_library_at_startup(self) -> None:
+        self.services.sync.stored_session = {
+            "url": "https://jf.example.com", "user_id": "u1", "user_name": "bob",
+            "token": "tok", "device_id": "d1"}
+        podlink_settings.write_private(podlink_ui_theme.ui_prefs_path(),
+                                       json.dumps({"page": "artists"}))
+        _app, _theme, window = create_application(["test"], self.services)
+        self.addCleanup(window.deleteLater)
+        window.set_motion(False)
+        self.assertIs(window.stack.currentWidget(), window.pages["artists"])
+        self.assertEqual(window.pages["artists"].empty.title.text(), "正在连接 Jellyfin…")
+        wait_until(self.app, lambda: window.jellyfin.loaded)
+        self.assertEqual(window.pages["artists"].body.currentIndex(), 0)
+
+
+class JellyfinBackendTests(unittest.TestCase):
+    class Client:
+        def __init__(self, rows, missing=False):
+            self.rows, self.missing, self.calls = rows, missing, []
+
+        def page(self, session, route, offset, limit, **params):
+            self.calls.append((route, offset, params))
+            return self.rows[offset:offset + 2], len(self.rows)
+
+        def request(self, session, path, image=False, **params):
+            self.calls.append((path, image, params))
+            if self.missing:
+                raise backends_error(404)
+            return b"jpeg"
+
+    def source(self, client):
+        return type("Source", (), {"client": client, "session": object()})()
+
+    def test_items_become_read_only_tracks(self) -> None:
+        rows = [{"Id": "a1", "Type": "Audio", "Name": "Song", "Artists": ["X", "Y"],
+                 "AlbumArtist": "X", "Album": "LP", "AlbumId": "al1", "Genres": ["Pop"],
+                 "People": [{"Name": "Z", "Type": "Composer"}, {"Name": "P", "Type": "Producer"}],
+                 "ProductionYear": 2001, "ParentIndexNumber": 1, "IndexNumber": 3,
+                 "RunTimeTicks": 2_000_000_000, "MediaSources": [{"Bitrate": 320_000}],
+                 "UserData": {"PlayCount": 4, "LastPlayedDate": "2024-01-02T03:04:05.1234567Z"},
+                 "DateCreated": "2023-05-06T07:08:09Z", "Path": "/srv/music/song.flac"},
+                {"Id": "a2", "Type": "Audio", "Name": "Two"},
+                {"Id": "v1", "Type": "Video", "Name": "Not music"}]
+        client = self.Client(rows)
+        progress = []
+        tracks = backends.SyncBackend().library_tracks(self.source(client),
+                                                       lambda d, t: progress.append((d, t)))
+        self.assertEqual([t.title for t in tracks], ["Song", "Two"])
+        first = tracks[0]
+        self.assertEqual((first.artist, first.album_artist, first.composer, first.genre),
+                         ("X, Y", "X", "Z", "Pop"))
+        self.assertEqual((first.length_ms, first.bitrate_kbps, first.play_count, first.track),
+                         (200_000, 320, 4, 3))
+        self.assertEqual(first.last_played, 1704164645)
+        self.assertFalse(first.managed)
+        self.assertEqual(progress, [(2, 3), (3, 3)])
+        self.assertEqual(client.calls[0][2]["IncludeItemTypes"], "Audio")
+        self.assertEqual(tracks[1].album_artist, "")
+
+    def test_album_art_uses_the_album_and_404_is_no_art(self) -> None:
+        from astrapod_desktop.jellyfin import track_from_item
+        track = track_from_item({"Id": "a1", "AlbumId": "al1", "Name": "x"}, 0)
+        client = self.Client([])
+        self.assertEqual(backends.SyncBackend().album_art(self.source(client), track, 128),
+                         b"jpeg")
+        self.assertEqual(client.calls[0][0], "Items/al1/Images/Primary")
+        self.assertIsNone(backends.SyncBackend().album_art(self.source(self.Client([], True)),
+                                                           track, 128))
+
+
+def backends_error(status):
+    return fakes.FakeJellyfinError(f"HTTP {status}", status)
+
+
+class DevicePortTests(GuiCase):
+    def test_the_port_is_chosen_on_the_device_page(self) -> None:
+        device = self.window.pages["device"]
+        sync = self.window.pages["sync"]
+        settings = self.window.pages["settings"]
+        self.assertFalse([w for w in sync.findChildren(QtWidgets.QLineEdit)
+                          if w.accessibleName() == "iPod 串口"])
+        self.assertEqual(device.port.text(), fakes.FAKE_PORT)
+        self.assertEqual(device.port_picker.badge.text(), "自动识别")
+        self.assertEqual(sync.port_label.text(), "iPod 串口：自动识别")
+        device.port.setText("/dev/ttyACM5")
+        device.port.editingFinished.emit()
+        self.assertEqual(self.window.prefs["port"], "/dev/ttyACM5")
+        self.assertEqual(self.services.library.port, "/dev/ttyACM5")
+        self.assertEqual(json.loads(podlink_ui_theme.ui_prefs_path().read_text())["port"],
+                         "/dev/ttyACM5")
+        self.assertEqual(settings.port.text(), "/dev/ttyACM5")
+        self.assertEqual(settings.port_badge.text(), "手动指定")
+        self.assertEqual(sync.port_label.text(), "iPod 串口：/dev/ttyACM5")
+        sync.url.setText("https://jellyfin.example.com")
+        sync.auth_switch.set_current("token", emit=True)
+        sync.token.setText("tok")
+        sync.connect_source()
+        wait_until(self.app, lambda: sync.source is not None and not sync.busy)
+        sync.preview()
+        wait_until(self.app, lambda: sync.plan is not None)
+        self.assertEqual(self.services.sync.calls[-1][2], "/dev/ttyACM5")
+        device.port_picker.auto_button.click()
+        self.assertEqual(self.window.prefs["port"], "")
+        self.assertIsNone(sync.plan)
+        self.assertEqual(device.port.text(), fakes.FAKE_PORT)
+        self.assertEqual(settings.port_badge.text(), "自动识别")
+        sync.port_button.click()
+        self.assertIs(self.window.stack.currentWidget(), device)
 
 
 class SettingsTests(GuiCase):

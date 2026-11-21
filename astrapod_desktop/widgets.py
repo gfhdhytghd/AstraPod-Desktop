@@ -826,6 +826,8 @@ class CapacityBar(QtWidgets.QWidget):
         self.segments: list[tuple[str, int, str]] = []
         self.total = 0
         self.progress = 1.0
+        # Bar widths as fractions of the total: drawn moves from start to end.
+        self._start = self._end = (0.0, 0.0)
         self.setMinimumHeight(74)
         self._anim = QtCore.QVariantAnimation(self)
         self._anim.setDuration(500)
@@ -838,14 +840,23 @@ class CapacityBar(QtWidgets.QWidget):
         self.progress = float(value)
         self.update()
 
+    def _drawn(self) -> tuple[float, float]:
+        return tuple(a + (b - a) * self.progress for a, b in zip(self._start, self._end))
+
     def set_usage(self, total: int, audio: int, other: int, free: int, animate=True) -> None:
         self.total = max(1, total)
         self.segments = [("音频", audio, "primary"), ("其他", other, "tertiary"),
                          ("可用", free, "secondary_container")]
         self.setAccessibleDescription(
             f"音频 {fmt.size(audio)}，其他 {fmt.size(other)}，可用 {fmt.size(free)}")
+        end = (audio / self.total, other / self.total)
+        if end == self._end:
+            self.update()
+            return
+        self._start, self._end = self._drawn(), end
+        self._anim.stop()
         if animate and MOTION["on"]:
-            self._anim.stop()
+            self.progress = 0.0
             self._anim.start()
         else:
             self.progress = 1.0
@@ -861,8 +872,8 @@ class CapacityBar(QtWidgets.QWidget):
         height, gap = 12.0, 4.0
         bar = R(0, 4, self.width(), height)
         x = bar.left()
-        for _name, amount, token in self.segments[:-1]:
-            width = bar.width() * amount / self.total * self.progress
+        for (_name, _amount, token), share in zip(self.segments[:-1], self._drawn()):
+            width = bar.width() * share
             if width >= 1:
                 painter.setBrush(QtGui.QColor(getattr(t, token)))
                 painter.drawRoundedRect(R(x, bar.top(), max(width - gap, height / 2), height),
@@ -1036,12 +1047,16 @@ KEY_ROLE = Qt.ItemDataRole.UserRole + 10
 ICON_ROLE = Qt.ItemDataRole.UserRole + 11
 HEADER_ROLE = Qt.ItemDataRole.UserRole + 12
 BADGE_ROLE = Qt.ItemDataRole.UserRole + 13
+PARENT_ROLE = Qt.ItemDataRole.UserRole + 14     # a child row's node key
+EXPANDED_ROLE = Qt.ItemDataRole.UserRole + 15   # a node row: True or False
+INDENT = 20
 
 
 class SidebarDelegate(QtWidgets.QStyledItemDelegate):
     """Drawer rows are 48 px pills with the label beside the icon; rail
     rows put a 56x32 indicator over a small label. The active page takes
-    the secondary container colour."""
+    the secondary container colour. A node row carries a chevron; its
+    children are indented in the drawer and sit on a tinted band in the rail."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1055,10 +1070,56 @@ class SidebarDelegate(QtWidgets.QStyledItemDelegate):
             return QtCore.QSize(option.rect.width(), 0 if self.compact else 30)
         return QtCore.QSize(option.rect.width(), 48 if self.compact else 40)
 
-    def indicator(self, rect: QtCore.QRectF) -> tuple[QtCore.QRectF, float]:
+    def indicator(self, rect: QtCore.QRectF, child: bool = False) -> tuple[QtCore.QRectF, float]:
         if self.compact:
             return R(rect.center().x() - 28, rect.top(), 56, 32), 16.0
-        return rect.adjusted(12, 1, -12, -1), 20.0
+        return rect.adjusted(12 + (INDENT if child else 0), 1, -12, -1), 20.0
+
+    def chevron_area(self, rect: QtCore.QRectF) -> QtCore.QRectF:
+        """Where a node row's chevron sits and takes clicks."""
+        pill, _radius = self.indicator(rect)
+        if self.compact:
+            return R(pill.right(), pill.top(), max(12.0, rect.right() - pill.right()), pill.height())
+        return R(pill.right() - 40, pill.top(), 40, pill.height())
+
+    @staticmethod
+    def _band(painter, rect: QtCore.QRectF, index, color: QtGui.QColor) -> None:
+        """The rail's backdrop behind a node's children, rounded at the
+        group's first and last row."""
+        parent = index.data(PARENT_ROLE)
+        first = index.siblingAtRow(index.row() - 1).data(PARENT_ROLE) != parent
+        last = index.siblingAtRow(index.row() + 1).data(PARENT_ROLE) != parent
+        band = rect.adjusted(6, 0, -6, 0)
+        path = QtGui.QPainterPath()
+        path.setFillRule(Qt.FillRule.WindingFill)
+        path.addRoundedRect(band, 14, 14)
+        if not first:
+            path.addRect(R(band.left(), band.top(), band.width(), band.height() / 2))
+        if not last:
+            path.addRect(R(band.left(), band.center().y(), band.width(), band.height() / 2))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawPath(path)
+
+    @staticmethod
+    def _chevron(painter, center: QtCore.QPointF, expanded: bool, size: float,
+                 color: QtGui.QColor) -> None:
+        half = size / 2
+        path = QtGui.QPainterPath()
+        if expanded:
+            path.moveTo(center.x() - half, center.y() - half / 2)
+            path.lineTo(center.x(), center.y() + half / 2)
+            path.lineTo(center.x() + half, center.y() - half / 2)
+        else:
+            path.moveTo(center.x() - half / 2, center.y() - half)
+            path.lineTo(center.x() + half / 2, center.y())
+            path.lineTo(center.x() - half / 2, center.y() + half)
+        pen = QtGui.QPen(color, 2 if size > 6 else 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
 
     def paint(self, painter, option, index):
         t = self.tokens
@@ -1079,9 +1140,13 @@ class SidebarDelegate(QtWidgets.QStyledItemDelegate):
                                  index.data(Qt.ItemDataRole.DisplayRole))
             painter.restore()
             return
+        child = bool(index.data(PARENT_ROLE))
+        expanded = index.data(EXPANDED_ROLE)
         selected = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
         hover = bool(option.state & QtWidgets.QStyle.StateFlag.State_MouseOver)
-        pill, radius = self.indicator(rect)
+        pill, radius = self.indicator(rect, child)
+        if child and self.compact:
+            self._band(painter, rect, index, QtGui.QColor(t.surface_container_high))
         painter.setPen(Qt.PenStyle.NoPen)
         if selected:
             painter.setBrush(QtGui.QColor(t.secondary_container))
@@ -1111,16 +1176,26 @@ class SidebarDelegate(QtWidgets.QStyledItemDelegate):
                              metrics.elidedText(text, Qt.TextElideMode.ElideRight, int(rect.width() - 4)))
             if badge:
                 self._badge(painter, font, str(badge), P(icon_rect.right() + 2, icon_rect.top() + 2), t)
+            if expanded is not None:
+                area = self.chevron_area(rect)
+                self._chevron(painter, area.center(), expanded, 6,
+                              QtGui.QColor(t.on_surface_variant))
         else:
             icons.paint(painter, index.data(ICON_ROLE), R(pill.left() + 16, pill.center().y() - 12, 24, 24), fg)
             font.setPixelSize(14)
             font.setWeight(QtGui.QFont.Weight.DemiBold if selected else QtGui.QFont.Weight.Medium)
             painter.setFont(font)
             painter.setPen(fg)
-            painter.drawText(pill.adjusted(52, 0, -48, 0),
-                             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+            metrics = QtGui.QFontMetrics(font)
+            text_rect = pill.adjusted(52, 0, -48, 0)
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                             metrics.elidedText(text, Qt.TextElideMode.ElideRight,
+                                                int(text_rect.width())))
             if badge:
                 self._badge(painter, font, str(badge), P(pill.right() - 24, pill.center().y()), t)
+            elif expanded is not None:
+                area = self.chevron_area(rect)
+                self._chevron(painter, P(area.center().x() + 2, area.center().y()), expanded, 9, fg)
         painter.restore()
 
     @staticmethod
@@ -1140,10 +1215,17 @@ class SidebarDelegate(QtWidgets.QStyledItemDelegate):
 
 
 class Sidebar(QtWidgets.QListView):
-    """Sections of pages; accepts files dropped on it for import."""
+    """Sections of pages; accepts files dropped on it for import.
+
+    A page added with a parent is that node's child: it shows only while
+    the node is expanded. Nodes start collapsed. Clicking a node opens its
+    page; its chevron, a click on the open node, or Left and Right toggle
+    it. Opening a child expands its node. The drawer shows a scroll bar
+    when the list outgrows the window; the rail scrolls by wheel only."""
 
     page_selected = Signal(str)
     files_dropped = Signal(list)
+    expanded_changed = Signal(str, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1155,7 +1237,8 @@ class Sidebar(QtWidgets.QListView):
         self.setAcceptDrops(True)
         self.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setUniformItemSizes(False)
         self.setAccessibleName("导航")
         self.rows: dict[str, int] = {}
@@ -1167,12 +1250,23 @@ class Sidebar(QtWidgets.QListView):
         under the icons, and the names move into tooltips."""
         self.compact = compact
         self.delegate.compact = compact
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff if compact
+                                        else Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         for row in range(self.model_.rowCount()):
             item = self.model_.item(row)
-            if item.data(HEADER_ROLE):
-                self.setRowHidden(row, compact)
-            else:
+            if not item.data(HEADER_ROLE):
                 item.setToolTip(item.text() if compact else "")
+        self._apply_visibility()
+
+    def _apply_visibility(self) -> None:
+        for row in range(self.model_.rowCount()):
+            item = self.model_.item(row)
+            parent = item.data(PARENT_ROLE)
+            if item.data(HEADER_ROLE):
+                hidden = self.compact
+            else:
+                hidden = bool(parent) and not self.is_expanded(parent)
+            self.setRowHidden(row, hidden)
         self.doItemsLayout()
         self.scrollTo(self.currentIndex())
         self.viewport().update()
@@ -1188,7 +1282,8 @@ class Sidebar(QtWidgets.QListView):
         super().focusOutEvent(event)
 
     def ripple_rect(self, index) -> tuple[QtCore.QRect, float]:
-        pill, radius = self.delegate.indicator(R(self.visualRect(index)))
+        pill, radius = self.delegate.indicator(R(self.visualRect(index)),
+                                               bool(index.data(PARENT_ROLE)))
         return pill.toRect(), radius
 
     def add_header(self, text: str) -> None:
@@ -1197,13 +1292,75 @@ class Sidebar(QtWidgets.QListView):
         item.setFlags(Qt.ItemFlag.NoItemFlags)
         self.model_.appendRow(item)
 
-    def add_page(self, key: str, text: str, icon_name: str) -> None:
+    def add_page(self, key: str, text: str, icon_name: str, parent: str | None = None) -> None:
+        """A page row; with parent, a child row of that node."""
         item = QtGui.QStandardItem(text)
         item.setData(key, KEY_ROLE)
         item.setData(icon_name, ICON_ROLE)
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        if parent is not None:
+            item.setData(parent, PARENT_ROLE)
+            node = self._item(parent)
+            if node.data(EXPANDED_ROLE) is None:
+                node.setData(False, EXPANDED_ROLE)
         self.rows[key] = self.model_.rowCount()
         self.model_.appendRow(item)
+
+    def _item(self, key: str):
+        row = self.rows.get(key)
+        return self.model_.item(row) if row is not None else None
+
+    def set_text(self, key: str, text: str) -> None:
+        item = self._item(key)
+        if item is not None and item.text() != text:
+            item.setText(text)
+            if self.compact:
+                item.setToolTip(text)
+
+    def children(self, key: str) -> list[str]:
+        return [k for k, row in self.rows.items() if self.model_.item(row).data(PARENT_ROLE) == key]
+
+    def is_expanded(self, key: str) -> bool:
+        item = self._item(key)
+        return bool(item is not None and item.data(EXPANDED_ROLE))
+
+    def set_expanded(self, key: str, expanded: bool) -> None:
+        item = self._item(key)
+        if item is None or item.data(EXPANDED_ROLE) is None or self.is_expanded(key) == expanded:
+            return
+        item.setData(expanded, EXPANDED_ROLE)
+        if not expanded and self.current_key() in self.children(key):
+            self.select(key)
+        self._apply_visibility()
+        self.expanded_changed.emit(key, expanded)
+
+    def mousePressEvent(self, event) -> None:
+        index = self.indexAt(event.position().toPoint())
+        key = index.data(KEY_ROLE) if index.isValid() else None
+        if key and index.data(EXPANDED_ROLE) is not None and event.button() == Qt.MouseButton.LeftButton:
+            on_chevron = self.delegate.chevron_area(R(self.visualRect(index))).contains(
+                event.position())
+            if on_chevron or key == self.current_key():
+                self.set_expanded(key, not self.is_expanded(key))
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        key = self.current_key()
+        item = self._item(key) if key else None
+        if item is not None and event.key() in (Qt.Key.Key_Right, Qt.Key.Key_Left):
+            expandable = item.data(EXPANDED_ROLE) is not None
+            if event.key() == Qt.Key.Key_Right and expandable:
+                self.set_expanded(key, True)
+                return
+            if event.key() == Qt.Key.Key_Left:
+                if expandable and self.is_expanded(key):
+                    self.set_expanded(key, False)
+                elif item.data(PARENT_ROLE):
+                    self.select(item.data(PARENT_ROLE))
+                return
+        super().keyPressEvent(event)
 
     def set_badge(self, key: str, value) -> None:
         row = self.rows.get(key)
@@ -1212,8 +1369,12 @@ class Sidebar(QtWidgets.QListView):
 
     def select(self, key: str) -> None:
         row = self.rows.get(key)
-        if row is not None:
-            self.setCurrentIndex(self.model_.index(row, 0))
+        if row is None:
+            return
+        parent = self.model_.item(row).data(PARENT_ROLE)
+        if parent and not self.is_expanded(parent):
+            self.set_expanded(parent, True)
+        self.setCurrentIndex(self.model_.index(row, 0))
 
     def current_key(self) -> str | None:
         return self.currentIndex().data(KEY_ROLE)

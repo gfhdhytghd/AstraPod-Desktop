@@ -13,6 +13,7 @@ from ..qt import QtCore, QtGui, QtWidgets, Qt
 from ..widgets import (ChevronComboBox, PasswordLineEdit, SegmentedControl, ToggleSwitch,
                        PageHeader, button, label, make_badge, make_card, set_badge)
 from . import Page
+from .port import PortPicker
 
 SETTING_CHOICES = {
     "CIDER_BACKEND": ("plugin", "auto", "rpc"),
@@ -27,7 +28,6 @@ AGENT_CONTROL_HELP = {
     "herdr": "iPod 的 Agents 和这里的 Agent 页只显示 herdr 的工作区和 Agent。",
     "t3": "iPod 的 Agents 和这里的 Agent 页只显示 T3 Code 的项目和线程。",
 }
-PORT_EXAMPLE = "例如 /dev/serial/by-id/usb-…-if00"
 MEDIA_SETTING_KEYS = ("JELLYFIN_URL", "CIDER_API_URL", "CIDER_BACKEND", "RUFIN_API_URL")
 # Shown only while Agent control is set to herdr.
 HERDR_ONLY_KEYS = ("HERDR_SOCKET_PATH", "HERDREMOTE_VOICE_FOCUS")
@@ -161,36 +161,18 @@ class SettingsPage(Page):
         device, device_layout = make_card(10)
         device_layout.addWidget(label("iPod", "card-title"))
         form = self._form()
-        port_row = QtWidgets.QHBoxLayout()
-        port_row.setSpacing(8)
-        self.port = QtWidgets.QLineEdit()
-        self.port.setAccessibleName("iPod 串口")
-        self.port.textChanged.connect(self._port_typed)
-        self.port.editingFinished.connect(self._show_port)
-        port_row.addWidget(self.port, 1)
-        self.port_badge = make_badge("")
-        port_row.addWidget(self.port_badge)
-        self.port_auto_button = button("改用自动识别", "ghost", None, self.use_auto_port)
-        port_row.addWidget(self.port_auto_button)
-        self.port_detect_button = button("", None, "refresh", self.detect_port)
-        self.port_detect_button.setToolTip("重新检测 iPod 串口")
-        self.port_detect_button.setAccessibleName("重新检测 iPod 串口")
-        port_row.addWidget(self.port_detect_button)
-        form.addRow(self._caption("iPod 串口"), port_row)
+        self.port_picker = PortPicker(window)
+        self.port = self.port_picker.field
+        self.port_badge = self.port_picker.badge
+        self.port_auto_button = self.port_picker.auto_button
+        self.port_detect_button = self.port_picker.detect_button
+        self.port_help = self.port_picker.help
+        form.addRow(self._caption("iPod 串口"), self.port_picker)
         device_layout.addLayout(form)
-        self.port_help = label("", "helper", wrap=True)
         device_layout.addWidget(self.port_help)
-        device_layout.addWidget(label("读取资料库、导入和同步时，电脑会暂时从后台远程服务借用这个串口。",
-                                      "helper", wrap=True))
+        device_layout.addWidget(label("读取资料库、导入和同步时，电脑会暂时从后台远程服务借用这个串口。"
+                                      "设备页也可以更改它。", "helper", wrap=True))
         layout.addWidget(device)
-        self.detected_port = None
-        self._filling_port = False
-        self.port_manual = bool(window.prefs.get("port"))
-        if self.port_manual:
-            self._fill_port(window.prefs["port"])
-        self._link_key = self._link_state_key(window.daemon.state)
-        window.daemon.state_changed.connect(self._link_changed)
-        self.detect_port()
 
         media, media_layout = make_card(12)
         media_layout.addWidget(label("iPod 遥控用的媒体服务", "card-title"))
@@ -281,66 +263,11 @@ class SettingsPage(Page):
 
     # iPod port ---------------------------------------------------------
     def detect_port(self) -> None:
-        detect = getattr(self.window_.services.library, "detect_port", None)
-        self.detected_port = detect() if detect is not None else None
-        self._show_port()
-
-    def use_auto_port(self) -> None:
-        self.port_manual = False
-        self._fill_port(self.detected_port or "")
-        self._show_port()
+        self.port_picker.detect()
 
     def port_override(self) -> str:
         """The explicit port to save; empty means auto-detect."""
-        return self.port.text().strip() if self.port_manual else ""
-
-    def _fill_port(self, text: str) -> None:
-        self._filling_port = True
-        try:
-            self.port.setText(text)
-        finally:
-            self._filling_port = False
-
-    def _port_typed(self, text: str) -> None:
-        if self._filling_port:
-            return
-        text = text.strip()
-        self.port_manual = bool(text) and text != self.detected_port
-        self._show_port(refill=False)
-
-    def _show_port(self, refill: bool = True) -> None:
-        detected = self.detected_port
-        if not self.port_manual and refill and not self.port.hasFocus():
-            self._fill_port(detected or "")
-        self.port.setPlaceholderText(PORT_EXAMPLE)
-        self.port.setProperty("auto_value", not self.port_manual)
-        tokens = self.tokens
-        self.port.setStyleSheet(f"color: {tokens.text_secondary};"
-                                if not self.port_manual and tokens is not None else "")
-        self.port_auto_button.setVisible(self.port_manual)
-        if self.port_manual:
-            set_badge(self.port_badge, "手动指定", "busy")
-            self.port_help.setText(
-                f"使用手动填写的串口。自动识别结果：{detected}。" if detected
-                else "使用手动填写的串口。现在没有自动识别到 iPod。")
-        elif detected:
-            set_badge(self.port_badge, "自动识别", "accent")
-            self.port_help.setText("已自动识别到 iPod。要改用别的串口，直接修改上面的路径。")
-        else:
-            set_badge(self.port_badge, "未检测到", "neutral")
-            self.port_help.setText("没有检测到 iPod。用 USB 连接并打开 PodLink 后点刷新，"
-                                   "或手动填写串口。")
-
-    @staticmethod
-    def _link_state_key(state: dict):
-        link = state.get("link") or {}
-        return bool(link.get("connected")), link.get("port"), link.get("mode")
-
-    def _link_changed(self, state: dict) -> None:
-        key = self._link_state_key(state)
-        if key != self._link_key:
-            self._link_key = key
-            self.detect_port()
+        return self.port_picker.override()
 
     # Agent control ---------------------------------------------------------
     def _agent_control_row(self) -> QtWidgets.QHBoxLayout:
@@ -653,7 +580,7 @@ class SettingsPage(Page):
         self.theme_switch.update_theme(tokens)
         if self.agent_control is not None:
             self.agent_control.update_theme(tokens)
-        self._show_port(refill=False)
+        self.port_picker.show_state(refill=False)
         self.motion.tokens = tokens
         self.color_source.update_theme(tokens)
         for swatch in self.swatches.values():

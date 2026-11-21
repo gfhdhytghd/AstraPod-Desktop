@@ -39,7 +39,7 @@ class AlbumDelegate(QtWidgets.QStyledItemDelegate):
         art_rect = R(rect.center().x() - side / 2, rect.top() + 12 - 5 * lift + (ART - side) / 2,
                      side, side)
         art_rect.translate(0, (1 - reveal) * 10)
-        image = view.window_.art.get(album.lead, "coverflow")
+        image = view.library.art.get(album.lead, "coverflow")
         draw_art(painter, art_rect, image if image is not NO_ART else None, album.title,
                  radius=9, shadow=1.0 + 0.9 * lift, loading=image is None, tokens=tokens)
         selected = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
@@ -72,9 +72,10 @@ class AlbumGrid(QtWidgets.QListView):
 
     album_opened = Signal(object)
 
-    def __init__(self, window, model: AlbumsModel, parent=None):
+    def __init__(self, window, model: AlbumsModel, library, parent=None):
         super().__init__(parent)
         self.window_ = window
+        self.library = library
         self.setModel(model)
         self.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
         self.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
@@ -157,9 +158,10 @@ class AlbumGrid(QtWidgets.QListView):
 class AlbumDetail(QtWidgets.QWidget):
     back = Signal()
 
-    def __init__(self, window, parent=None):
+    def __init__(self, window, library, parent=None):
         super().__init__(parent)
         self.window_ = window
+        self.library = library
         self.album = None
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -185,6 +187,7 @@ class AlbumDetail(QtWidgets.QWidget):
         info.addStretch(1)
         actions = QtWidgets.QHBoxLayout()
         self.info_button = button("显示简介", None, "info", self._info)
+        self.info_button.setVisible(library.editable)
         actions.addWidget(self.info_button)
         actions.addStretch(1)
         info.addLayout(actions)
@@ -195,12 +198,13 @@ class AlbumDetail(QtWidgets.QWidget):
         self.model = SongsModel(self)
         self.model.sort_column = -1
         self.table = SongsTable(window, None, self.model,
-                                ["track", "title", "length", "artist", "plays", "rating"])
+                                ["track", "title", "length", "artist", "plays", "rating"],
+                                library=library)
         self.table.info_requested.connect(window.show_info)
         self.table.delete_requested.connect(window.confirm_delete)
         card_layout.addWidget(self.table)
         layout.addWidget(card, 1)
-        window.art.art_ready.connect(self._art_ready)
+        library.art.art_ready.connect(self._art_ready)
 
     def show_album(self, album) -> None:
         self.album = album
@@ -218,13 +222,14 @@ class AlbumDetail(QtWidgets.QWidget):
     def _load_art(self) -> None:
         if self.album is None:
             return
-        image = self.window_.art.get(self.album.lead, "wps")
+        art = self.library.art
+        image = art.get(self.album.lead, "wps")
         if image is None or image is NO_ART:
-            small = self.window_.art.get(self.album.lead, "coverflow")
+            small = art.get(self.album.lead, "coverflow")
             image = small if isinstance(small, QtGui.QImage) else image
         self.art.tokens = self.window_.theme_manager.tokens
         self.art.set_image(image if isinstance(image, QtGui.QImage) else None, self.album.title)
-        self.window_.show_track_art(self.album.lead)
+        self.window_.show_track_art(self.album.lead, art)
 
     def _art_ready(self, key) -> None:
         if self.album is not None and key == self.album.key:
@@ -240,8 +245,11 @@ class AlbumsPage(Page):
     key = "albums"
     searchable = True
 
-    def __init__(self, window, parent=None):
+    def __init__(self, window, library=None, key: str = "albums", parent=None):
         super().__init__(window, parent)
+        self.key = key
+        self.library = library = library or window.library_state
+        self.search_hint = library.search_hint
         self.stack = QtWidgets.QStackedWidget()
         grid_page = QtWidgets.QWidget()
         grid_layout = QtWidgets.QVBoxLayout(grid_page)
@@ -250,30 +258,37 @@ class AlbumsPage(Page):
         self.header = PageHeader("专辑")
         grid_layout.addWidget(self.header)
         self.model = AlbumsModel(self)
-        self.grid = AlbumGrid(window, self.model)
+        self.grid = AlbumGrid(window, self.model, library)
         self.grid.album_opened.connect(self.open_album)
-        self.empty = EmptyState("albums", "还没有专辑", "读取 iPod 资料库后，专辑和插图会显示在这里。",
-                                "读取 iPod 资料库", lambda: window.library_state.refresh(True))
+        self.empty = EmptyState("albums", *library.empty_content("albums", "专辑"))
         self.inner = QtWidgets.QStackedWidget()
         self.inner.addWidget(self.grid)
         self.inner.addWidget(self.empty)
         grid_layout.addWidget(self.inner, 1)
-        self.detail = AlbumDetail(window)
+        self.detail = AlbumDetail(window, library)
         self.detail.back.connect(self.close_album)
         self.stack.addWidget(grid_page)
         self.stack.addWidget(self.detail)
         self.layout_.addWidget(self.stack)
-        window.library_state.changed.connect(self.reload)
-        window.art.art_ready.connect(self.model.art_changed)
+        library.changed.connect(self.reload)
+        library.art.art_ready.connect(self.model.art_changed)
         self.reload()
 
     def reload(self) -> None:
-        tracks = self.window_.library_state.tracks
+        tracks = self.library.tracks
         if tracks is not getattr(self, "_shown", None):
             self._shown = tracks
             self.model.set_tracks(tracks)
+            if not tracks and self.stack.currentWidget() is self.detail:
+                self.close_album()
+        if not tracks:
+            self.empty.set_content(*self.library.empty_content("albums", "专辑"))
         self.inner.setCurrentWidget(self.grid if tracks else self.empty)
         self.header.subtitle.setText(f"{len(self.model.albums)} 张专辑" if tracks else "")
+
+    def shown(self) -> None:
+        if not self.library.editable:
+            self.library.ensure_loaded()
 
     def open_album(self, album) -> None:
         if album is None:
@@ -289,7 +304,7 @@ class AlbumsPage(Page):
     def set_search(self, text: str) -> None:
         self.model.set_search(text)
         self.header.subtitle.setText(f"{len(self.model.albums)} 张专辑"
-                                     if self.window_.library_state.tracks else "")
+                                     if self.library.tracks else "")
 
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key.Key_Escape, Qt.Key.Key_Backspace) and \

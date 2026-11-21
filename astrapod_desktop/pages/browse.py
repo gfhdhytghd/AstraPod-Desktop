@@ -71,10 +71,14 @@ class BrowsePage(Page):
         "composers": ("作曲者", "composer", "全部作曲者", "composers"),
     }
 
-    def __init__(self, window, key: str, parent=None):
+    def __init__(self, window, kind: str, library=None, key: str | None = None, parent=None):
         super().__init__(window, parent)
-        self.key = key
-        title, self.field, all_label, icon_name = self.FIELDS[key]
+        self.key = key or kind
+        self.kind = kind
+        self.library = library = library or window.library_state
+        self.search_hint = library.search_hint
+        title, self.field, all_label, icon_name = self.FIELDS[kind]
+        self.title = title
         self.header = PageHeader(title)
         self.layout_.addWidget(self.header)
         self.terms: list[str] = []
@@ -99,16 +103,15 @@ class BrowsePage(Page):
         split.addWidget(middle)
         right, right_layout = make_card(0, expand=True, margins=(4, 4, 4, 4))
         self.table = SongsTable(window, "browse_columns",
-                                defaults=["title", "length", "artist", "album", "rating"])
+                                defaults=["title", "length", "artist", "album", "rating"],
+                                library=library)
         self.table.info_requested.connect(window.show_info)
         self.table.delete_requested.connect(window.confirm_delete)
         right_layout.addWidget(self.table)
         split.addWidget(right)
         split.setSizes([230, 210, 700])
         split.setStretchFactor(2, 1)
-        self.empty = EmptyState(icon_name, f"还没有{title}", "读取 iPod 资料库后可以按"
-                                f"{title}浏览歌曲。", "读取 iPod 资料库",
-                                lambda: window.library_state.refresh(True))
+        self.empty = EmptyState(icon_name, *library.empty_content(kind, title))
         self.body.addWidget(split)
         self.body.addWidget(self.empty)
         self.layout_.addWidget(self.body, 1)
@@ -118,11 +121,13 @@ class BrowsePage(Page):
 
         self.value_view.selectionModel().currentChanged.connect(self._value_changed)
         self.album_view.selectionModel().currentChanged.connect(self._album_changed)
-        window.library_state.changed.connect(self.reload)
+        library.changed.connect(self.reload)
         self.reload()
 
     def reload(self) -> None:
-        tracks = self.window_.library_state.tracks
+        tracks = self.library.tracks
+        if not tracks:
+            self.empty.set_content(*self.library.empty_content(self.kind, self.title))
         if tracks is getattr(self, "_shown", None):
             return
         self._shown = tracks
@@ -133,7 +138,7 @@ class BrowsePage(Page):
         self.header.subtitle.setText(f"{len(self.values.values)} 项" if tracks else "")
 
     def _matching(self) -> list:
-        tracks = self.window_.library_state.tracks
+        tracks = self.library.tracks
         if not self.terms:
             return tracks
         out = []
@@ -181,6 +186,10 @@ class BrowsePage(Page):
                     self.value_view.setCurrentIndex(self.values.index(row))
                     break
         self.status.setText(models.summary_line(self.table.proxy.tracks()))
+
+    def shown(self) -> None:
+        if not self.library.editable:
+            self.library.ensure_loaded()
 
     def apply_theme(self, tokens) -> None:
         self.table.apply_theme(tokens)

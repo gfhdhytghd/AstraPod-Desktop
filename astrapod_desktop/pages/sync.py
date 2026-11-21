@@ -1,10 +1,12 @@
 """Jellyfin sync: log in, choose a scope, preview the difference, apply.
-A successful sign-in is kept across restarts until the owner signs out."""
+A successful sign-in is kept across restarts until the owner signs out, and
+the 资料库 pages browse Jellyfin through it. The iPod is the one the device
+page's serial port reaches."""
 from __future__ import annotations
 
 import os
 
-from ..qt import QtCore, QtGui, QtWidgets, Qt
+from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal
 from ..widgets import (ChevronComboBox, PageHeader, PasswordLineEdit, SegmentedControl,
                        button, label, make_badge, make_card, qcolor, set_badge)
 from . import Page
@@ -79,6 +81,7 @@ class StatTile(QtWidgets.QFrame):
 
 class SyncPage(Page):
     key = "sync"
+    source_state = Signal()         # session, restoring or source changed
 
     def __init__(self, window, parent=None):
         super().__init__(window, parent)
@@ -166,11 +169,15 @@ class SyncPage(Page):
         self.scope.currentIndexChanged.connect(self.invalidate_plan)
         self.scope.currentIndexChanged.connect(self._remember_scope)
         scope_layout.addWidget(self.scope)
-        self.port = QtWidgets.QLineEdit()
-        self.port.setPlaceholderText("iPod 串口（留空自动识别）")
-        self.port.setAccessibleName("iPod 串口")
-        self.port.textChanged.connect(self.invalidate_plan)
-        scope_layout.addWidget(self.port)
+        port_row = QtWidgets.QHBoxLayout()
+        self.port_label = label("", "helper", wrap=True)
+        port_row.addWidget(self.port_label, 1)
+        self.port_button = button("更改", "ghost", None, lambda: window.navigate("device"))
+        self.port_button.setToolTip("在设备页选择 iPod 串口")
+        port_row.addWidget(self.port_button)
+        scope_layout.addLayout(port_row)
+        self._show_port()
+        window.port_changed.connect(self._port_changed)
         scope_layout.addStretch(1)
         scope_row = QtWidgets.QHBoxLayout()
         scope_row.addWidget(label("iPod 需要处于 PodLink USB 模式", "helper", wrap=True), 1)
@@ -372,11 +379,24 @@ class SyncPage(Page):
         if not self.busy:
             self.connect_source()
 
+    # iPod port ----------------------------------------------------------
+    def port(self) -> str:
+        """The device page's port; empty means auto-detect."""
+        return self.window_.prefs.get("port") or ""
+
+    def _show_port(self) -> None:
+        port = self.port()
+        self.port_label.setText(f"iPod 串口：{port}" if port else "iPod 串口：自动识别")
+
+    def _port_changed(self, _port: str) -> None:
+        self._show_port()
+        self.invalidate_plan()
+
     # State ------------------------------------------------------------
     def update_buttons(self) -> None:
         interactive = not self.busy and not self.restoring
         for control in (self.username, self.password, self.token, self.scope,
-                        self.port, self.connect_button, self.sign_out_button):
+                        self.port_button, self.connect_button, self.sign_out_button):
             control.setEnabled(interactive)
         self.url.setEnabled(interactive and self.session is None)
         self.auth_switch.set_options_enabled(interactive)
@@ -396,6 +416,7 @@ class SyncPage(Page):
             set_badge(self.connection_badge, "已登录，未连接", "danger")
         else:
             set_badge(self.connection_badge, "未连接", "neutral")
+        self.source_state.emit()
 
     def _update_metrics(self, plan) -> None:
         add = len(plan.additions) if plan else 0
@@ -491,7 +512,7 @@ class SyncPage(Page):
         index = self.scope.currentIndex()
         if self.busy or self.source is None or not 0 <= index < len(self.scopes):
             return
-        scope, source, port = self.scopes[index], self.source, self.port.text().strip()
+        scope, source, port = self.scopes[index], self.source, self.port()
         self.job("正在比较 Jellyfin 和 iPod 的曲库…",
                  lambda: self.backend.preview(source, scope, port), self.show_plan)
 
@@ -554,7 +575,7 @@ class SyncPage(Page):
             self.sync(plan)
 
     def sync(self, plan) -> None:
-        source, port = self.source, self.port.text().strip()
+        source, port = self.source, self.port()
         self.job("正在同步。高采样率音频会先在电脑上转换…",
                  lambda: self.backend.apply(source, plan, port), self.sync_complete)
 

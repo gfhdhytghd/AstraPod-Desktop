@@ -228,6 +228,44 @@ class SyncBackend:
         source = hrmediasync.JellyfinSource(record["url"], record["token"])
         return source, source.scopes()
 
+    # Read-only browsing for the 资料库 pages. Network only; never the iPod.
+    LIBRARY_PAGE = 200
+
+    def library_tracks(self, source, progress=None):
+        """Every audio item the signed-in account sees, as JellyfinTrack rows."""
+        from .jellyfin import track_from_item
+        rows, offset, total = [], 0, None
+        while total is None or offset < total:
+            page, total = source.client.page(
+                source.session, "Items", offset, self.LIBRARY_PAGE, IncludeItemTypes="Audio",
+                Recursive="true", SortBy="SortName", EnableImages="false",
+                EnableUserData="true", Fields="Genres,People,MediaSources,DateCreated,Path")
+            if not page:
+                break
+            rows.extend(page)
+            offset += len(page)
+            if progress is not None:
+                progress(offset, total)
+        tracks = []
+        for row in rows:
+            track = track_from_item(row, len(tracks))
+            if track is not None:
+                tracks.append(track)
+        return tracks
+
+    def album_art(self, source, track, pixels):
+        """The album's (or else the track's) primary image as JPEG bytes;
+        None when Jellyfin has none."""
+        item = track.album_id or track.item_id
+        try:
+            return source.client.request(source.session, f"Items/{item}/Images/Primary",
+                                         image=True, MaxWidth=pixels, MaxHeight=pixels,
+                                         Format="Jpg")
+        except OSError as error:
+            if getattr(error, "status", None) == 404:
+                return None
+            raise
+
     def preview(self, source, scope, port):
         import hrmediasync
         return hrmediasync.preview(source, scope, port, **self._serial())
