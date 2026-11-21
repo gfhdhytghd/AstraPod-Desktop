@@ -588,6 +588,7 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("ping", "info"):
         sub.add_parser(name)
+    sub.add_parser("reboot").add_argument("--serial", required=True)
     sub.add_parser("echo").add_argument("text")
     sub.add_parser("bench").add_argument("--bytes", type=int, default=1024 * 1024)
     sub.add_parser("latency").add_argument("--samples", type=int, default=100)
@@ -597,6 +598,10 @@ def main():
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     try:
+        if args.command == "reboot":
+            from podlink_shell import execute
+            execute(args.serial, "reboot")
+            return
         if args.command == "serve":
             asyncio.run(serve(args.port, args.listen_port, args.timeout))
             return
