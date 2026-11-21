@@ -1,4 +1,4 @@
-"""Import: iTunes' "Add to Library" — review, then upload over PodLink."""
+"""Import: iTunes' "Add to Library" — review, then import to the iPod."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
@@ -12,6 +12,7 @@ from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal
 from ..widgets import (DropFrame, PageHeader, ToggleSwitch, button, configure_table, draw_art,
                        label, qcolor)
 from . import Page
+from .sync import disk_mode_option
 
 R = QtCore.QRectF
 ITEM_ROLE = Qt.ItemDataRole.UserRole + 30
@@ -296,6 +297,7 @@ class ImportPage(Page):
         self.progress.setVisible(False)
         column.addWidget(self.summary)
         column.addWidget(self.progress)
+        self.disk_mode = disk_mode_option(window, column, "import_disk_mode", "导入")
         footer_layout.addLayout(column, 1)
         footer_layout.addWidget(label("跳过 iPod 上已有的歌曲", "field-label"))
         self.skip_check = ToggleSwitch()
@@ -450,23 +452,29 @@ class ImportPage(Page):
             item.state, item.progress = "queued", 0.0
             self.model.changed(item)
         skip = self.skip_check.isChecked()
+        disk_mode = self.disk_mode.isChecked()
         library = self.window_.library_state.library
         paths = [item.path for item in chosen]
         counts = {"done": 0, "skip": 0, "error": 0}
 
         def work(job):
-            with library.session() as session:
-                def progress(event):
-                    job.progress(None, None, event)
-                    if event.get("state") == "probe" and job.cancelled:
-                        raise Cancelled()
-                try:
-                    if hasattr(session, "import_files"):
-                        session.import_files(paths, progress, skip_duplicates=skip)
-                    else:
-                        upload_each(session, paths, progress)
-                except Cancelled:
-                    return {"cancelled": True}
+            def progress(event):
+                job.progress(None, None, event)
+                if event.get("state") == "probe":
+                    job.check()
+
+            try:
+                job.check()
+                if disk_mode:
+                    library.import_disk(paths, progress, skip_duplicates=skip)
+                else:
+                    with library.session() as session:
+                        if hasattr(session, "import_files"):
+                            session.import_files(paths, progress, skip_duplicates=skip)
+                        else:
+                            upload_each(session, paths, progress)
+            except Cancelled:
+                return {"cancelled": True}
             return {"cancelled": False}
 
         def on_progress(_fraction, _text, event):
@@ -510,7 +518,8 @@ class ImportPage(Page):
         self.cancel_button.setVisible(True)
         self.cancel_button.setEnabled(True)
         self.import_button.setEnabled(False)
-        for widget in (self.add_files_button, self.add_folder_button, self.clear_button, self.skip_check):
+        for widget in (self.add_files_button, self.add_folder_button, self.clear_button,
+                       self.skip_check, self.disk_mode):
             widget.setEnabled(False)
         self.summary.setText(f"正在导入 {len(paths)} 首。可以在两首之间取消。")
 
@@ -528,7 +537,8 @@ class ImportPage(Page):
                 self.model.changed(item)
         self.progress.setVisible(False)
         self.cancel_button.setVisible(False)
-        for widget in (self.add_files_button, self.add_folder_button, self.clear_button, self.skip_check):
+        for widget in (self.add_files_button, self.add_folder_button, self.clear_button,
+                       self.skip_check, self.disk_mode):
             widget.setEnabled(True)
         text = f"已导入 {counts['done']} 首"
         if counts["skip"]:
@@ -549,6 +559,8 @@ class ImportPage(Page):
 
     def apply_theme(self, tokens) -> None:
         self.skip_check.tokens = tokens
+        self.disk_mode.tokens = tokens
+        self.disk_mode.update()
         self.target.update()
 
 

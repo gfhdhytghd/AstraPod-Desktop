@@ -7,6 +7,7 @@ import stat
 import struct
 
 BORROW_SERIAL = b'borrow-serial-v1\n'
+ENTER_DISK = b'enter-disk-v1'
 CAPABILITY = b'DH\t1\tdisk-mode-v1'
 
 
@@ -99,13 +100,17 @@ class Control:
                         self.serial_lease = channel.dup()
                         self.serial_lease.setblocking(False)
                         return
-                    if request != b'enter-disk-v1\n':
+                    target = request.removesuffix(b'\n').split(b'\t')
+                    if not request.endswith(b'\n') or target[0] != ENTER_DISK or len(target) not in (1, 2):
                         channel.sendall(b'5 invalid request\n')
                         return
                 if uid != os.getuid():
                     pass
                 elif link is None or not link.opened:
                     reply = b'3 no PodLink session\n'
+                elif len(target) == 2 and target[1] != os.fsencode(
+                        os.path.realpath(link.port.port)):
+                    reply = b'5 PodLink session is for a different player\n'
                 elif self.token is None:
                     reply = b'4 firmware lacks disk-mode-v1 hello\n'
                 else:

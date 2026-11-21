@@ -266,6 +266,10 @@ class FakeLibrary:
         self.sessions += 1
         yield FakeSession(self)
 
+    def import_disk(self, paths, progress, skip_duplicates=True):
+        with self.session() as session:
+            return session.import_files(paths, progress, skip_duplicates=skip_duplicates)
+
     def remember(self, serial, summary):
         pass
 
@@ -403,6 +407,11 @@ class FakeSync:
 
     def apply(self, source, plan, port):
         self.calls.append(("apply", plan, port))
+        self._wait()
+        return len(plan.additions), len(plan.removals)
+
+    def apply_disk(self, source, plan, port):
+        self.calls.append(("apply_disk", plan, port))
         self._wait()
         return len(plan.additions), len(plan.removals)
 
