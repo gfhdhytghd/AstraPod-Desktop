@@ -42,6 +42,9 @@ PodLink Shell uses a separate USB endpoint and can run while HerdRemote is
 connected. See the [Apple IR setup][ir] and the [Cider bridge setup][cider]
 for those optional integrations.
 
+For plugin launch, screen capture and device checks, see the
+[iPod plugin smoke test](docs/plugin-smoke.md).
+
 ### Disk Mode for media transfers
 
 Start with the iPod connected in PodLink mode. Enable **磁盘模式** on the

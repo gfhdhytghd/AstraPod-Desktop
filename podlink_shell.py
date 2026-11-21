@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """Open the PodLink shell on a connected iPod Classic."""
 import argparse
+from dataclasses import dataclass
 import errno
 from pathlib import Path
+import re
 import shlex
 import struct
 import sys
 import time
+import zlib
 
 import usb.core
 
 
 COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4, "open-bench": 5}
 REQUEST, INDEX = 0x5D, 0x4951
+IPOD_VENDOR, IPOD_PRODUCT = 0x05AC, 0x1261
+EP0_STALL_DELAYS = (.05, .10, .20, .25, .25, .25, .25, .25)
 RECORD_START = {"line-in": 6, "mic": 7}
 RECORD_STOP = 8
 RECORD_ACTIVE, RECORD_READY, RECORD_ERROR = 1, 2, 3
@@ -20,24 +25,159 @@ RECORD_STATES = (
     "idle", "recording", "saved", "capture failed", "input unsupported",
     "recorder busy",
 )
+PLUGIN_LAUNCH, PLUGIN_EXIT, SCREENSHOT_BEGIN = 9, 10, 11
+PLUGIN_STATUS = struct.Struct("<IIIIi32s")
+SCREENSHOT_META = struct.Struct("<IIHHHH")
+PLUGIN_STATES = ("idle", "queued", "running")
+PLUGIN_REASONS = ("none", "normal", "usb", "error")
+PLUGIN_NAME = re.compile(rb"[a-zA-Z0-9][a-zA-Z0-9_-]{0,30}")
+SCREENSHOT_DATA = 0x100
+LCD_WIDTH, LCD_HEIGHT = 320, 240
+
+
+@dataclass(frozen=True)
+class PluginStatus:
+    generation: int
+    state: str
+    reason: str
+    result: int
+    name: str
+
+    def __str__(self):
+        return (f"plugin={self.name or '-'} state={self.state} "
+                f"reason={self.reason} result={self.result} generation={self.generation}")
 
 
 def find_player(serial):
-    players = [
-        device for device in usb.core.find(
-            find_all=True, idVendor=0x05AC, idProduct=0x1261
-        )
-        if device.serial_number == serial
-    ]
+    players = []
+    for device in usb.core.find(find_all=True, idVendor=IPOD_VENDOR, idProduct=IPOD_PRODUCT):
+        if (device.idVendor, device.idProduct) != (IPOD_VENDOR, IPOD_PRODUCT):
+            continue
+        try:
+            if device.serial_number == serial:
+                players.append(device)
+        except (ValueError, usb.core.USBError):
+            continue
     if len(players) != 1:
         raise RuntimeError("Expected one connected iPod with the specified USB serial")
     return players[0]
 
 
 def status(device):
-    return struct.unpack("<4I", device.ctrl_transfer(
-        0xC0, REQUEST, 0, INDEX, 16, timeout=1000
-    ))
+    return struct.unpack("<4I", read_control(device, 0, 16))
+
+
+def ep0_transfer(player, direction, request, value, index, payload):
+    """Retry a stalled transfer without repeating the surrounding command."""
+    for delay in EP0_STALL_DELAYS:
+        try:
+            return player.ctrl_transfer(direction, request, value, index, payload, timeout=1000)
+        except usb.core.USBError as error:
+            if error.errno != errno.EPIPE:
+                raise
+            time.sleep(delay)
+    return player.ctrl_transfer(direction, request, value, index, payload, timeout=1000)
+
+
+def read_control(player, value, length):
+    data = bytes(ep0_transfer(player, 0xC0, REQUEST, value, INDEX, length))
+    if len(data) != length:
+        raise RuntimeError(f"Short PodLink Shell response for value {value:#x}")
+    return data
+
+
+def write_control(player, value, data=b""):
+    if ep0_transfer(player, 0x40, REQUEST, value, INDEX, data) != len(data):
+        raise RuntimeError(f"Short PodLink Shell write for value {value:#x}")
+
+
+def plugin_status(player):
+    version, generation, state, reason, result, raw = PLUGIN_STATUS.unpack(
+        read_control(player, 3, PLUGIN_STATUS.size)
+    )
+    name, end, padding = raw.partition(b"\0")
+    if (version != 1 or state >= len(PLUGIN_STATES) or reason >= len(PLUGIN_REASONS)
+            or not end or any(padding) or (name and not PLUGIN_NAME.fullmatch(name))):
+        raise RuntimeError("Invalid plugin status")
+    return PluginStatus(generation, PLUGIN_STATES[state], PLUGIN_REASONS[reason],
+                        result, name.decode("ascii"))
+
+
+def plugin_launch(player, name):
+    if not name or not PLUGIN_NAME.fullmatch(name.encode("utf-8")):
+        raise ValueError("plugin-launch requires a plugin basename of 1 to 31 ASCII characters")
+    initial = plugin_status(player)
+    if initial.state != "idle":
+        raise RuntimeError(f"A plugin is already active: {initial}")
+    write_control(player, PLUGIN_LAUNCH, name.encode("ascii"))
+    expected = (initial.generation + 1) & 0xFFFFFFFF
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        current = plugin_status(player)
+        if current.generation == expected and current.name == name:
+            if current.state == "running":
+                return current
+            if current.state == "idle":
+                raise RuntimeError(f"Plugin returned during launch: {current}")
+        elif current.generation != initial.generation:
+            raise RuntimeError(f"Another launch replaced {name}: {current}")
+        time.sleep(.05)
+    raise RuntimeError(f"Timed out launching {name}")
+
+
+def plugin_exit(player):
+    write_control(player, PLUGIN_EXIT)
+
+
+def screenshot_meta(player):
+    return SCREENSHOT_META.unpack(read_control(player, 4, SCREENSHOT_META.size))
+
+
+def lcd_snapshot(player):
+    initial = screenshot_meta(player)[0]
+    write_control(player, SCREENSHOT_BEGIN)
+    expected = (initial + 1) & 0xFFFFFFFF
+    deadline = time.monotonic() + 25
+    while time.monotonic() < deadline:
+        meta = screenshot_meta(player)
+        generation, length, width, height, chunk, state = meta
+        if generation == expected and state == 2:
+            break
+        if generation not in (initial, expected) or state > 2:
+            raise RuntimeError("LCD snapshot was replaced")
+        time.sleep(.05)
+    else:
+        raise RuntimeError("Timed out waiting for LCD snapshot")
+    if ((width, height) != (LCD_WIDTH, LCD_HEIGHT) or length != width * height * 2
+            or not 0 < chunk <= 4096 or (length + chunk - 1) // chunk > 65536 - SCREENSHOT_DATA):
+        raise RuntimeError("Invalid LCD snapshot format")
+    pixels = bytearray()
+    for index, offset in enumerate(range(0, length, chunk)):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Timed out reading LCD snapshot")
+        pixels.extend(read_control(player, SCREENSHOT_DATA + index, min(chunk, length - offset)))
+    if screenshot_meta(player) != meta:
+        raise RuntimeError("LCD snapshot changed during transfer")
+    return bytes(pixels)
+
+
+def png_chunk(kind, data):
+    return (struct.pack(">I", len(data)) + kind + data
+            + struct.pack(">I", zlib.crc32(kind + data)))
+
+
+def screenshot(player, destination):
+    pixels = lcd_snapshot(player)
+    rows = bytearray()
+    for offset in range(0, len(pixels), LCD_WIDTH * 2):
+        rows.append(0)  # PNG filter: None.
+        for pixel, in struct.iter_unpack("<H", pixels[offset:offset + LCD_WIDTH * 2]):
+            rows.extend(((pixel >> 11) * 255 // 31, ((pixel >> 5) & 63) * 255 // 63,
+                         (pixel & 31) * 255 // 31))
+    header = struct.pack(">IIBBBBB", LCD_WIDTH, LCD_HEIGHT, 8, 2, 0, 0, 0)
+    png = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", header)
+           + png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b""))
+    Path(destination).write_bytes(png)
 
 
 def record_status(player):
@@ -92,6 +232,22 @@ def debug_names(player):
 
 def execute(serial, action, argument=None):
     player = find_player(serial)
+    if action == "plugin-status":
+        print(plugin_status(player))
+        return
+    if action == "plugin-launch":
+        print(plugin_launch(player, argument))
+        return
+    if action == "plugin-exit":
+        plugin_exit(player)
+        print("plugin exit requested")
+        return
+    if action == "screenshot":
+        if not argument:
+            raise ValueError("screenshot requires an output PNG path")
+        screenshot(player, argument)
+        print(f"Saved {LCD_WIDTH}x{LCD_HEIGHT} PNG to {argument}")
+        return
     if action == "debug-list":
         for _, name in debug_names(player):
             print(name)
@@ -137,7 +293,7 @@ def execute(serial, action, argument=None):
     else:
         command = COMMANDS[action]
     address = (player.bus, player.address)
-    player.ctrl_transfer(0x40, REQUEST, command, INDEX, b"", timeout=1000)
+    ep0_transfer(player, 0x40, REQUEST, command, INDEX, b"")
     deadline = time.monotonic() + 35
     while time.monotonic() < deadline:
         time.sleep(0.2)
@@ -165,10 +321,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--serial", required=True, help="USB serial number of the iPod")
     actions = ("status", "debug-list", "debug", *COMMANDS,
-               "record-info", "record-start", "record-stop", "record-fetch")
+               "record-info", "record-start", "record-stop", "record-fetch",
+               "plugin-launch", "plugin-status", "plugin-exit", "screenshot")
     parser.add_argument("command", nargs="?", choices=actions)
     parser.add_argument("name", nargs="?",
-                        help="Debug menu label, recording source, or output WAV path")
+                        help="Debug label, plugin name, recording source or output file")
     parser.add_argument("--format", choices=("wav",), default="wav",
                         help="record-start format (default: wav)")
     args = parser.parse_args()
