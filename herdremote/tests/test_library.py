@@ -121,6 +121,8 @@ class FakeLink:
                 f"MS3 SUMMARY ipod6g\tbuild\t80000000000\t9000000000\t"
                 f"{len(self.rows)}\t51\t1\t0".encode())
             return b"MS3 MORE"
+        if command == b"FILES":
+            return b"MS3 ERR command"
         if command == b"DB":
             self.pending.append(b"MS3 MORE")
             for row in self.rows:
@@ -204,7 +206,7 @@ class LibraryTests(unittest.TestCase):
         link.media_busy = True
         with self.assertRaisesRegex(RuntimeError, "busy"):
             library.tracks(link)
-        self.assertEqual(link.requests, [b"MS3 DB"])
+        self.assertEqual(link.requests, [b"MS3 FILES"])
         link.media_busy = False
         link.send(podlink.TEXT, b"MS3 DB")
         self.assertEqual(link.receive(1).payload, b"MS3 READY")
@@ -328,6 +330,131 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(link.refreshes, 0)
         self.assertEqual(events[-1]["state"], "error")
         self.assertIsNotNone(events[-1]["error"])
+
+
+TAGCACHE_FIXTURE = Path(__file__).parent / "fixtures" / "tagcache"
+
+
+def tagcache_fixture():
+    return {file.name: file.read_bytes() for file in TAGCACHE_FIXTURE.glob("*.tcd")}
+
+
+def fixture_walk():
+    class ReferenceWalk(FakeLink):
+        def library_command(self, command):
+            if command == b"DB":
+                self.pending.extend((TAGCACHE_FIXTURE / "walk.txt").read_bytes().splitlines())
+                return b"MS3 READY"
+            return super().library_command(command)
+    return library.tracks(ReferenceWalk())
+
+
+class BulkLink(FakeLink):
+    def __init__(self, files=None):
+        super().__init__()
+        self.files = tagcache_fixture() if files is None else files
+        self.offset = 0
+        self.selected = None
+        self.manifests = 0
+        self.final_generation = 3
+        self.offset_error = 0
+        self.crc_error = 0
+
+    def send(self, kind, payload):
+        if payload == b"MS3 NEXT" and self.selected is not None:
+            data = self.files[self.selected]
+            if self.offset < len(data):
+                assert not self.frames
+                self.requests.append(payload)
+                chunk = data[self.offset:self.offset + self.max_message - 8]
+                frame = b"MSF1" + struct.pack("<I", self.offset + self.offset_error) + chunk
+                self.frames.append(SimpleNamespace(type=podlink.BINARY, payload=frame))
+                self.offset += len(chunk)
+                return
+        super().send(kind, payload)
+
+    def library_command(self, command):
+        if command == b"FILES":
+            self.manifests += 1
+            generation = 3 if self.manifests == 1 else self.final_generation
+            sizes = "".join(f"\t{name}:{len(data)}" for name, data in self.files.items())
+            return f"MS3 FILES 1\t{generation}\t0\t0{sizes}".encode()
+        if command.startswith(b"FILE "):
+            self.selected = command[5:].decode()
+            self.offset = 0
+            return f"MS3 FILE {len(self.files[self.selected])}".encode()
+        if command == b"NEXT" and self.selected is not None:
+            data = self.files[self.selected]
+            self.selected = None
+            return f"MS3 DONE {len(data)} {zlib.crc32(data) ^ self.crc_error:08x}".encode()
+        if command == b"STOP":
+            self.selected = None
+        return super().library_command(command)
+
+
+class BulkLibraryTests(unittest.TestCase):
+    def test_parser_matches_real_firmware_walk(self):
+        expected = fixture_walk()
+        self.assertEqual(library.parse_tagcache(tagcache_fixture(), expected_commit=1), expected)
+        self.assertEqual(len(expected), 4)
+        self.assertTrue(expected[0].managed)
+        self.assertEqual(expected[1].title, "Pilot")
+
+    def test_deleted_slots_and_unsigned_time(self):
+        files = tagcache_fixture()
+        master = bytearray(files["database_idx.tcd"])
+        # Put invalid seeks in a deleted slot and keep the original live indices.
+        struct.pack_into("<24i", master, 24 + 96, *([-1] * 23), 1)
+        struct.pack_into("<I", master, 24 + 20 * 4, 0xf0000000)
+        struct.pack_into("<i", master, 24 + 15 * 4, 7)
+        files["database_idx.tcd"] = master
+        tracks = fixture_walk()
+        self.assertEqual(library.parse_tagcache(files),
+                         [replace(tracks[0], mtime=0xf0000000, play_count=7), *tracks[2:]])
+
+    def test_rejects_truncated_tag_table(self):
+        files = tagcache_fixture()
+        files["database_4.tcd"] = files["database_4.tcd"][:-1]
+        with self.assertRaises(ValueError):
+            library.parse_tagcache(files)
+
+    def test_bulk_download_verifies_all_files_and_reports_bytes(self):
+        link = BulkLink()
+        link.max_message = 384  # Force the master file across multiple frames.
+        reports = []
+        tracks = library.tracks(link, byte_progress=lambda *event: reports.append(event),
+                                expected_commit=1)
+        self.assertEqual(tracks, fixture_walk())
+        total = sum(map(len, link.files.values()))
+        self.assertEqual(reports[-1], (total, total))
+        self.assertTrue(all(a < b and size == total == next_size
+                            for (a, size), (b, next_size) in zip(reports, reports[1:])))
+        self.assertGreater(len(reports), len(link.files))
+        self.assertEqual(link.manifests, 2)
+        self.assertNotIn(b"MS3 DB", link.requests)
+
+    def test_bad_chunk_or_crc_stops_transfer(self):
+        for error, reason in [("offset_error", "invalid database chunk"),
+                              ("crc_error", "CRC mismatch")]:
+            with self.subTest(error=error):
+                link = BulkLink()
+                setattr(link, error, 1)
+                with self.assertRaisesRegex(RuntimeError, reason):
+                    library.tracks(link)
+                self.assertEqual(link.requests[-1], b"MS3 STOP")
+                self.assertNotIn(b"MS3 DB", link.requests)
+
+    def test_snapshot_changes_are_rejected(self):
+        link = BulkLink()
+        link.final_generation += 1
+        with self.assertRaisesRegex(RuntimeError, "database changed"):
+            library.tracks(link)
+        self.assertEqual(link.manifests, 2)
+
+        link = BulkLink()
+        with self.assertRaisesRegex(RuntimeError, "database changed"):
+            library.tracks(link, expected_commit=2)
+        self.assertEqual(link.requests, [b"MS3 FILES"])
 
 
 if __name__ == "__main__":

@@ -161,7 +161,7 @@ class FakeSession:
         self._delay()
         return self.library.summary_value
 
-    def tracks(self, progress=None):
+    def tracks(self, progress=None, *, byte_progress=None):
         total = len(self.library.tracks_value)
         for done in range(0, total, max(1, total // 8)):
             self._delay(0.02)

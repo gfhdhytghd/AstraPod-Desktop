@@ -51,7 +51,11 @@ class LibraryState(QtCore.QObject):
                     def progress(done):
                         job.check()
                         job.progress(done / total, f"正在读取资料库 {done}/{total}")
-                    tracks = session.tracks(progress)
+                    def byte_progress(done, size):
+                        job.check()
+                        job.progress(done / size, f"正在读取资料库 {done:,}/{size:,} 字节")
+
+                    tracks = session.tracks(progress, byte_progress=byte_progress)
                     library.cache.store(serial, summary.commit_id, tracks)
                 library.remember(serial, summary)
                 return serial, summary, tracks

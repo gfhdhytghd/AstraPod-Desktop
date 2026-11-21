@@ -6,10 +6,12 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
+import re
 from pathlib import Path
 import struct
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 import time
+from zlib import crc32
 
 import podlink
 from hrmediasync import music_tags
@@ -71,19 +73,28 @@ ART_DIMENSIONS = {"list": 44, "coverflow": 128, "wps": 300}
 COUNT_REPLY_TIMEOUT = 30.0
 
 
-def _request(link, command, *, timeout=None):
+class _MS3Error(RuntimeError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__("iPod library: " + reason.decode("ascii", "replace"))
+
+
+def _request(link, command, *, timeout=None, binary=False):
     # Other resident services can announce themselves on the same link.
     link.send(podlink.TEXT, b"MS3 " + command)
     deadline = time.monotonic() + (link.timeout if timeout is None else timeout)
     while (remaining := deadline - time.monotonic()) > 0:
         message = link.receive(remaining)
+        if (binary and message.type == podlink.BINARY
+                and message.payload.startswith(b"MSF1")):
+            return message.payload
         if message.type != podlink.TEXT or not message.payload.startswith(b"MS3 "):
             continue
         if len(message.payload) > 500:
             raise RuntimeError("Oversized MS3 reply")
         reply = message.payload[4:]
         if reply.startswith(b"ERR "):
-            raise RuntimeError("iPod library: " + reply[4:].decode("ascii", "replace"))
+            raise _MS3Error(reply[4:])
         return reply
     raise TimeoutError("iPod library reply timed out")
 
@@ -147,7 +158,163 @@ def _track_from_data(record):
     return DeviceTrack(index, *strings, *values, _parse_bool(fields[20]))
 
 
-def tracks(link: podlink.Link, progress=None) -> list[DeviceTrack]:
+# TCH10 on-disk layout from apps-ipod/database/tagcache.{c,h}.
+_MASTER = "database_idx.tcd"
+_TEXT_TAGS = (4, 3, 0, 1, 7, 2, 5, 8, 6)
+_NUMERIC_TAGS = (9, 10, 11, 14, 13, 15, 16, 17, 18, 20)
+_TAG_FILES = {tag: f"database_{tag}.tcd" for tag in (*_TEXT_TAGS, 12)}
+_DATABASE_FILES = {_MASTER, *_TAG_FILES.values()}
+_MAGIC = 0x54434810
+_MASTER_HEADER = 24
+_TAG_HEADER = 12
+_EPISODE_DATE = re.compile(rb" \([0-9]{4}-[0-9]{2}-[0-9]{2}\)\Z")
+
+
+def _managed_path(path):
+    if path.startswith(b"/<HDD0>/"):
+        path = path[7:]
+    prefix = b"/music/podlink/"
+    return (path.lower().startswith(prefix)
+            and not any(c in path for c in (b"\\", b":", b"<", b">"))
+            and all(part not in (b"", b".", b"..")
+                    for part in path[len(prefix):].split(b"/")))
+
+
+def _tag_table(data, endian):
+    magic, size, count = struct.unpack_from(endian + "3i", data)
+    if magic != _MAGIC or size != len(data) - _TAG_HEADER or count < 0:
+        raise ValueError("invalid tag table header")
+    offset = _TAG_HEADER
+    tags = {}
+    for _ in range(count):
+        length, _index = struct.unpack_from(endian + "2i", data, offset)
+        start = offset + 8
+        end = start + length
+        if length < 0 or end > len(data):
+            raise ValueError("invalid tag length")
+        # The length includes the terminator and any alignment padding.
+        tags[offset] = bytes(data[start:end]).split(b"\0", 1)[0]
+        offset = end
+    if offset != len(data):
+        raise ValueError("tag table length mismatch")
+    return tags
+
+
+def parse_tagcache(files, *, expected_commit=None) -> list[DeviceTrack]:
+    """Decode a complete TCH10 file set into MS3 walk records."""
+    try:
+        master = files[_MASTER]
+        endian = "<" if int.from_bytes(master[:4], "little") == _MAGIC else ">"
+        magic, _size, count, _serial, commit, dirty = struct.unpack_from(
+            endian + "6i", master)
+        entry = struct.Struct(endian + "24i")  # 23 tag slots plus flags
+        if (magic != _MAGIC or dirty or count < 0
+                or len(master) != _MASTER_HEADER + count * entry.size):
+            raise ValueError("invalid TCH10 master index")
+        if expected_commit is not None and commit != expected_commit:
+            raise ValueError("database changed")
+
+        tables = {tag: _tag_table(files[_TAG_FILES[tag]], endian) for tag in _TEXT_TAGS}
+        # db_spoken_build keeps only the first 64 matching genres, in file order.
+        spoken = []
+        for seek, genre in tables[2].items():
+            genre = genre.lower()
+            if (genre in (b"book", b"books", b"spoken", b"speech", b"non-music",
+                          b"nonmusic", b"podcast", b"podcasts")
+                    or any(name in genre for name in (b"audiobook", b"audio book", b"spoken word"))):
+                spoken.append((seek, genre))
+                if len(spoken) == 64:
+                    break
+        podcasts = {seek for seek, genre in spoken if genre in (b"podcast", b"podcasts")}
+
+        result = []
+        for index, row in enumerate(entry.iter_unpack(memoryview(master)[_MASTER_HEADER:])):
+            if row[-1] & 1:  # FLAG_DELETED: string slots now contain hashes.
+                continue
+            fields = [tables[tag][row[tag]] for tag in _TEXT_TAGS]
+            if row[2] in podcasts:
+                fields[1] = _EPISODE_DATE.sub(b"", fields[1])
+            strings = [value.decode("utf-8", "surrogateescape") for value in fields]
+            numeric = [row[tag] for tag in _NUMERIC_TAGS]
+            numeric[-1] &= 0xffffffff  # mtime is unsigned on the wire
+            result.append(DeviceTrack(index, *strings, *numeric, _managed_path(fields[0])))
+        return result
+    except (KeyError, struct.error) as error:
+        raise ValueError("missing or truncated tagcache data") from error
+
+
+def _manifest(reply):
+    if not reply.startswith(b"FILES "):
+        raise ValueError("expected a database manifest")
+    commit, generation, removed, stats, *entries = reply[6:].decode("ascii").split("\t")
+    files = {}
+    for entry in entries:
+        name, size = entry.split(":")
+        if name not in _DATABASE_FILES or name in files or not 0 < int(size) <= 0xffffffff:
+            raise ValueError("invalid database file")
+        files[name] = int(size)
+    if files.keys() != _DATABASE_FILES:
+        raise ValueError("incomplete database manifest")
+    return (int(commit), int(generation), int(removed), int(stats)), files
+
+
+def _bulk_tracks(link, manifest, byte_progress, expected_commit):
+    snapshot, sizes = _manifest(manifest)
+    if expected_commit is not None and snapshot[0] != expected_commit:
+        raise ValueError("database changed")
+    files = {}
+    done, total = 0, sum(sizes.values())
+    for name, size in sizes.items():
+        complete = False
+        try:
+            opened = _request(link, b"FILE " + name.encode("ascii"))
+            if opened != f"FILE {size}".encode("ascii"):
+                raise ValueError("database file length changed")
+            data = bytearray()
+            crc = 0
+            while True:
+                reply = _request(link, b"NEXT", binary=True)
+                if reply.startswith(b"MSF1"):
+                    if (not 8 < len(reply) <= link.max_message
+                            or struct.unpack_from("<I", reply, 4)[0] != len(data)
+                            or len(data) + len(reply) - 8 > size):
+                        raise ValueError("invalid database chunk")
+                    chunk = reply[8:]
+                    data.extend(chunk)
+                    crc = crc32(chunk, crc)
+                    done += len(chunk)
+                    if byte_progress is not None:
+                        byte_progress(done, total)
+                else:
+                    if len(data) != size or reply != f"DONE {size} {crc:08x}".encode("ascii"):
+                        raise ValueError("database file length or CRC mismatch")
+                    complete = True
+                    break
+            files[name] = data
+        finally:
+            if not complete:
+                _stop(link)
+    if _manifest(_request(link, b"FILES")) != (snapshot, sizes):
+        raise ValueError("database changed")
+    return parse_tagcache(files, expected_commit=snapshot[0])
+
+
+def tracks(link: podlink.Link, progress=None, *, byte_progress=None,
+           expected_commit=None) -> list[DeviceTrack]:
+    """Read a snapshot. Progress callbacks receive tracks (walk) or bytes (bulk)."""
+    try:
+        manifest = _request(link, b"FILES")
+    except _MS3Error as error:
+        if error.reason != b"command":
+            raise
+        return _walk_tracks(link, progress)
+    try:
+        return _bulk_tracks(link, manifest, byte_progress, expected_commit)
+    except ValueError as error:
+        raise RuntimeError(f"Invalid iPod library snapshot: {error}") from error
+
+
+def _walk_tracks(link, progress=None):
     if _request(link, b"DB") != b"READY":
         raise RuntimeError("Invalid iPod library walk reply")
     result = []

@@ -66,12 +66,16 @@ class LibrarySession:
         self.module = module
         self.link = link
         self.identity = identity
+        self.commit_id = None
 
     def summary(self):
-        return self.module.summary(self.link)
+        summary = self.module.summary(self.link)
+        self.commit_id = summary.commit_id
+        return summary
 
-    def tracks(self, progress=None):
-        return self.module.tracks(self.link, progress)
+    def tracks(self, progress=None, *, byte_progress=None):
+        return self.module.tracks(self.link, progress, byte_progress=byte_progress,
+                                  expected_commit=self.commit_id)
 
     def detail(self, track):
         return self.module.detail(self.link, track)
