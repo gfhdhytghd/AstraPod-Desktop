@@ -1,0 +1,334 @@
+"""Offline MS3 library and MS1 import contracts."""
+from base64 import b64encode
+from collections import deque
+from dataclasses import astuple, replace
+import json
+from pathlib import Path
+import struct
+import sys
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+import zlib
+
+TOOLS = Path(__file__).resolve().parents[2]
+sys.path[:0] = [str(TOOLS), str(TOOLS / "herdremote")]
+
+import hrlibrary as library
+import podlink
+
+
+TRACK = library.DeviceTrack(
+    17, "/<HDD0>/Music/PodLink/Jellyfin/東京 song.flac",
+    "夜の音", "Artist; Guest", "Album", "Artist", "Jazz", "Composer", "Group",
+    "Line one\twith tabs\r\n" + "星" * 133, 2004, 2, 3, 85_000, 925,
+    5, 7, 215_000, 33, 2_200_000_000, True)
+
+
+def chunks(data):
+    for offset in range(0, len(data), 366):
+        end = offset + 366
+        flag = b"." if end >= len(data) else b"+"
+        yield b"MS3 DATA " + flag + b" " + b64encode(data[offset:end])
+
+
+def record(track):
+    return b"\0".join(
+        str(int(field) if isinstance(field, bool) else field)
+        .encode("utf-8", "surrogateescape")
+        for field in astuple(track)
+    ) + b"\0"
+
+
+class FakeLink:
+    max_message = 512
+    timeout = 1
+
+    def __init__(self, rows=(TRACK,)):
+        self.rows = list(rows)
+        self.requests = []
+        self.frames = deque()
+        self.pending = deque()
+        self.media_busy = False
+        self.changed = False
+        self.art_reply = b"MS3 NOART"
+        self.art_pixels = b""
+        self.refreshes = 0
+        self.stored = []
+        self.next_upload_error = None
+        self.incoming = None
+        self.stops = 0
+
+    def send(self, kind, payload):
+        assert not self.frames
+        if isinstance(payload, str):
+            payload = payload.encode()
+        self.requests.append(payload)
+        reply = self.command(kind, payload)
+        assert len(reply) <= 500
+        self.frames.append(SimpleNamespace(type=podlink.TEXT, payload=reply))
+
+    def receive(self, timeout):
+        return self.frames.popleft()
+
+    def command(self, kind, payload):
+        if kind == podlink.BINARY:
+            assert payload.startswith(b"MSD1") and self.incoming is not None
+            self.incoming.extend(payload[4:])
+            error, self.next_upload_error = self.next_upload_error, None
+            return error or b"MS1 ACK"
+        if payload.startswith(b"MS3 "):
+            return self.library_command(payload[4:])
+        if self.pending:
+            return payload[:3] + b" ERR busy"
+        if payload == b"MS1 REFRESH":
+            self.refreshes += 1
+            return b"MS1 QUEUED"
+        if payload.startswith(b"MS1 PUT "):
+            _, _, size, crc, self.incoming_name = payload.split()
+            self.incoming_size = int(size, 16)
+            self.incoming_crc = int(crc, 16)
+            self.incoming = bytearray()
+            return b"MS1 READY"
+        if payload == b"MS1 END":
+            assert len(self.incoming) == self.incoming_size
+            assert zlib.crc32(self.incoming) == self.incoming_crc
+            self.stored.append(bytes(self.incoming))
+            self.incoming = None
+            return b"MS1 STORED"
+        if payload == b"MS1 STOP":
+            self.stops += 1
+            self.incoming = None
+            return b"MS1 STOPPED"
+        raise AssertionError(payload)
+
+    def library_command(self, command):
+        if self.media_busy:
+            return b"MS3 ERR busy"
+        if command == b"STOP":
+            self.pending.clear()
+            return b"MS3 STOPPED"
+        if command == b"NEXT" and self.pending:
+            if self.changed:
+                self.pending.clear()
+                return b"MS3 ERR database changed"
+            return self.pending.popleft()
+        if self.pending:
+            return b"MS3 ERR busy"
+        if command == b"SUMMARY":
+            self.pending.append(
+                f"MS3 SUMMARY ipod6g\tbuild\t80000000000\t9000000000\t"
+                f"{len(self.rows)}\t51\t1\t0".encode())
+            return b"MS3 MORE"
+        if command == b"DB":
+            self.pending.append(b"MS3 MORE")
+            for row in self.rows:
+                self.pending.extend(chunks(record(row)))
+            self.pending.append(b"MS3 END")
+            return b"MS3 READY"
+        if command.startswith(b"DETAIL "):
+            assert command[7:] == TRACK.path.encode()
+            return b"MS3 DETAIL 2389102\tFLAC\t44100\t2\t1"
+        if command.startswith(b"ART "):
+            assert command.split(b" ", 2)[2] == TRACK.path.encode()
+            self.pending.extend(chunks(self.art_pixels))
+            return self.art_reply
+        if command.startswith(b"DEL "):
+            path = command[4:].decode("utf-8")
+            if ".." in path.split("/") or not path.startswith("/<HDD0>/Music/PodLink/"):
+                return b"MS3 ERR unmanaged path"
+            self.rows = [row for row in self.rows if row.path != path]
+            return b"MS3 DELETED"
+        raise AssertionError(command)
+
+
+class LibraryTests(unittest.TestCase):
+    def test_summary_continues_and_ignores_unrelated_frames(self):
+        class ResidentLink(FakeLink):
+            def send(self, kind, payload):
+                super().send(kind, payload)
+                self.frames.appendleft(
+                    SimpleNamespace(type=podlink.TEXT, payload=b"CAPS other"))
+
+        self.assertEqual(library.summary(ResidentLink()),
+                         library.DeviceSummary("ipod6g", "build", 80_000_000_000,
+                                               9_000_000_000, 1, 51, True))
+
+    def test_summary_reports_database_busy(self):
+        class BusyDatabase(FakeLink):
+            def library_command(self, command):
+                assert command == b"SUMMARY"
+                return b"MS3 SUMMARY ipod6g\tbuild\t8192\t4096\t0\t51\t0\t1"
+
+        result = library.summary(BusyDatabase())
+        self.assertFalse(result.database_ready)
+        self.assertEqual(result.track_count, 0)
+
+    def test_summary_allows_slow_count_replies(self):
+        class SlowCount(FakeLink):
+            timeout = 10
+
+            def receive(self, timeout):
+                if timeout < 15:
+                    raise TimeoutError("slow count")
+                return super().receive(timeout)
+
+        link = SlowCount()
+        self.assertEqual(library.summary(link).track_count, 1)
+        self.assertEqual(link.requests, [b"MS3 SUMMARY", b"MS3 NEXT"])
+
+    def test_multi_reply_track_records_and_progress(self):
+        other = replace(TRACK, index=31, title="Malformed tag\udcff",
+                        path="/Music/song.mp3", managed=False)
+        link = FakeLink([TRACK, other])
+        received = []
+        self.assertGreater(len(record(TRACK)), 500)
+        self.assertEqual(library.tracks(link, received.append), [TRACK, other])
+        self.assertEqual(received, [1, 2])
+        self.assertNotIn(b"MS3 STOP", link.requests)
+
+    def test_db_changes_mid_walk(self):
+        link = FakeLink([TRACK, replace(TRACK, index=18)])
+
+        def change_database(done):
+            self.assertEqual(done, 1)
+            link.changed = True
+
+        with self.assertRaisesRegex(RuntimeError, "database changed"):
+            library.tracks(link, change_database)
+        self.assertEqual(link.requests[-1], b"MS3 STOP")
+
+    def test_busy_interlock(self):
+        link = FakeLink()
+        link.media_busy = True
+        with self.assertRaisesRegex(RuntimeError, "busy"):
+            library.tracks(link)
+        self.assertEqual(link.requests, [b"MS3 DB"])
+        link.media_busy = False
+        link.send(podlink.TEXT, b"MS3 DB")
+        self.assertEqual(link.receive(1).payload, b"MS3 READY")
+        for command in (b"MS1 REFRESH", b"MS2 LIST"):
+            link.send(podlink.TEXT, command)
+            self.assertEqual(link.receive(1).payload, command[:3] + b" ERR busy")
+
+    def test_detail_and_delete(self):
+        link = FakeLink()
+        self.assertEqual(library.detail(link, TRACK),
+                         library.TrackDetail(2389102, "FLAC", 44100, 2, True))
+        with self.assertRaisesRegex(ValueError, "PodLink"):
+            library.delete(link, replace(TRACK, managed=False))
+        with self.assertRaisesRegex(RuntimeError, "unmanaged path"):
+            library.delete(link, replace(TRACK, path=TRACK.path + "/../test"))
+        self.assertEqual(link.refreshes, 0)
+        library.delete(link, TRACK)
+        self.assertEqual(link.refreshes, 1)
+        self.assertEqual(link.rows, [])
+
+    def test_artwork_columns_and_rows(self):
+        red, green, blue = 0xf800, 0x07e0, 0x001f
+        white, black, yellow = 0xffff, 0, 0xffe0
+        expected = bytes.fromhex("ff0000 00ff00 0000ff ffffff 000000 ffff00")
+        link = FakeLink()
+        link.art_reply = b"MS3 ART 3 2 columns"
+        link.art_pixels = struct.pack("<6H", red, white, green, black, blue, yellow)
+        self.assertEqual(library.artwork(link, TRACK), library.Artwork(3, 2, expected))
+        link.art_reply = b"MS3 ART 3 2 rows"
+        link.art_pixels = struct.pack("<6H", red, green, blue, white, black, yellow)
+        self.assertEqual(library.artwork(link, TRACK, "list"),
+                         library.Artwork(3, 2, expected))
+
+    def test_artwork_multiple_replies(self):
+        link = FakeLink()
+        link.art_reply = b"MS3 ART 20 20 rows"
+        link.art_pixels = struct.pack("<H", 0x001f) * 400
+        self.assertEqual(library.artwork(link, TRACK, "list").rgb888,
+                         b"\0\0\xff" * 400)
+        self.assertEqual(link.requests.count(b"MS3 NEXT"), 3)
+
+    def test_artwork_missing_and_placeholder(self):
+        link = FakeLink()
+        self.assertIsNone(library.artwork(link, TRACK))
+        link.art_reply = b"MS3 PLACEHOLDER"
+        self.assertIsNone(library.artwork(link, TRACK))
+        self.assertEqual(len(link.requests), 2)
+
+    def test_artwork_rejects_truncated_stream(self):
+        link = FakeLink()
+        link.art_reply = b"MS3 ART 3 2 rows"
+        link.art_pixels = b"\0\0"
+        with self.assertRaisesRegex(RuntimeError, "Invalid iPod artwork"):
+            library.artwork(link, TRACK)
+
+    def test_cache_is_keyed_by_serial_and_commit(self):
+        with TemporaryDirectory() as directory:
+            cache = library.LibraryCache(Path(directory))
+            cache.store("../device", 51, [TRACK])
+            self.assertEqual(cache.load("../device", 51), [TRACK])
+            self.assertIsNone(cache.load("other device", 51))
+            self.assertIsNone(cache.load("../device", 52))
+            first = cache.art_path("../device", TRACK, "list")
+            self.assertEqual(first.suffix, ".png")
+            self.assertTrue(first.is_relative_to(directory))
+            self.assertNotEqual(first, cache.art_path("../device", TRACK, "wps"))
+            self.assertNotEqual(first, cache.art_path("other", TRACK, "list"))
+
+
+def probe(*args):
+    if "format_tags" not in args[args.index("-show_entries") + 1]:
+        return json.dumps({"streams": [{"sample_rate": "44100", "codec_name": "flac"}]})
+    name = Path(args[-1]).stem
+    return json.dumps({"format": {"duration": "85.4", "tags": {
+        "TITLE": TRACK.title if name == "device-copy" else "New cut",
+        "ARTIST": "guest; artist",
+        "ALBUM": TRACK.album,
+        "DISC": "2/4",
+        "TRACK": "3/12",
+    }}, "streams": [{}]})
+
+
+class ImportTests(unittest.TestCase):
+    def test_duplicate_skip_before_upload_and_one_refresh(self):
+        link, events = FakeLink(), []
+        with TemporaryDirectory() as work, patch.object(podlink, "media_command", probe):
+            paths = [Path(work) / (name + ".flac") for name in
+                     ("device-copy", "new", "batch-copy")]
+            for path in paths:
+                path.write_bytes(b"music" * 600)
+            stored = library.import_files(link, paths, events.append)
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["source"], str(paths[1]))
+        self.assertEqual(link.stored, [b"music" * 600])
+        self.assertEqual(link.refreshes, 1)
+        self.assertEqual(link.requests.count(b"MS3 DB"), 1)
+        self.assertEqual([event["state"] for event in events],
+                         ["probe", "skip", "probe", "upload", "done", "probe", "skip"])
+        self.assertEqual(events[4]["sent"], 3000)
+        self.assertEqual(events[4]["total"], 3000)
+
+    def test_duplicate_check_can_be_disabled(self):
+        link, events = FakeLink(), []
+        with TemporaryDirectory() as work, patch.object(podlink, "media_command", probe):
+            path = Path(work) / "device-copy.flac"
+            path.write_bytes(b"music")
+            library.import_files(link, [path], events.append, skip_duplicates=False)
+        self.assertEqual(link.stored, [b"music"])
+        self.assertEqual(link.refreshes, 1)
+        self.assertNotIn(b"MS3 DB", link.requests)
+
+    def test_failed_upload_stops_transfer_and_reports_error(self):
+        link, events = FakeLink(), []
+        link.next_upload_error = b"MS1 ERR write"
+        with TemporaryDirectory() as work, patch.object(podlink, "media_command", probe):
+            path = Path(work) / "new.flac"
+            path.write_bytes(b"music")
+            with self.assertRaisesRegex(RuntimeError, "ERR write"):
+                library.import_files(link, [path], events.append)
+        self.assertEqual(link.stops, 1)
+        self.assertEqual(link.refreshes, 0)
+        self.assertEqual(events[-1]["state"], "error")
+        self.assertIsNotNone(events[-1]["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -85,3 +85,29 @@ def test_cli_waits_for_volume(tmp_path):
     finally:
         thread.join()
         server.close()
+
+
+def test_serial_lease_releases_on_disconnect_and_refuses_second_owner(tmp_path):
+    tmp_path.chmod(0o700)
+    relinquish = Mock()
+    control = hrdisk.Control(str(tmp_path / 'disk.sock'), release_serial=relinquish)
+    control.start()
+    try:
+        with socket.socket(socket.AF_UNIX) as first, socket.socket(socket.AF_UNIX) as second:
+            first.settimeout(1)
+            first.connect(control.path)
+            first.sendall(hrdisk.BORROW_SERIAL)
+            control.poll(None)
+            assert first.recv(64) == b'0 serial released\n'
+            assert control.serial_lease is not None
+
+            second.settimeout(1)
+            second.connect(control.path)
+            second.sendall(hrdisk.BORROW_SERIAL)
+            control.poll(None)
+            assert second.recv(64) == b'5 serial already borrowed\n'
+            relinquish.assert_called_once()
+        control.poll(None)
+        assert control.serial_lease is None
+    finally:
+        control.close()

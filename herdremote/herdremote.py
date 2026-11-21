@@ -14,6 +14,8 @@ Dependencies: Python 3.9+, pyserial. Logs go to stdout.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+import copy
+from functools import lru_cache
 import logging
 import os
 import queue
@@ -28,13 +30,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import podlink  # noqa: E402  tools/podlink.py: the PodLink frame codec
 
 import hrdisk
+import hragent
+import hrdesktop
 import hrfallback
 import hrdetect  # noqa: E402
 import hrdetail  # noqa: E402
 import hrherdr  # noqa: E402
 import hrorder  # noqa: E402
 import hrproto  # noqa: E402
-import hrusage  # noqa: E402
+import hrt3  # noqa: E402
 import hrvoice  # noqa: E402
 import hrkeys  # noqa: E402
 import hrusagekeys  # noqa: E402
@@ -77,10 +81,12 @@ def find_device(ports, device=DEVICE):
 class Answerer(threading.Thread):
     """Answers questions off the link thread: keys, then re-reads to confirm."""
 
-    def __init__(self, herdr, results, changed):
+    def __init__(self, herdr, results, changed, desktop_results=None):
         super().__init__(daemon=True)
         self.herdr, self.results, self.changed = herdr, results, changed
+        self.desktop_results = desktop_results
         self.jobs = queue.Queue()
+        self.available = lambda: True
 
     def run(self):
         while True:
@@ -91,10 +97,14 @@ class Answerer(threading.Thread):
                 ok, text = False, str(error)
             log.info("answer %s pane=%s option=%s: %s %s", question["id"],
                      question["pane"], number, "ok" if ok else "failed", text)
-            self.results.put((req, ok, text))
+            desktop = isinstance(req, int) and req < 0
+            results = self.desktop_results if desktop else self.results
+            results.put((req, ok, text))
             self.changed.set()
 
     def current(self, pane):
+        if not self.available():
+            raise hrherdr.HerdrError("herdr control is off")
         text = self.herdr.read(pane)
         q = hrdetect.find_question(text)
         return q, hrdetect.question_id(pane, q) if q else None
@@ -105,6 +115,8 @@ class Answerer(threading.Thread):
         if qid != question["id"]:
             return False, "The question has changed"
         if q["method"] == "codex-queued":
+            if not self.available():
+                return False, "herdr control is off"
             self.herdr.send_keys(pane, ["shift+left"])
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
@@ -117,6 +129,8 @@ class Answerer(threading.Thread):
                 return False, "Codex did not open the question"
         keys = hrdetect.answer_keys(q, number)
         before = hrdetect.question_id(pane, q)
+        if not self.available():
+            return False, "herdr control is off"
         self.herdr.send_keys(pane, keys)
         custom = number in q.get("custom", [])
         deadline = time.monotonic() + CONFIRM_SECONDS
@@ -173,15 +187,17 @@ class Daemon:
         self.order = hrorder.Order(args.state)
         self.changed = threading.Event()
         self.results = queue.Queue()
-        self.answerer = Answerer(self.herdr, self.results, self.changed)
-        self.model = dict(workspaces=[], agents={}, others={}, questions={},
-                          tabs={}, tab_agents={}, panes=set(), pane_meta={})
+        self.desktop_results = queue.Queue()
+        self.answerer = Answerer(self.herdr, self.results, self.changed, self.desktop_results)
+        self.answerer.available = lambda: self.agents.control == "herdr"
+        self.model = hrherdr.empty_model()
         self.state_seen = {}
         self.model_time = 0.0
         self.herdr_ok = False
         self.port = self.link = None
+        self.link_serial = None
+        self.link_device = None
         self.stopping = threading.Event()
-        self.usage = hrusage.UsageCache()
         self.keys = hrkeys.KeyTaps(hrkeys.KeyTool(getattr(args, "key_tool", None)),
                                   key_scale=getattr(args, "key_scale", None))
         self.usage_keys = hrusagekeys.UsageKeys(self.keys, lambda:
@@ -195,16 +211,25 @@ class Daemon:
             voice_max_hold=getattr(args, "voice_max_hold", 120),
             voice_method=getattr(args, "voice_method", "HoldStart"))
         self.reader = None
+        self.watcher = None
         self.model_job = self.detail_job = None
         self.model_key = None
         self.next_refresh = 0.0
         self.sessions = hrsession.Sessions()
         self.appserver = hrappserver.Reader()
         self.cider = None
+        self.agents = hragent.Agents()
+        self.usage = hrt3.Usage(self.agents.client)
+        self.t3_focus_worker = None
+        self.t3_focus_job = None
+        self.desktop = hrdesktop.Server(self)
+        self.voice_worker = None
+        self.voice_jobs = {}
         self.remote_log = hrremotelog.Writer()
         self.ir_fallback = hrfallback.Executor(self.keys, self.voice)
         self.disk_control = hrdisk.Control(getattr(args, "disk_control_socket", None),
-                                          fallback=self.ir_fallback)
+                                          fallback=self.ir_fallback,
+                                          release_serial=self.close_link)
         self.reset_session()
 
     def reset_session(self):
@@ -212,13 +237,17 @@ class Daemon:
         self.session_generation = getattr(self, "session_generation", 0) + 1
         self.keys.reset()
         if not getattr(self, "ir_fallback", None) or not self.ir_fallback.talking:
-            self.voice.stop()
+            self.stop_voice()
         self.sent_ws = None
+        self.pending_usage = False
         self.sent_status = None
         self.sent_agents = None
         self.sent_tabs = None
         self.sent_questions = {}
         self.question_ext = False
+        self.t3_player = False
+        self.t3_focus_pending = None
+        self.agents.reset()
         self.custom_pending = {}
         self.custom_input = None
         self.subscribed = None
@@ -240,17 +269,63 @@ class Daemon:
         self.usage_keys.update(False)
 
     # --- herdr ---------------------------------------------------------
+    @property
+    def player_t3(self):
+        return self.agents.control == "t3" and self.t3_player
+
+    def configure_agents(self, settings):
+        previous = self.agents.control
+        self.agents.configure(settings)
+        if self.agents.control == previous:
+            return
+        self.session_generation += 1
+        self.agents.reset()
+        self.t3_focus_pending = None
+        self.stop_voice(discard=True)
+        self.desktop.voice_owner = None
+        self.keys.reset()
+        self.usage_keys.update(False)
+        self.custom_pending.clear()
+        self.custom_input = None
+        self.key_details.clear()
+        self.subscribed = self.subscribed_tab = self.detail_pane = self.detail_keys_pane = None
+        self.sent_agents = self.sent_tabs = self.sent_detail = self.sent_detail_key = None
+        self.pending_detail = None
+        self.detail_fast_due = None
+        self.next_detail = self.next_tick = self.next_refresh = 0
+        self.model = hrherdr.empty_model()
+        self.state_seen.clear()
+        self.model_time = time.monotonic()
+        self.herdr_ok = False
+        self.desktop.focused_tab = None
+        self.desktop.dismissed.clear()
+
+    def update_herdr_watcher(self):
+        if self.watcher is not None:
+            self.watcher.stopping.set()
+            self.watcher = None
+        if self.reader is not None and self.agents.control == "herdr":
+            self.watcher = hrherdr.Watcher(self.herdr, self.changed)
+            self.watcher.start()
+
+    def set_input_plugins(self, plugins):
+        """Publish Interface 3 status dictionaries on the daemon thread."""
+        self.desktop.plugins = copy.deepcopy(plugins)
+
     def refresh(self):
         """Synchronous refresh for --once and host callers; run uses a worker."""
+        if self.agents.control != "herdr":
+            return
         self.apply_model(self.read_model(self.herdr, self.subscribed,
                                          self.subscribed_tab, not self.herdr_ok))
 
-    def read_model(self, client, workspace, tab, probe):
+    def read_model(self, client, workspace, tab, probe, desktop_tab=None):
         try:
             if probe:
                 client.detect_capabilities()
             snapshot = client.snapshot()
 
+            @lru_cache(maxsize=None)
             def read(pane):
                 if self.stopping.is_set():
                     raise hrherdr.HerdrError("herdremote stopping")
@@ -259,6 +334,8 @@ class Daemon:
             if self.stopping.is_set():
                 return None, time.monotonic(), "herdremote stopping"
             model = hrherdr.build_model(snapshot, read, workspace, tab)
+            if desktop_tab and desktop_tab != (workspace, tab):
+                model["desktop"] = hrherdr.build_model(snapshot, read, *desktop_tab)
             if self.stopping.is_set():
                 return None, time.monotonic(), "herdremote stopping"
             return self.order.apply(model), time.monotonic(), None
@@ -273,7 +350,7 @@ class Daemon:
             if session and (session[1] not in model['panes'] or any(
                     q['pane'] == session[1] and q['id'] != session[0]
                     for q in model['questions'].values())):
-                self.voice.stop()
+                self.stop_voice()
                 self.keys.reset()
                 self.custom_input = None
                 self.detail_keys_pane = None
@@ -396,7 +473,7 @@ class Daemon:
         previous, self.foreground = self.foreground, value
         self.detail_edit_revision += 1  # Reject a read begun in another visibility epoch.
         if value in (0, 2):
-            self.voice.stop()
+            self.stop_voice()
         if value == 1 and previous in (0, 2):
             # Keep subscriptions and the last sent picture; only changes go out.
             self.next_detail = 0.0
@@ -412,8 +489,13 @@ class Daemon:
         Each worker owns its Herdr client, so probes cannot change the focus
         connection's capabilities. Stale subscription/session results are dropped.
         """
+        if self.agents.control != "herdr":
+            return
         self.flush_detail()
+        desktop_tab = self.desktop.focused_tab if self.desktop.subscribed else None
         key = (self.session_generation, self.subscribed, self.subscribed_tab)
+        extra = (desktop_tab,) if desktop_tab else ()
+        key += extra
         if self.model_job and self.model_job[1].done():
             requested, future = self.model_job
             self.model_job = None
@@ -437,10 +519,11 @@ class Daemon:
             client = hrherdr.Herdr(self.herdr.path, self.herdr.timeout)
             self.model_job = (key, self.reader.submit(
                 self.read_model, client, self.subscribed, self.subscribed_tab,
-                not self.herdr_ok))
+                not self.herdr_ok, *extra))
         due = self.detail_fast_due if self.detail_fast_due is not None else self.next_detail
         if (self.foreground in (None, 1) and
                 self.sent_ws is not None and self.detail_pane and
+                not hragent.THREAD.fullmatch(self.detail_pane) and
                 self.detail_job is None and now >= due):
             pane = self.detail_pane
             self.detail_fast_due = None
@@ -470,6 +553,8 @@ class Daemon:
             self.close_link()
             return False
         log.info("PodLink session open on %s", device)
+        self.link_device = device
+        self.link_serial = DEVICE["serial"] if not self.args.port else None
         self.reset_session()
         self.send(hrproto.hello(VERSION))
         self.send(hrhandoff.CAPABILITY)
@@ -496,25 +581,28 @@ class Daemon:
     def send(self, payload):
         self.link.send(podlink.TEXT, payload)
 
+    def complete_answer(self, result, model):
+        pending = self.custom_pending.pop(result[0], None)
+        if pending and result[1]:
+            valid = pending[2] == self.session_generation and not any(
+                q['pane'] == pending[1] and q['id'] != pending[0]
+                for q in model['questions'].values())
+            if not valid:
+                return result[0], False, "The question has changed"
+            self.custom_input = pending[:2]
+            self.sent_detail_key = None
+            self.detail_edit_revision += 1
+            self.next_detail = 0
+        return result
+
     def flush_replies(self):
         """Publish replies before adopting reads that may predate a key batch."""
+        self.agents.flush(self)
+        self.pump_t3_focus()
         if self.sent_ws is None:
             return
         while not self.results.empty():
-            result = self.results.get()
-            pending = self.custom_pending.pop(result[0], None)
-            if pending and result[1]:
-                valid = pending[2] == self.session_generation and not any(
-                    q['pane'] == pending[1] and q['id'] != pending[0]
-                    for q in self.model['questions'].values())
-                if valid:
-                    self.custom_input = pending[:2]
-                    self.sent_detail_key = None
-                    self.detail_edit_revision += 1
-                    self.next_detail = 0
-                else:
-                    result = (result[0], False, "The question has changed")
-            self.send(hrproto.result(*result))
+            self.send(hrproto.result(*self.complete_answer(self.results.get(), self.model)))
         for result in self.keys.replies():
             self.send(hrproto.result(*result))
             target = self.key_details.pop(result[0], None)
@@ -529,10 +617,15 @@ class Daemon:
             return  # no Agents client has introduced itself
         self.flush_detail()
         self.flush_replies()
-        if not self.model_time:
+        t3_mode = self.agents.control == "t3"
+        if not t3_mode and not self.model_time:
             return  # do not present an empty startup model while a read is pending
-        ws = hrproto.workspaces(self.model["workspaces"])
-        st = hrproto.status(self.model["workspaces"])
+        picture = self.agents.client.snapshot() if self.player_t3 else ({}, {}, {})
+        limit = self.detail_limit()
+        spaces = self.agents.workspaces(picture) if t3_mode else self.model["workspaces"]
+        ws = hrproto.workspaces(spaces, limit)
+        # The legacy W encoder can fit fewer rows when the link cap is small.
+        st = hrproto.status(spaces[:int(hrproto.decode(ws)[0][1])], limit)
         if ws != self.sent_ws:
             self.send(ws)
             self.sent_ws = ws
@@ -541,30 +634,59 @@ class Daemon:
             self.send(st)
             self.sent_status = st
         if self.subscribed:
-            tabs = self.model["tabs"].get(self.subscribed, [])
-            payload = hrproto.tabs(self.subscribed, tabs)
+            if hragent.PROJECT.fullmatch(self.subscribed):
+                tabs, rows = self.agents.tab_rows(picture, self.subscribed, self.subscribed_tab)
+            else:
+                tabs = self.model["tabs"].get(self.subscribed, [])
+                tid = self.subscribed_tab or (tabs[0]["id"] if tabs else None)
+                rows = self.model["tab_agents"].get(tid, []) if any(
+                    t["id"] == tid for t in tabs) else []
+            payload = hrproto.tabs(self.subscribed, tabs, limit)
             if payload != self.sent_tabs:
                 self.send(payload)
                 self.sent_tabs = payload
-            tid = self.subscribed_tab or (tabs[0]["id"] if tabs else None)
-            rows = self.model["tab_agents"].get(tid, []) if any(
-                t["id"] == tid for t in tabs) else []
-            payload = hrproto.agents(self.subscribed, rows)
+            payload = hrproto.agents(self.subscribed, rows, limit)
             if payload != self.sent_agents:
                 self.send(payload)
                 self.sent_agents = payload
-        current = self.model["questions"]
+        current = (self.agents.questions(picture, self.question_ext) if t3_mode else
+                   list(self.model["questions"].values()))
+        current.sort(key=lambda q: q.get("asked", self.order.panes.get(q["pane"], {}).get("asked"))
+                     or float("inf"))
+        current = {q["id"]: q for q in current[:hrproto.MAX_QUESTIONS]}
         for qid in list(self.sent_questions):
             if qid not in current:
                 self.send(hrproto.question_gone(qid))
                 del self.sent_questions[qid]
-        for qid, q in list(current.items())[:hrproto.MAX_QUESTIONS]:
-            if self.sent_questions.get(qid) != hrproto.question(q, self.question_ext):
-                self.send(hrproto.question(q, self.question_ext))
-                self.sent_questions[qid] = hrproto.question(q, self.question_ext)
+        if self.player_t3:
+            # The player preserves Q arrival order when updating an existing ID.
+            # Reinsert the suffix when a late subscription reveals an older Q.
+            prefix = 0
+            for old, new in zip(self.sent_questions, current):
+                if old != new:
+                    break
+                prefix += 1
+            for qid in list(self.sent_questions)[prefix:]:
+                self.send(hrproto.question_gone(qid))
+                del self.sent_questions[qid]
+        self.agents.recent_questions = {}
+        for qid, q in current.items():
+            payload = hrproto.question(q, self.question_ext, limit)
+            if "key" in q:
+                numbers = (int(record[1]) for record in hrproto.decode(payload)[1:]
+                           if record[0] == "o")
+                self.agents.recent_questions[qid] = {number: q["values"][number]
+                                                     for number in numbers}
+            if self.sent_questions.get(qid) != payload:
+                self.send(payload)
+                self.sent_questions[qid] = payload
         now = time.monotonic()
         due = self.detail_fast_due if self.detail_fast_due is not None else self.next_detail
-        if self.foreground in (None, 1) and self.reader is None and self.detail_pane and now >= due:
+        if (self.foreground in (None, 1) and self.detail_pane and now >= due
+                and hragent.THREAD.fullmatch(self.detail_pane)):
+            self.send_detail(self.agents.detail(picture, self.detail_pane, limit))
+            self.next_detail = now + DETAIL_SECONDS
+        elif self.foreground in (None, 1) and self.reader is None and self.detail_pane and now >= due:
             # Share one deadline across switches: repeated det cannot bypass
             # the read/send limit. Never read a pane absent from the snapshot.
             self.detail_fast_due = None
@@ -576,7 +698,9 @@ class Daemon:
             now = time.monotonic()
             self.next_detail = now + DETAIL_SECONDS
         if now >= self.next_tick:
-            self.send(hrproto.tick(now - self.model_time, self.herdr_ok))
+            # The firmware uses a false heartbeat to display a herdr-specific error.
+            age, ok = (0, True) if t3_mode else (now - self.model_time, self.herdr_ok)
+            self.send(hrproto.tick(age, ok))
             self.next_tick = now + TICK_SECONDS
 
     def command(self, payload):
@@ -587,8 +711,7 @@ class Daemon:
         if self._ir_owns_desktop() and payload.startswith(b"cc\t"):
             return  # Dock input must not also mutate Cider during IR ownership.
         if self.cider is None and payload.startswith((b"ci\t1\t", b"hf\t1\tq\t")):
-            self.cider = hrcider.Bridge()
-            self.cider.start()
+            self.ensure_cider()
         if self.cider is not None and self.cider.command(payload):
             return
         parsed = hrproto.parse_command(payload)
@@ -596,7 +719,9 @@ class Daemon:
             log.info("ignored message from player: %r", payload[:40])
             return
         name, args = parsed
-        if self._ir_owns_desktop() and name in ("fw", "fp", "ft", "a", "qi"):
+        if (self._ir_owns_desktop() and name in ("fw", "fp", "ft", "a", "qi", "act")
+                and not (name in ("fw", "fp", "ft") and (
+                    hragent.THREAD.fullmatch(args[1]) or hragent.PROJECT.fullmatch(args[1])))):
             self.send(hrproto.result(args[0], False, "IR host fallback active"))
             return
         if name == "hr":
@@ -605,9 +730,39 @@ class Daemon:
         elif name == "qx":
             self.question_ext = True
             self.sent_questions.clear()
+        elif name == "tc":
+            self.t3_player = self.sent_ws is not None
         elif name == "qi":
-            self.custom_command(*args)
+            if args[1].startswith("t3q"):
+                try:
+                    self.agents.custom(self, *args)
+                except ValueError as error:
+                    self.send(hrproto.result(args[0], False, str(error)))
+            elif len(args) == 3:
+                self.custom_command(*args)
+        elif name == "ks":
+            target = args[0]
+            if hragent.THREAD.fullmatch(target):
+                row = self.agents.client.snapshot()[1].get(self.agents.threads.get(target))
+                valid = self.player_t3 and row is not None
+            else:
+                row = None
+                valid = self.agents.control == "herdr" and self.herdr_ok and target in self.model["panes"]
+            zoomed = self.detail_context(target).get("zoomed", False)
+            self.send(self.agents.sheet_payload(target, row, zoomed, self.detail_limit(), valid))
+        elif name == "act":
+            try:
+                self.agents.action(self, *args)
+            except (ValueError, hrherdr.HerdrError) as error:
+                self.send(hrproto.result(args[0], False, str(error)))
         elif name == "sub":
+            if args[0] != "-":
+                t3_project = bool(hragent.PROJECT.fullmatch(args[0]))
+                if t3_project:
+                    if not self.player_t3 or len(args) != 2 or args[1] not in ("active", "all"):
+                        return
+                elif self.agents.control != "herdr":
+                    return
             self.subscribed = None if args[0] == "-" else args[0]
             self.subscribed_tab = args[1] if len(args) == 2 else None
             self.sent_agents = None
@@ -615,7 +770,13 @@ class Daemon:
             self.changed.set()
         elif name == "det":
             pane = None if args[0] == "-" else args[0]
+            if pane and (bool(hragent.THREAD.fullmatch(pane)) != (self.agents.control == "t3")
+                         or self.agents.control == "t3" and not self.player_t3):
+                return
             if pane != self.detail_pane:
+                self.agents.sheet = None
+                self.agents.editing = None
+                self.next_detail = 0.0 if pane and hragent.THREAD.fullmatch(pane) else self.next_detail
                 self.detail_keys_pane = None
                 self.usage_keys.update(False)
                 self.sent_detail = None
@@ -625,9 +786,12 @@ class Daemon:
                 self.key_details.clear()
             self.detail_pane = pane
         elif name == "us":
-            self.send(hrproto.usage(self.usage.snapshot(), time.time()))
-            self.usage.request()
+            rows = self.usage.snapshot()
+            self.send(hrproto.usage(rows, time.time(), replace_errors=True))
+            self.pending_usage = bool(self.usage.request())
         elif name == "vw":
+            if args[0] != "1":
+                self.pending_usage = False
             if args[0] == 'detail':
                 pane = args[1]
                 self.usage_keys.update(pane == self.detail_pane == self.detail_keys_pane,
@@ -642,15 +806,32 @@ class Daemon:
             self.key_command(*args)
         elif name == "a":
             req, qid, number = args
-            q = self.model["questions"].get(qid)
-            if not q or not (number.isdigit() or (number == "-1" and q.get("no") == -1)):
-                self.send(hrproto.result(req, False, "The question has gone"))
-            else:
-                if int(number) in q.get("custom", []):
-                    self.custom_pending[req] = (qid, q["pane"], self.session_generation)
-                self.answerer.jobs.put((req, q, int(number)))
+            try:
+                if qid.startswith(("t3q", "t3a")):
+                    self.agents.answer(self, req, qid, int(number))
+                else:
+                    self.queue_answer(req, qid, number)
+            except ValueError as error:
+                self.send(hrproto.result(req, False, str(error)))
+
+    def queue_answer(self, req, qid, number):
+        if self.agents.control != "herdr":
+            raise ValueError("herdr control is off")
+        if self._ir_owns_desktop():
+            raise ValueError("IR host fallback active")
+        model = self.desktop.model if isinstance(req, int) and req < 0 else self.model
+        question = model["questions"].get(qid)
+        if not question or not (number.isdecimal() or (number == "-1" and question.get("no") == -1)):
+            raise ValueError("The question has gone")
+        number = int(number)
+        if number in question.get("custom", []):
+            self.custom_pending[req] = (qid, question["pane"], self.session_generation)
+        self.answerer.jobs.put((req, question, number))
 
     def custom_command(self, req, qid, key):
+        if self.desktop.voice_owner is not None:
+            self.send(hrproto.result(req, False, "Voice input busy"))
+            return
         session = self.custom_input
         if not session or session[0] != qid or session[1] != self.detail_keys_pane or session[1] != self.detail_pane:
             self.send(hrproto.result(req, False, "Input is not focused"))
@@ -688,6 +869,8 @@ class Daemon:
             self.send(hrproto.result(req, *result))
 
     def voice_focus_target(self, target):
+        if self.agents.control != "herdr":
+            raise hrvoice.VoiceError("herdr control is off")
         params = dict(pane_id=target)
         if target.startswith("w:"):
             wid = target[2:]
@@ -700,71 +883,228 @@ class Daemon:
                 params["tab_id"] = ws["tab"]
         try:
             # Voice must never use the legacy all-client focus fallback.
-            if not self.herdr._focus_local(**params):
+            client = self.herdr
+            if self.voice_worker is not None and isinstance(client, hrherdr.Herdr):
+                client = hrherdr.Herdr(client.path, client.timeout)
+            if not client._focus_local(**params):
                 raise hrvoice.VoiceError("Local herdr focus unavailable")
         except hrherdr.HerdrError as error:
             raise hrvoice.VoiceError(str(error)) from error
         self.changed.set()
 
+    def check_voice_target(self, name, target):
+        if name != "vd" or not target or target == "-":
+            return
+        if (hragent.THREAD.fullmatch(target) or
+                target.startswith("w:") and hragent.PROJECT.fullmatch(target[2:])):
+            raise ValueError("Voice cannot reach T3")
+        if self.agents.control != "herdr":
+            raise ValueError("herdr control is off")
+
+    def voice_action(self, name, target=None):
+        try:
+            self.check_voice_target(name, target)
+        except ValueError as error:
+            return False, str(error)
+        if self._ir_owns_desktop():
+            return False, "IR host fallback active"
+        return (self.voice.press(target) if name == "vd" else
+                self.voice.discard() if name == "vc" else self.voice.release())
+
+    def queue_voice(self, name, target=None, req=None):
+        self.check_voice_target(name, target)
+        if self._ir_owns_desktop():
+            raise ValueError("IR host fallback active")
+        if len(self.voice_jobs) >= hrdesktop.MAX_JOBS:
+            raise ValueError("Voice busy")
+        future = self.voice_worker.submit(self.voice_action, name, target)
+        self.voice_jobs[future] = (name, req, self.session_generation)
+        return future
+
+    @property
+    def voice_pending(self):
+        return next(iter(self.voice_jobs.values()), None)
+
+    def stop_voice(self, discard=False):
+        if not discard and self.desktop.voice_owner is not None:
+            return
+        if self.voice_worker is None:
+            return self.voice.discard() if discard else self.voice.stop()
+        if self.voice_jobs or self.voice.engaged:
+            future = self.voice_worker.submit(self.voice.discard if discard else self.voice.stop)
+            if discard:
+                self.voice_jobs[future] = ("vc", None, self.session_generation)
+
+    def flush_voice(self):
+        for future, (name, req, session) in tuple(self.voice_jobs.items()):
+            if not future.done():
+                continue
+            del self.voice_jobs[future]
+            try:
+                result = future.result()
+            except Exception:
+                log.exception("Voice operation failed")
+                result = False, "Voice input failed"
+            self.desktop.voice_result = result
+            if req is not None and session == self.session_generation and self.link:
+                self.send(hrproto.result(req, *result))
+
     def voice_command(self, name, req, target=None):
         if self._ir_owns_desktop():
             self.send(hrproto.result(req, False, "IR host fallback active"))
             return
-        result = (self.voice.press(target) if name == "vd" else
-                  self.voice.discard() if name == "vc" else self.voice.release())
+        if self.desktop.voice_owner is not None:
+            self.send(hrproto.result(req, False, "Voice input busy"))
+            return
+        if self.voice_worker is not None:
+            try:
+                self.queue_voice(name, target, req)
+            except ValueError as error:
+                self.send(hrproto.result(req, False, str(error)))
+            return
+        result = self.voice_action(name, target)
         self.send(hrproto.result(req, *result))
 
-    def focus(self, name, req, target, tab_id=None):
+    def prepare_focus(self, name, target, tab_id=None, *, client=None):
         self.detail_keys_pane = None
         self.usage_keys.update(False)
-        try:
-            if name in ("fw", "ft"):
-                ws = next((w for w in self.model["workspaces"]
-                           if w["id"] == target), None)
-                if not ws:
-                    raise hrherdr.HerdrError("no workspace %s" % target)
-                if name == "ft":
-                    tab = next((t for t in self.model["tabs"].get(target, [])
-                                if t["id"] == tab_id), None)
-                    if not tab:
-                        raise hrherdr.HerdrError("no tab %s in workspace %s" %
-                                                (tab_id, target))
-                    self.herdr.focus_tab(target, tab_id)
-                    text = "Focused " + tab["label"]
-                else:
-                    self.herdr.focus_workspace(target, ws["tab"])
-                    text = "Focused " + ws["label"]
+        if hragent.THREAD.fullmatch(target) or hragent.PROJECT.fullmatch(target):
+            if self.player_t3 and hragent.PROJECT.fullmatch(target):
+                return lambda: (self.session_generation, None, "Focused")
+            raise hrherdr.HerdrError("T3 target unavailable")
+        if self.agents.control != "herdr":
+            raise hrherdr.HerdrError("herdr control is off")
+        if self._ir_owns_desktop():
+            raise hrherdr.HerdrError("IR host fallback active")
+        client = self.herdr if client is None else client
+        session = self.session_generation
+        pane = target if name == "fp" else None
+        if name in ("fw", "ft"):
+            ws = next((w for w in self.model["workspaces"] if w["id"] == target), None)
+            if not ws:
+                raise hrherdr.HerdrError("no workspace %s" % target)
+            if name == "ft":
+                tab = next((t for t in self.model["tabs"].get(target, [])
+                            if t["id"] == tab_id), None)
+                if not tab:
+                    raise hrherdr.HerdrError("no tab %s in workspace %s" % (tab_id, target))
+                action, args, text = client.focus_tab, (target, tab_id), "Focused " + tab["label"]
             else:
-                self.herdr.focus_pane(target)
-                if target == self.detail_pane:
-                    self.detail_keys_pane = target
-                text = "Focused pane"
+                action, args, text = client.focus_workspace, (target, ws["tab"]), "Focused " + ws["label"]
+        else:
+            action, args, text = client.focus_pane, (target,), "Focused pane"
+
+        def focus():
+            if self.agents.control != "herdr":
+                raise hrherdr.HerdrError("herdr control is off")
+            if self._ir_owns_desktop():
+                raise hrherdr.HerdrError("IR host fallback active")
+            action(*args)
+            return session, pane, text
+
+        return focus
+
+    def complete_focus(self, result):
+        session, pane, text = result
+        if session == self.session_generation and pane == self.detail_pane:
+            self.detail_keys_pane = pane
+        return text
+
+    def focus(self, name, req, target, tab_id=None):
+        if name in ("fp", "fw") and hragent.THREAD.fullmatch(target):
+            self.detail_keys_pane = None
+            self.usage_keys.update(False)
+            if not self.player_t3:
+                self.send(hrproto.result(req, False, "T3 unavailable"))
+                return
+            previous = self.t3_focus_pending
+            self.t3_focus_pending = req, target
+            if previous:
+                self.send(hrproto.result(previous[0], False, "Focus superseded"))
+            return
+        try:
+            text = self.complete_focus(self.prepare_focus(name, target, tab_id)())
             self.send(hrproto.result(req, True, text))
             log.debug("%s %s", text, target)
         except hrherdr.HerdrError as error:
             self.send(hrproto.result(req, False, str(error)))
             log.warning("focus %s failed: %s", target, error)
 
+    def pump_t3_focus(self):
+        # Keep only the running opener and the newest pending target.
+        if self.t3_focus_job:
+            future, session, req, text = self.t3_focus_job
+            if not future.done():
+                return
+            self.t3_focus_job = None
+            if session == self.session_generation:
+                try:
+                    future.result()
+                except ValueError as error:
+                    self.send(hrproto.result(req, False, str(error)))
+                else:
+                    self.send(hrproto.result(req, True, text))
+
+        if self.t3_focus_pending is None:
+            return
+        req, target = self.t3_focus_pending
+        self.t3_focus_pending = None
+        try:
+            identity, text = self.agents.focus_target(target)
+        except ValueError as error:
+            self.send(hrproto.result(req, False, str(error)))
+            return
+        if not self.agents.follow_ipod:
+            self.send(hrproto.result(req, True, text))
+        elif self.t3_focus_worker is None:
+            self.send(hrproto.result(req, False, "T3 desktop opener unavailable"))
+        else:
+            future = self.t3_focus_worker.submit(self.agents.client.open_thread, identity)
+            self.t3_focus_job = future, self.session_generation, req, text
+
+    def ensure_cider(self):
+        if self.cider is None:
+            self.cider = hrdesktop.make_bridge()
+        return self.cider
+
+    def apply_desktop_settings(self, values, token):
+        hrdesktop.apply_settings(self, values, token)
+
     def run(self):
+        self.agents.client.start()
         self.disk_control.start()
         self.usage_keys.start()
         self.usage.start()
-        hrherdr.Watcher(self.herdr, self.changed).start()
         self.answerer.start()
         self.reader = ThreadPoolExecutor(max_workers=2, thread_name_prefix="herdremote-read")
+        self.update_herdr_watcher()
+        self.voice_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="herdremote-voice")
+        self.t3_focus_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="herdremote-t3-focus")
         try:
+            try:
+                self.desktop.start()
+            except OSError as error:
+                log.warning("Desktop socket unavailable: %s", error)
             self.run_loop()
         finally:
             self.stopping.set()
+            if self.watcher is not None:
+                self.watcher.stopping.set()
+            self.desktop.close()
+            self.agents.client.close()
             self.disk_control.close()
             self.remote_log.close()
             if self.cider is not None:
                 self.cider.close()
             self.usage_keys.close()
             self.keys.reset()
-            self.voice.stop()
             if self.link:
                 self.close_link()
+            self.voice_worker.shutdown(wait=True, cancel_futures=False)
+            self.voice_worker = None
+            self.t3_focus_worker.shutdown(wait=True)
+            self.t3_focus_worker = None
+            self.voice.stop()
             self.reader.shutdown(wait=True, cancel_futures=True)
             self.reader = None
             self.usage.close()
@@ -776,7 +1116,8 @@ class Daemon:
             self.disk_control.poll(self.link)
             if not self.link:
                 self.pump_reads()
-                if now >= next_probe:
+                self.poll_desktop()
+                if self.disk_control.serial_lease is None and now >= next_probe:
                     next_probe = now + 1.0
                     self.open_link()
                 time.sleep(0.05)
@@ -792,11 +1133,17 @@ class Daemon:
                     self.cider.check_liveness()
                 self.adopt_foreground()
                 self.usage_keys.poll()
+                if self.pending_usage:
+                    rows = self.usage.snapshot()
+                    if not any(row.get("refreshing") for row in rows):
+                        self.pending_usage = False
+                        self.send(hrproto.usage(rows, time.time(), replace_errors=True))
                 self.flush_replies()
                 self.pump_reads()
                 self.push()
                 if self.cider is not None:
                     self.cider.poll(self.link.send, self.link.best_effort_delay)
+                self.poll_desktop()
             except (podlink.LinkClosed, hrcider.SessionExpired) as error:
                 log.info("PodLink closed (%s): %s", error.code, error.reason)
                 self.link.opened = False
@@ -808,8 +1155,19 @@ class Daemon:
                 continue
             time.sleep(0.02)
 
+    def poll_desktop(self):
+        if getattr(self, "desktop", None) is not None:
+            while not self.desktop_results.empty():
+                result = self.complete_answer(self.desktop_results.get(), self.desktop.model)
+                self.desktop.answer_reply(*result)
+            self.flush_voice()
+            self.desktop.poll()
+            self.agents.watch(self.desktop.subscribed, self.sent_ws is not None and self.player_t3,
+                              self.subscribed, self.subscribed_tab, self.detail_pane)
+
 
 def main():
+    desktop_env = {key: os.environ[key] for key in hrdesktop.SETTINGS_KEYS if key in os.environ}
     try:
         import podlink_settings
         for key, value in podlink_settings.load().items():
@@ -837,42 +1195,61 @@ def main():
     parser.add_argument("--usage-dump", action="store_true",
                         help="print one read-only usage frame; no herdr/serial access")
     parser.add_argument("--usage-wait", type=float, default=6,
-                        help="usage-dump indexing budget in seconds (default: 6)")
+                        help="usage-dump wait budget in seconds (default: 6)")
     hrvoice.add_arguments(parser)
     hrkeys.add_arguments(parser)
     parser.add_argument("--debug", action="store_true", help="log metadata for every detail frame")
     args = parser.parse_args()
+    args.desktop_env = desktop_env
+    args.desktop_overrides = {arg.split("=", 1)[0] for arg in sys.argv[1:]}
     logging.basicConfig(stream=sys.stdout, level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
     if args.usage_dump:
-        cache = hrusage.UsageCache()
+        client = hrt3.Client()
+        client.configure(False, None)
+        cache = hrt3.Usage(client)
         try:
-            dump_started = time.time()
             cache.request()
             deadline = time.monotonic() + max(0, args.usage_wait)
             while time.monotonic() < deadline:
-                rows = cache.snapshot()
-                if all(r.get("updated_at",dump_started) >= dump_started and
-                       not r.get("indexing") and
-                       not r["note"].startswith("indexing ") for r in rows):
+                if not any(r.get("refreshing") for r in cache.snapshot()):
                     break
-                cache.request()
                 time.sleep(0.02)
-            print(hrproto.usage(cache.snapshot(), time.time()).decode())
+            print(hrproto.usage(cache.snapshot(), time.time(), replace_errors=True).decode())
         finally:
             cache.close()
         return
     daemon = Daemon(args)
+    try:
+        daemon.configure_agents(hragent.config(os.environ))
+    except ValueError as error:
+        parser.error(str(error))
     if args.once:
-        daemon.refresh()
-        for record in hrproto.decode(hrproto.workspaces(
-                daemon.model["workspaces"])):
-            print("\t".join(record))
-        for record in hrproto.decode(hrproto.status(
-                daemon.model["workspaces"])):
-            print("\t".join(record))
-        for q in daemon.model["questions"].values():
+        if daemon.agents.control == "t3":
+            client = daemon.agents.client
+            if client.usage_token():
+                client.watch(True, (None, None, None))
+                client.start()
+                try:
+                    deadline = time.monotonic() + 3
+                    while not client.state()["connected"] and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                    picture = client.snapshot()
+                finally:
+                    client.close()
+            else:
+                picture = ({}, {}, {})
+            spaces = daemon.agents.workspaces(picture)
+            questions = daemon.agents.questions(picture)
+        else:
+            daemon.refresh()
+            spaces = daemon.model["workspaces"]
+            questions = daemon.model["questions"].values()
+        print(hrproto.workspaces(spaces).decode())
+        print(hrproto.status(spaces).decode())
+        for q in questions:
             print(hrproto.question(q).decode())
+        daemon.usage.close()
         return
     # systemd stops the service with SIGTERM: close the session cleanly
     signal.signal(signal.SIGTERM, lambda *_: daemon.stopping.set())

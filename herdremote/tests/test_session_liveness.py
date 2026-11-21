@@ -94,7 +94,7 @@ class DaemonRecovery(unittest.TestCase):
         # services are inert; this is not a serial/device integration test.
         import herdremote,types,threading,collections
         daemon=object.__new__(herdremote.Daemon)
-        daemon.disk_control=Mock()
+        daemon.disk_control=Mock(serial_lease=None)
         daemon.stopping=threading.Event();daemon.args=types.SimpleNamespace(port='/fake/tty')
         daemon.cider=Mock();daemon.cider.check_liveness.side_effect=hrcider.SessionExpired('stale application')
         daemon.clock_sync=Mock();daemon.usage_keys=Mock();daemon.reset_session=Mock()

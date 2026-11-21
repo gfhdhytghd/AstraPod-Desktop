@@ -61,11 +61,11 @@ def decode(payload):
     return [line.split("\t") for line in text.split("\n")]
 
 
-def _fit(head, rows):
+def _fit(head, rows, max_message=MAX_MESSAGE):
     """Drop trailing rows until head + rows fits one frame."""
     while True:
         try:
-            return encode([head] + rows)
+            return encode([head] + rows, max_message)
         except ValueError:
             if not rows:
                 raise
@@ -77,44 +77,63 @@ def hello(daemon_version):
     return encode([["HR", str(VERSION), clean(daemon_version, 32)]])
 
 
-def workspaces(items):
+def workspaces(items, max_message=MAX_MESSAGE):
     """items: dicts with id, label, focused, working, waiting, done, idle."""
     rows = [[clean(w["id"], 15), "f" if w["focused"] else "-",
              str(w["working"]), str(w["waiting"]), str(w["done"]),
              str(w["idle"]), clean(w["label"], LABEL_BYTES)]
             for w in items[:MAX_WORKSPACES]]
-    return _fit(["W", str(len(rows))], rows)
+    first_t3 = next((i for i, row in enumerate(rows)
+                     if row[0].startswith("t3p")), len(rows))
+    if first_t3 == len(rows):
+        return _fit(["W", str(len(rows))], rows, max_message)
+    while len(rows) > first_t3:
+        try:
+            return encode([["W", str(len(rows))]] + rows[:first_t3] +
+                          [["#", "T3"]] + rows[first_t3:], max_message)
+        except ValueError:
+            rows.pop()
+    return _fit(["W", str(len(rows))], rows, max_message)
 
 
-def status(items):
+def status(items, max_message=MAX_MESSAGE):
     """items: dicts with id, tab1 and other, each a status letter or "-".
 
     Sent after every W; a player that does not know it keeps W's counts.
     """
     rows = [[clean(w["id"], 15), w["tab1"][:1] or "-", w["other"][:1] or "-"]
             for w in items[:MAX_WORKSPACES]]
-    return _fit(["S", str(len(rows))], rows)
+    return _fit(["S", str(len(rows))], rows, max_message)
 
 
-def agents(workspace_id, items):
+def agents(workspace_id, items, max_message=MAX_MESSAGE):
     """items: dicts with pane, kind, status, question, name, title, last."""
     rows = [[clean(a["pane"], 15), clean(a["kind"] or "?", 11),
              STATUS_CODES.get(a["status"], "u"),
              "1" if a["question"] else "0", clean(a.get("name") or "", 31),
              clean(a["title"], TITLE_BYTES), clean(a["last"], LAST_BYTES)]
             for a in items[:MAX_AGENTS]]
-    return _fit(["A", clean(workspace_id, 15), str(len(rows))], rows)
+    return _fit(["A", clean(workspace_id, 15), str(len(rows))], rows, max_message)
 
 
-def tabs(workspace_id, items):
+def tabs(workspace_id, items, max_message=MAX_MESSAGE):
     """A complete tab list; seven-field T records cannot be mistaken for ticks."""
     items = items[:MAX_TABS]
     wid = clean(workspace_id, 15)
-    if not items:
-        return encode([["T", wid, "0", "0", "-", "", "-"]])
-    return encode([["T", wid, str(len(items)), str(i), clean(t["id"], 15),
-                    clean(t["label"], LABEL_BYTES), t["status"]]
-                   for i, t in enumerate(items)])
+    while items:
+        try:
+            return encode([["T", wid, str(len(items)), str(i), clean(t["id"], 15),
+                            clean(t["label"], LABEL_BYTES), t["status"]]
+                           for i, t in enumerate(items)], max_message)
+        except ValueError:
+            items = items[:-1]
+    return encode([["T", wid, "0", "0", "-", "", "-"]], max_message)
+
+
+def actions(target, items, max_message=MAX_MESSAGE):
+    rows = [[action, clean(label, LABEL_BYTES), str(int(confirm))]
+            for action, label, confirm in items[:12]]
+    return _fit(["K", clean(target, 15), str(len(rows))], rows, max_message)
 
 
 def detail_text(text, limit, byte_limit=None):
@@ -170,7 +189,7 @@ def detail(pane, fields, max_message=MAX_MESSAGE):
                   max_message=max_message)
 
 
-def question(q, extended=False):
+def question(q, extended=False, max_message=MAX_MESSAGE):
     """q: dict with id, pane, workspace, multi, agent, lines, options.
 
     options are (number, label) pairs; number is what the answer message
@@ -188,7 +207,13 @@ def question(q, extended=False):
             "m" if q["multi"] else "-", clean(q.get("display_agent", q["agent"]) if extended else q["agent"], LABEL_BYTES)]
     if extended:
         head += [str(q.get("yes", 0)), str(q.get("no", 0)), clean(q.get("tab", ""), LABEL_BYTES)]
-    return encode([head] + rows)
+    while True:
+        try:
+            return encode([head] + rows, max_message)
+        except ValueError:
+            if not rows:
+                raise
+            rows.pop(0 if rows[0][0] == "?" else -1)
 
 
 def question_gone(qid):
@@ -206,11 +231,11 @@ def tick(age_seconds, herdr_ok):
     return encode([["T", str(int(age_seconds)), "1" if herdr_ok else "0"]])
 
 
-def usage(items, now):
+def usage(items, now, *, replace_errors=False):
     """One U frame, four P records, and N. Reset fields are absolute in cache."""
     by_service = {item["svc"]: item for item in items}
     rows = []
-    total_tokens = total_usd = 0
+    counts, costs = [], []
     oldest = now
     any_success = False
     # Bound numeric fields as well as text, so all four rows always fit.
@@ -223,8 +248,6 @@ def usage(items, now):
         if state not in ("ok", "tok", "none", "err"):
             state = "err"
         any_success |= state != "err"
-        # Age is the row's refresh time. A limit sampled long ago stays
-        # fresh here: Claude is probed every 15 minutes.
         oldest = min(oldest, item.get("updated_at", item.get("sampled_at", now)))
         fields = ["P", service, state]
         for prefix in ("h5", "wk"):
@@ -232,14 +255,17 @@ def usage(items, now):
             reset = item.get(prefix + "_reset")
             fields += ["-" if pct is None else str(max(0, min(100, int(pct)))),
                        "-" if reset is None else integer(reset - now)]
-        tokens = int(integer(item.get("tokens")))
-        usd = int(integer(item.get("usd_milli")))
-        total_tokens += tokens
-        total_usd += usd
-        rows.append(fields + [str(tokens), str(usd),
-                              clean(item.get("note", ""), USAGE_NOTE_BYTES)])
-    return encode([["U", integer(now - oldest), "1" if any_success else "0"]]
-                  + rows + [["N", str(total_tokens), str(total_usd)]])
+        numbers = [item.get(key, 0) for key in ("tokens", "usd_milli")]
+        for value, total in zip(numbers, (counts, costs)):
+            if value is not None:
+                total.append(int(integer(value)))
+        fields += [integer(value) if value is not None else "-" for value in numbers]
+        rows.append(fields + [clean(item.get("note", ""), USAGE_NOTE_BYTES)])
+    # Current firmware retains its old rows on U 0. T3 error rows replace
+    # stale figures so their explicit unavailable status reaches the screen.
+    totals = [integer(sum(total)) if total else "-" for total in (counts, costs)]
+    return encode([["U", integer(now - oldest), "1" if any_success or replace_errors else "0"]]
+                  + rows + [["N", *totals]])
 
 
 def parse_command(payload):
@@ -260,12 +286,28 @@ def parse_command(payload):
                 not any(ord(c) < 32 or ord(c) == 127 for c in args[1])):
             return name, args
         return None
-    shapes = {"qx": 1, "qi": 3, "hr": 1, "sub": 1, "fw": 2, "fp": 2, "a": 3, "us": 0,
+    shapes = {"qx": 1, "tc": 1, "qi": 3, "hr": 1, "sub": 1, "fw": 2, "fp": 2, "a": 3, "us": 0,
+              "ks": 1, "act": 3,
               "vd": 2, "vu": 1, "vc": 1, "k": 2, "ft": 3, "det": 1}
-    if name == "qx":
+    if name in ("qx", "tc"):
         return (name, args) if len(records) == 1 and args == ["1"] else None
     if name == "qi":
+        if (len(records) == 1 and len(args) == 4 and args[2] == "enter"
+                and all(args) and len(args[0].encode("utf-8")) <= 7
+                and len(args[1].encode("utf-8")) <= 11
+                and len(args[3].encode("utf-8")) <= 1024
+                and not any(ord(c) < 32 or ord(c) == 127 for arg in args for c in arg)):
+            return name, args
         return (name, args) if len(records) == 1 and len(args) == 3 and args[2] in ("enter", "esc") and all(args) and len(args[0]) <= 7 and len(args[1]) <= 11 else None
+    if name in ("ks", "act"):
+        limits = (15,) if name == "ks" else (7, 15, 16)
+        if len(records) == 1 and len(args) == len(limits) and all(
+            0 < len(arg.encode("utf-8")) <= limit
+            and not any(ord(c) < 32 or ord(c) == 127 for c in arg)
+            for arg, limit in zip(args, limits)
+        ):
+            return name, args
+        return None
     if name in ("sub", "ft", "det"):
         valid_lengths = (1, 2) if name == "sub" else (shapes[name],)
         if len(records) != 1 or len(args) not in valid_lengths:

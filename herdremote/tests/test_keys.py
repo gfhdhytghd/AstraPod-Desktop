@@ -366,7 +366,7 @@ class ConfigTests(unittest.TestCase):
 class DaemonTests(TapFixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
-        with mock.patch.object(herdremote.hrusage, "UsageCache"):
+        with mock.patch.object(herdremote.hrt3, "Usage"):
             self.daemon = herdremote.Daemon(types.SimpleNamespace(socket="/nonexistent", state=None))
         self.daemon.keys = self.taps
         self.daemon.herdr = mock.Mock()
@@ -401,7 +401,7 @@ class DaemonTests(TapFixture, unittest.TestCase):
         self.assertIn(b"R\t1\tok", self.messages)
 
     def test_daemon_scale_config_is_forwarded(self):
-        with mock.patch.object(herdremote.hrusage, "UsageCache"):
+        with mock.patch.object(herdremote.hrt3, "Usage"):
             daemon = herdremote.Daemon(types.SimpleNamespace(socket="/nonexistent", state=None,
                                                             key_scale=8))
         self.assertEqual(daemon.keys.key_scale, 8)

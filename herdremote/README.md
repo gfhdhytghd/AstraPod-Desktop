@@ -1,7 +1,7 @@
 # HerdRemote
 
-HerdRemote puts the agents that [herdr](https://herdr.dev) runs on this
-computer onto the iPod, in **System > Agents**. From the player you can:
+HerdRemote puts agents from [herdr](https://herdr.dev) or T3 Code on the iPod
+under **System > Agents**. With the default herdr source, you can:
 
 - see every herdr workspace, with how many of its agents are working,
   waiting for you, done or idle, in any tab;
@@ -21,31 +21,10 @@ computer onto the iPod, in **System > Agents**. From the player you can:
 - switch between Spaces and Usage with LEFT/RIGHT. Usage shows each service's
   5-hour and weekly limits, tokens this week and their equivalent API price.
 
-An expired stored subscription token starts a separate background refresh worker.
-Usage displays `refreshing...` during the attempt, then fresh limits or a fixed
-failure reason. Ordinary usage HTTP failures do not start a refresh. HerdRemote
-never calls an OAuth refresh endpoint or writes a CLI credential file.
-
-The worker runs `claude --safe-mode` in a dedicated PTY without sending input,
-`codex app-server` with `account/read {"refreshToken":true}`, `grok models`, or
-`~/.local/bin/agy models`. No model prompt is sent. It re-reads credentials and
-retries limits once. All four providers skip refresh while another instance of
-that CLI is running, including background servers (`expired (CLI running)`).
-This conservative guard also protects older sessions whose rotation behavior
-cannot be established from the installed CLI version.
-
-The daemon terminates only its own refresh process group, after at most 20 s or
-on shutdown. CLI time is limited to 14 s; input is closed except for the private
-Codex protocol pipe and Claude PTY. Browser launching is disabled. A dead refresh
-token shows `login required`; sign in manually in the provider CLI. API credential
-environment overrides are removed. CLI output never enters logs or the cache.
-INFO attempt logs contain only provider, method, duration, and fixed outcome.
-
-The per-provider refresh ledger in
-`~/.cache/podbox-herdremote/usage/requests/refresh-<provider>.json` shares a minimum
-30-minute interval across daemon instances and restarts. Failure backoff grows to
-four hours. The usage scan-cache override does not bypass this ledger. Package changes are host-only. An already-running daemon keeps its loaded code
-until its next normal start.
+Usage reads the local T3 Code server in either Agents mode. It displays
+`T3 unavailable` when T3 cannot be reached or has no saved session.
+HerdRemote reads T3 on startup and on Usage requests. It does not
+poll provider APIs, index transcripts, or start provider refresh CLIs.
 
 Remote PLAY taps select after the 200 ms double-tap window; double taps
 switch screens. Native PLAY taps under 150 ms play/pause music. Remote holds
@@ -150,6 +129,32 @@ systemctl --user edit --full herdremote   # point ExecStart at your checkout
 systemctl --user enable --now herdremote
 journalctl --user -u herdremote -f
 ```
+
+## Desktop API
+
+Connect to `$XDG_RUNTIME_DIR/podbox-herdremote/desktop.sock` as the daemon
+user. The daemon owns the serial port. Send one UTF-8 JSON object per line,
+with an integer `id` unique among your outstanding requests.
+
+```json
+{"id":1,"op":"hello"}
+{"id":2,"op":"subscribe","logs":true}
+{"id":3,"op":"focus_workspace","workspace":"w1"}
+```
+
+`hello` returns the protocol version and supported operations. A reply
+contains the matching `id`, `ok`, and either `result` or `error`.
+Subscription sends a full state after its reply. Later state events send
+the newest changed state at most four times per second. With `logs:true`,
+live log events also arrive on the connection. Dispatch by `id` or
+`event` because replies and events can interleave.
+
+Use the workspace, pane, and question IDs from state events. Send `voice`
+with `release` or `cancel` after `press`. Closing that client discards
+its outstanding hold.
+`reload` applies desktop settings while the PodLink session stays open.
+See [Interface 2](../../.specifications/astrapod-desktop.md#interface-2-daemon-desktop-api-stream-b-provides-d-consumes)
+for operation arguments and result fields.
 
 ## Hold to talk
 
@@ -960,3 +965,97 @@ EP0-failed/CDC-live case. No new network listener or dependency is added.
 Deploy it together with the matching bridge's `host_fallback.py` and the six
 runtime files listed in `docs/podbox/ir-host-fallback.md`. Both herdremote and
 podbox-usbkey require restart after the copies; FU44 performs neither action.
+
+### T3 connection
+
+Set `AGENT_CONTROL` to `herdr` (default) or `t3` to choose the iPod's
+Agents source. Each mode shows only that source. Desktop `reload` applies
+the change on the open PodLink session. The legacy `T3_CONTROL` value is
+ignored, including `on` without an explicit `AGENT_CONTROL`.
+
+Use **连接 T3** in desktop Settings to grant AstraPod a scoped session.
+This works in both Agents modes so Usage can read T3. Use **断开 T3** to revoke it. Set `T3_BIN` if the daemon
+cannot find `t3` in its PATH or at `~/.local/bin/t3`. Adjust
+`AGENT_QUICK_REPLIES` with one reply per line, up to eight lines and 60
+UTF-8 bytes per reply. A T3 sheet has room for the first seven replies.
+
+Selecting a T3 thread in **System > Agents** or entering its detail
+switches the thread view in the T3 desktop app. The window may stay
+behind another window. With `T3_FOLLOW_IPOD=off`, the daemon confirms
+thread focus requests without opening the app link. The default is
+`on`. With follow on, the daemon passes a `t3code://threads/…` link
+to `xdg-open` in a worker. It takes the environment ID from
+`~/.t3/userdata/environment-id` and checks both IDs for UUID shape.
+Selecting a T3 project leaves the desktop view unchanged.
+
+#### T3 remote protocol
+
+The client uses the contracts from T3 Code Server **0.1.10**, build
+`7d32075e3757`, in `apps/server/dist` inside the installed Electron
+bundle. It reads the loopback origin from
+`~/.t3/userdata/server-runtime.json` and connects to
+`/ws?orchestrationProtocol=2` with an HTTP `Authorization: Bearer` header.
+The WebSocket upgrade completes the handshake. Each frame contains an
+Effect RPC JSON envelope or array of envelopes. Requests use
+`_tag: "Request"` with `id`, `tag`, `payload` and `headers`. Streaming
+replies use `Chunk` with `requestId` and `values`. The client acknowledges
+chunks using `Ack` and cancels subscriptions using `Interrupt`, both
+with `requestId`. Unary replies use `Exit` with a success or failure
+value.
+
+- `orchestration.subscribeShell` supplies projects and thread summaries.
+  `orchestration.getArchivedShellSnapshot` fills the All view on demand.
+- `orchestration.subscribeThread` supplies the bounded projection and
+  changes to messages, runtime requests and turn items. Match
+  `runtimeRequests[].id` to the `requestId` of an approval or user-input
+  turn item to get its prompt and choices. For an approval without an
+  explicit options array, the desktop's defaults are Decline, Always
+  allow this session, and Approve.
+- `orchestration.dispatchCommand` takes the command as its payload and
+  returns a sequence number. `message.dispatch` with
+  `queue_after_active` sends a quick reply. `run.interrupt` with
+  `holdQueue: true` interrupts the selected run. `thread.stop` can stop
+  a thread and its delegated work. The other sheet commands are
+  `thread.settle`, `thread.unsettle`, `thread.snooze`, `thread.pin` and
+  `thread.unpin`.
+- `runtime-request.respond` takes the provider decision or a map of
+  question IDs to answer strings or arrays. `thread.user-input.dismiss`
+  dismisses a pending user-input request.
+- The 0.1.10 bundle also exports `getThreadProjection`, `searchThreads`,
+  `launchThread` and `forceStopThread`. The Agents screen uses the
+  subscriptions and run-level interrupt described above.
+
+The session file is `t3-session-token` beside `desktop.json`, mode 0600.
+The daemon issues it only through `t3_connect` with
+`orchestration:read`, `orchestration:operate` and `diagnostics:read`.
+Older sessions can read limits. Use **断开 T3** and **连接 T3** to add
+authorization for the weekly summary. On disconnect it
+reads the session ID from the signed token payload for
+`t3 auth session revoke` and deletes the local token on success. It
+keeps an Agents WebSocket in `t3` mode while a desktop subscriber or a
+T3-capable player needs it. Each Usage read uses a short-lived loopback
+WebSocket in either mode. A changed server version can connect if it still decodes the
+same schema. Schema failures appear in `state.t3.error`.
+
+Usage reads `server.getConfig`: `providers[].driver` and
+`providers[].usageLimits.windows[]` give the account's used percent and
+reset timestamp. Model- and provider-specific windows are omitted from
+the four general provider rows. `server.getUsageSummary` provides daily
+buckets for today and the preceding six UTC dates. Token totals sum
+uncached input, cache reads, cache creation and output. T3 already counts
+reasoning in output. The reported `costUsd` is an estimate for the
+bucket. Unpriced or unavailable cost, and other unavailable fields, are
+null in desktop state and `-` in the player frame. The Usage page keeps
+its existing per-provider fields. `state.agents.control` identifies the
+active Agents source.
+
+The desktop can store a Jellyfin login in `jellyfin-session.json` beside
+the player tokens. The private file holds the server URL, user identity,
+access token, device ID and optional source selection.
+
+herdr actions use `pane.send_keys` for Esc, `pane.zoom` for the displayed
+zoom mode and `pane.send_input` for an ordered text-and-Enter submission.
+The `org.lais.FcitxVoice1` D-Bus interface supplies recording lifecycle
+signals and methods for committing input at the focused desktop field.
+It has no transcript return path for HerdRemote, so T3 detail refuses
+voice holds.

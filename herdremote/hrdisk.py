@@ -6,6 +6,7 @@ import socket
 import stat
 import struct
 
+BORROW_SERIAL = b'borrow-serial-v1\n'
 CAPABILITY = b'DH\t1\tdisk-mode-v1'
 
 
@@ -15,9 +16,11 @@ def default_socket():
 
 
 class Control:
-    def __init__(self, path=None, *, fallback=None):
+    def __init__(self, path=None, *, fallback=None, release_serial=None):
         self.path = path or default_socket()
         self.fallback = fallback
+        self.release_serial = release_serial
+        self.serial_lease = None
         self.server = None
         self.reset()
 
@@ -55,6 +58,15 @@ class Control:
         self.server.setblocking(False)
 
     def poll(self, link):
+        if self.serial_lease is not None:
+            try:
+                self.serial_lease.recv(1)
+            except BlockingIOError:
+                pass
+            except OSError:
+                self.release_lease()
+            else:
+                self.release_lease()
         if self.server is None:
             return
         try:
@@ -78,6 +90,15 @@ class Control:
                     if request.startswith(b'ir-') and self.fallback is not None:
                         channel.sendall(self.fallback.handle(request, link))
                         return
+                    if request == BORROW_SERIAL and self.release_serial is not None:
+                        if self.serial_lease is not None:
+                            channel.sendall(b'5 serial already borrowed\n')
+                            return
+                        self.release_serial()
+                        channel.sendall(b'0 serial released\n')
+                        self.serial_lease = channel.dup()
+                        self.serial_lease.setblocking(False)
+                        return
                     if request != b'enter-disk-v1\n':
                         channel.sendall(b'5 invalid request\n')
                         return
@@ -97,7 +118,13 @@ class Control:
             except (OSError, TimeoutError):
                 return
 
+    def release_lease(self):
+        if self.serial_lease is not None:
+            self.serial_lease.close()
+            self.serial_lease = None
+
     def close(self):
+        self.release_lease()
         if self.fallback is not None:
             self.fallback.close()
         if self.server is not None:

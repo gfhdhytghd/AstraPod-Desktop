@@ -1,12 +1,13 @@
 """One-way Jellyfin reconciliation over PodLink."""
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
 import re
+import socket
 from tempfile import TemporaryDirectory
 import time
 import unicodedata
@@ -15,6 +16,7 @@ import uuid
 import urllib.request
 
 import podlink
+import hrdisk
 from hrjellyfin import JellyfinClient, JellyfinError, Session, https_base, id_or_none, token_from
 
 AUDIO_SUFFIXES = {".flac", ".m4a", ".mp3"}
@@ -227,6 +229,20 @@ class JellyfinSource:
 
 
 @contextmanager
+def borrow_serial():
+    """Keep a local lease open until the sync operation closes its USB link."""
+    with socket.socket(socket.AF_UNIX) as channel:
+        channel.settimeout(12)
+        channel.connect(hrdisk.default_socket())
+        channel.sendall(hrdisk.BORROW_SERIAL)
+        with channel.makefile("rb") as replies:
+            reply = replies.readline(128)
+        if reply != b"0 serial released\n":
+            raise RuntimeError("The AstraPod background service could not release the iPod connection.")
+        yield
+
+
+@contextmanager
 def connect_device(port):
     from serial.tools import list_ports
     ports = list(list_ports.comports())
@@ -307,9 +323,9 @@ def original_matches(link, tracks):
                 matched.add(matches[0].name)
 
 
-def preview(source, scope, port):
+def preview(source, scope, port, *, serial_access=nullcontext):
     tracks = source.tracks(scope)
-    with connect_device(port) as (link, device):
+    with serial_access(), connect_device(port) as (link, device):
         owned = inventory(link, source.identity)
         return Plan(source.identity, scope, device, tracks, owned, original_matches(link, tracks))
 
@@ -336,11 +352,12 @@ def wait_with_link(link, task):
     return task.result()
 
 
-def apply(source, plan, port):
+def apply(source, plan, port, *, serial_access=nullcontext):
     if plan.identity != source.identity or source.tracks(plan.scope) != plan.tracks:
         raise RuntimeError("Jellyfin changed after preview; build a new preview")
 
-    with connect_device(port) as (link, device), ThreadPoolExecutor(max_workers=1) as worker:
+    with (serial_access(), connect_device(port) as (link, device),
+          ThreadPoolExecutor(max_workers=1) as worker):
         if (device != plan.device or inventory(link, source.identity) != plan.owned
                 or original_matches(link, plan.tracks) != plan.matched):
             raise RuntimeError("iPod changed after preview; build a new preview")

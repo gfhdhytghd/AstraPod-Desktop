@@ -172,6 +172,11 @@ def detail_lines(text):
     return lines[-12:]
 
 
+def empty_model():
+    return dict(workspaces=[], agents={}, others={}, questions={},
+                tabs={}, tab_agents={}, panes=set(), pane_meta={})
+
+
 def build_model(snapshot, read, subscribed=None, tab_id=None):
     """The dashboard model from a herdr snapshot.
 
@@ -247,7 +252,10 @@ def build_model(snapshot, read, subscribed=None, tab_id=None):
         agents[wid] = rows
         others[wid] = elsewhere
     sessions = {a["pane_id"]: a.get("agent_session") for a in snapshot.get("agents", [])}
+    zoomed = {layout.get("focused_pane_id") for layout in snapshot.get("layouts", [])
+              if layout.get("zoomed")}
     pane_meta = {p["pane_id"]: dict(kind=p.get("agent") or "unknown",
+                 zoomed=p["pane_id"] in zoomed,
                  agent_session=p.get("agent_session") or sessions.get(p["pane_id"]),
                  status=p.get("agent_status") or "unknown",
                  title=p.get("terminal_title_stripped") or "")

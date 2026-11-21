@@ -300,7 +300,7 @@ class DaemonTests(VoiceFixture, unittest.TestCase):
     # the controller in a real daemon with a mocked herdr and in-memory link.
     def setUp(self):
         super().setUp()
-        with mock.patch.object(herdremote.hrusage, "UsageCache"):
+        with mock.patch.object(herdremote.hrt3, "Usage"):
             self.daemon = herdremote.Daemon(types.SimpleNamespace(socket="/nonexistent", state=None))
         self.daemon.voice = self.voice
         self.daemon.herdr = mock.Mock(spec=hrherdr.Herdr)
@@ -330,7 +330,7 @@ class DaemonTests(VoiceFixture, unittest.TestCase):
             self.assertIsNone(hrproto.parse_command(bad), bad)
 
     def test_daemon_default_voice_does_not_focus(self):
-        with mock.patch.object(herdremote.hrusage, "UsageCache"):
+        with mock.patch.object(herdremote.hrt3, "Usage"):
             daemon = herdremote.Daemon(types.SimpleNamespace(socket="/nonexistent", state=None))
         self.addCleanup(daemon.voice.stop)
         daemon.herdr = mock.Mock(spec=hrherdr.Herdr)

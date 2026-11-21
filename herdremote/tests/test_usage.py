@@ -333,7 +333,7 @@ class Cache(unittest.TestCase):
         cache = Mock()
         cache.snapshot.return_value = rows
         with patch.object(sys,'argv',['herdremote','--usage-dump']), \
-                patch.object(hrusage,'UsageCache',return_value=cache), \
+                patch.object(herdremote.hrt3,'Usage',return_value=cache), \
                 patch.object(herdremote,'Daemon',side_effect=AssertionError('must not construct daemon')), \
                 patch('sys.stdout',new_callable=io.StringIO) as stdout:
             herdremote.main()
