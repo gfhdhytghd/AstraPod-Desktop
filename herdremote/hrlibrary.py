@@ -277,8 +277,9 @@ def _open_binary(link, command):
     return _request(link, command), False
 
 
-def _read_binary(link, size, label, progress=None, *, streaming=False):
-    data = bytearray()
+def _read_binary(link, size, label, progress=None, *, streaming=False, sink=None):
+    data = bytearray() if sink is None else None
+    offset = 0
     crc = 0
     credits = STREAM_WINDOW
     while True:
@@ -291,18 +292,42 @@ def _read_binary(link, size, label, progress=None, *, streaming=False):
         else:
             reply = _request(link, b"NEXT", binary=True)
         if not reply.startswith(b"MSF1"):
-            if len(data) != size or reply != f"DONE {size} {crc:08x}".encode("ascii"):
+            if offset != size or reply != f"DONE {size} {crc:08x}".encode("ascii"):
                 raise ValueError(f"{label} length or CRC mismatch")
             return data
         if (not 8 < len(reply) <= link.max_message
-                or struct.unpack_from("<I", reply, 4)[0] != len(data)
-                or len(data) + len(reply) - 8 > size):
+                or struct.unpack_from("<I", reply, 4)[0] != offset
+                or offset + len(reply) - 8 > size):
             raise ValueError(f"invalid {label} chunk")
         chunk = memoryview(reply)[8:]
-        data.extend(chunk)
+        if sink is None:
+            data.extend(chunk)
+        else:
+            sink.write(chunk)
+        offset += len(chunk)
         crc = crc32(chunk, crc)
         if progress is not None:
-            progress(len(data))
+            progress(offset)
+
+
+def download_sample(link, path, destination):
+    """Write a read-only MS3 sample after validating offsets, length and CRC."""
+    destination = Path(destination)
+    complete = False
+    try:
+        opened = _request(link, b"STREAM SAMPLE " + path.encode("utf-8"))
+        match = re.fullmatch(rb"SAMPLE ([0-9]{1,9})", opened)
+        if match is None or not 0 < (size := int(match[1])) <= 128 * 1024 * 1024:
+            raise ValueError("Invalid iPod sample length")
+        with TemporaryDirectory(dir=destination.parent) as staging:
+            partial = Path(staging) / "sample"
+            with partial.open("wb") as output:
+                _read_binary(link, size, "sample", streaming=True, sink=output)
+            complete = True
+            partial.replace(destination)
+    finally:
+        if not complete:
+            _stop(link)
 
 
 def _bulk_tracks(link, manifest, byte_progress, expected_commit):

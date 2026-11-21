@@ -383,10 +383,11 @@ class BulkLink(FakeLink):
             generation = 3 if self.manifests == 1 else self.final_generation
             sizes = "".join(f"\t{name}:{len(data)}" for name, data in self.files.items())
             return f"MS3 FILES 1\t{generation}\t0\t0{sizes}".encode()
-        if command.startswith(b"FILE "):
-            self.selected = command[5:].decode()
+        if command.startswith((b"FILE ", b"SAMPLE ")):
+            verb, path = command.split(b" ", 1)
+            self.selected = path.decode()
             self.offset = 0
-            return f"MS3 FILE {len(self.files[self.selected])}".encode()
+            return b"MS3 " + verb + f" {len(self.files[self.selected])}".encode()
         if command == b"NEXT" and self.selected is not None:
             data = self.files[self.selected]
             self.selected = None
@@ -399,7 +400,7 @@ class BulkLink(FakeLink):
 class StreamLink(BulkLink):
     """A peer that queues a window behind the legacy metadata."""
     def send(self, kind, payload):
-        if payload.startswith(b"MS3 STREAM FILE "):
+        if payload.startswith((b"MS3 STREAM FILE ", b"MS3 STREAM SAMPLE ")):
             super().send(kind, b"MS3 " + payload[11:])
             self.requests[-1] = payload
         elif payload == b"MS3 CREDIT":
@@ -426,6 +427,24 @@ class StreamLink(BulkLink):
 
 
 class BulkLibraryTests(unittest.TestCase):
+    def test_recording_fetch_uses_credit_and_preserves_output_on_bad_crc(self):
+        recording = "/Recordings/PodLink-0001.wav"
+        data = b"RIFF" + bytes(range(255)) * 30
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / "record.wav"
+            link = StreamLink({recording: data})
+            library.download_sample(link, recording, output)
+            self.assertEqual(output.read_bytes(), data)
+            self.assertEqual(link.requests[0], b"MS3 STREAM SAMPLE " + recording.encode())
+            self.assertIn(b"MS3 CREDIT", link.requests)
+            link = StreamLink({recording: b"different data"})
+            link.crc_error = 1
+            with self.assertRaisesRegex(ValueError, "CRC mismatch"):
+                library.download_sample(link, recording, output)
+            self.assertEqual(output.read_bytes(), data)
+            self.assertEqual(link.requests[-1], b"MS3 STOP")
+            self.assertEqual(list(Path(directory).iterdir()), [output])
+
     def test_stream_uses_credits_without_next_round_trips(self):
         link = StreamLink()
         link.max_message = 48
