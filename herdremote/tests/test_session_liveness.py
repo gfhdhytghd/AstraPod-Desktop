@@ -95,6 +95,7 @@ class DaemonRecovery(unittest.TestCase):
         import herdremote,types,threading,collections
         daemon=object.__new__(herdremote.Daemon)
         daemon.disk_control=Mock(serial_lease=None)
+        daemon.plugin_link=Mock()
         daemon.stopping=threading.Event();daemon.args=types.SimpleNamespace(port='/fake/tty')
         daemon.cider=Mock();daemon.cider.check_liveness.side_effect=hrcider.SessionExpired('stale application')
         daemon.clock_sync=Mock();daemon.usage_keys=Mock();daemon.reset_session=Mock()
@@ -109,6 +110,7 @@ class DaemonRecovery(unittest.TestCase):
             daemon.run_loop()
         serial_open.assert_called_once_with('/fake/tty',2)
         old_port.close.assert_called_once();daemon.cider.disconnect.assert_called_once()
+        daemon.plugin_link.link_lost.assert_called_once()
         replacement.open.assert_called_once();daemon.reset_session.assert_called()
         self.assertIs(daemon.link,replacement)
         self.assertEqual((replacement.keepalive_interval,replacement.keepalive_timeout,replacement.nonce_keepalive),(1.,3.,True))

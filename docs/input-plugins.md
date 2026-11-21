@@ -180,3 +180,74 @@ journalctl --user -u astrapod-plugins.service -f
 To roll back, disable `apple-ir` with the CLI. Wait for it to stop in any
 embedded host. Disable and stop `astrapod-plugins.service`, then enable and
 start `podbox-usbkey.service`.
+
+## PodLink companions
+
+A companion exchanges messages and files with a foreground AstraPod device
+plugin. Give the companion `"kind": "podlink"` and declare its channel names:
+
+```json
+{
+  "id": "podlink-echo",
+  "name": "PodLink Echo",
+  "version": "1.0.0",
+  "kind": "podlink",
+  "entry": "plugin.py",
+  "api": 1,
+  "description": "Echo messages and exchange files.",
+  "device_channels": ["astrapod.echo"],
+  "permissions": [],
+  "settings": {}
+}
+```
+
+Each name has 1–32 ASCII bytes. Use lowercase letters, digits, dots,
+underscores and hyphens. Start with a letter or digit. Match the name
+the device requests, including its case. A connected channel has one
+active companion. Open the device plugin after its companion starts.
+
+Use the regular plugin host with the updated HerdRemote daemon running:
+
+```sh
+python -m astrapod_plugins enable podlink-echo
+python -m astrapod_plugins run --events
+```
+
+Use the running plugin host if you already have one. HerdRemote keeps
+the CDC tty open. The host connects through
+`$XDG_RUNTIME_DIR/podbox-herdremote/plugin-link.sock`.
+
+### Companion API
+
+Use `PodLinkPlugin()` to consume the normal settings record. Poll
+`receive_podlink(timeout_seconds)` for `(token, packet)`. A timeout
+returns `None`. Call `send_podlink(token, packet)` with the supplied
+token and channel. The token distinguishes separate opens, including
+opens that reuse a channel number after reconnect.
+
+Use `Packet` and `Op` from `astrapod_plugins.podlink_wire`. Reply to
+`Op.OPEN` with `Packet(Op.OPEN_OK, packet.channel)`. Then accept
+`Op.TEXT` and `Op.BINARY`. The payload limit is 2,048 bytes. TEXT's
+payload is UTF-8. Each receive contains one complete message.
+
+Use `PodLinkFiles(directory)` from `astrapod_plugins.podlink_files`
+to serve file requests. Pass received packets to `handle(token, packet)`
+and send its replies in order. Poll `expire()` with the receive loop
+and send its cancellation if present. An optional callback takes
+`(bytes_transferred, total_bytes)`. Close the helper when the connection
+or plugin ends. Pass the received CLOSE packet to the helper to clear
+the matching request. See the bundled
+[echo companion](../astrapod_plugins/podlink-echo/plugin.py) for a full loop.
+
+The helper resolves single-segment file names inside its directory. It
+copies at most 64 MiB in 2 KiB chunks. It verifies the entire CRC32 before
+publishing a received file. On cancellation or a failed check it removes
+its temporary file and preserves any existing destination.
+
+### Echo companion files
+
+The bundled companion uses
+`${XDG_DATA_HOME:-$HOME/.local/share}/astrapod/podlink-echo`.
+Use its `directory` setting to select another folder. Device PUSH creates
+the object named by the device in that folder. Device PULL of that name
+returns the same bytes. Keep the companion running through both operations.

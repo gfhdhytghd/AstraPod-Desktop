@@ -9,6 +9,7 @@ import re
 import sys
 
 from .sdk import API, encode
+from .podlink_wire import CHANNEL, MAX_CHANNELS
 
 
 LOG = logging.getLogger(__name__)
@@ -30,6 +31,8 @@ class Manifest:
     entry: Path
     permissions: tuple[str, ...]
     settings_schema: dict
+    kind: str = 'input'
+    device_channels: tuple[str, ...] = ()
 
     def command(self):
         return [sys.executable, str(self.entry)] if self.entry.suffix == '.py' else [str(self.entry)]
@@ -61,8 +64,15 @@ def load_manifest(path):
     plugin_id = raw['id']
     if len(plugin_id) > 64 or not ID.fullmatch(plugin_id) or plugin_id != path.parent.name:
         raise ValueError('plugin ID must match its directory name')
-    if raw.get('kind') != 'input' or type(raw.get('api')) is not int or raw['api'] != API:
-        raise ValueError('expected an API 1 input plugin')
+    kind = raw.get('kind')
+    if kind not in ('input', 'podlink') or type(raw.get('api')) is not int or raw['api'] != API:
+        raise ValueError('expected an API 1 input or PodLink plugin')
+    channels = raw.get('device_channels', [])
+    if (not isinstance(channels, list) or len(channels) > MAX_CHANNELS
+            or any(not isinstance(name, str) or not name.isascii()
+                   or not CHANNEL.fullmatch(name.encode('ascii')) for name in channels)
+            or len(set(channels)) != len(channels) or (kind == 'podlink') != bool(channels)):
+        raise ValueError('invalid device_channels declaration')
     root = path.parent.resolve()
     relative = Path(raw['entry'])
     entry = (root / relative).resolve()
@@ -85,7 +95,7 @@ def load_manifest(path):
                 or not isinstance(field.get('enum', []), list)):
             raise ValueError(f'invalid settings field {key!r}')
     manifest = Manifest(plugin_id, raw['name'], raw['version'], raw['description'],
-                        entry, tuple(permissions), schema)
+                        entry, tuple(permissions), schema, kind, tuple(channels))
     manifest.settings({})
     return manifest
 

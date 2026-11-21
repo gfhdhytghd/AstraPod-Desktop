@@ -1,8 +1,11 @@
 """Version 1 JSON-lines framing and plugin-side stdio helpers."""
 import json
 import os
+import select
 import sys
 import time
+
+from .podlink_wire import child_record, parse_child
 
 
 API = 1
@@ -86,3 +89,41 @@ class Plugin:
             return True
         except (BlockingIOError, BrokenPipeError):
             return False
+
+
+class PodLinkPlugin(Plugin):
+    """Exchange PodLink packets with the host through bounded JSON lines."""
+
+    def __init__(self, stdin=None, stdout=None):
+        self._pending = bytearray()
+        super().__init__(stdin, stdout)
+
+    def receive(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        fd = self.stdin.fileno()
+        while True:
+            end = self._pending.find(b'\n')
+            if end >= 0:
+                line = bytes(self._pending[:end + 1])
+                del self._pending[:end + 1]
+                return decode(line)
+            if len(self._pending) >= MAX_LINE:
+                raise ValueError('unterminated plugin host record')
+            remaining = None if deadline is None else max(deadline - time.monotonic(), 0)
+            if not select.select([fd], [], [], remaining)[0]:
+                return None
+            incoming = os.read(fd, MAX_LINE)
+            if not incoming:
+                raise EOFError('plugin host disconnected')
+            self._pending.extend(incoming)
+
+    def receive_podlink(self, timeout=None):
+        record = self.receive(timeout)
+        if record is None:
+            return None
+        if record.get('type') != 'podlink':
+            raise ValueError('expected a PodLink record')
+        return parse_child(record)
+
+    def send_podlink(self, token, packet):
+        self.send(child_record(token, packet))

@@ -15,6 +15,8 @@ import time
 
 from .actions import Actions, finite
 from .manifest import discover, settings_record
+from .podlink_client import HostLink
+from .podlink_wire import MAX_CHANNELS, child_record, parse_child
 from .sdk import MAX_LINE, PHASES, REMOTES, STATES, decode, encode
 
 
@@ -56,7 +58,8 @@ class _Child:
 
 
 class PluginHost:
-    def __init__(self, config_path=None, *, repo_dir=PACKAGE, user_dir=None, actions=None):
+    def __init__(self, config_path=None, *, repo_dir=PACKAGE, user_dir=None, actions=None,
+                 podlink_socket=None):
         config_dir = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
         data_dir = Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share')
         runtime_dir = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}')
@@ -64,6 +67,7 @@ class PluginHost:
         self.runtime_dir = runtime_dir / 'astrapod-plugins'
         self.manifests = discover(repo_dir, user_dir or data_dir / 'astrapod/plugins')
         self._actions = Actions() if actions is None else actions
+        self._podlink = HostLink(podlink_socket)
         self._lock = threading.RLock()
         self._callbacks = []
         self._worker = None
@@ -280,6 +284,8 @@ class PluginHost:
             except (ValueError, OSError) as exc:
                 reply.update(ok=False, error=str(exc))
             self._send(process, reply)
+        elif kind == 'podlink' and self.manifests[plugin_id].device_channels:
+            self._podlink.send(plugin_id, *parse_child(record))
         else:
             raise ValueError('unknown plugin message')
 
@@ -296,6 +302,26 @@ class PluginHost:
             self._message(plugin_id, child.process, decode(line + b'\n'))
         if len(child.pending) >= MAX_LINE:
             raise ValueError('unterminated plugin record exceeds line limit')
+
+    def _poll_podlink(self, selector, children, now):
+        def deliver(plugin_id, token, packet):
+            child = children.get(plugin_id)
+            if child is None or child.deadline is not None:
+                return False
+            try:
+                self._send(child.process, child_record(token, packet))
+                return True
+            except OSError as error:
+                self._retire(selector, child, now, str(error))
+                return False
+
+        routes = {}
+        for plugin_id, child in children.items():
+            if child.deadline is None and child.process.poll() is None:
+                for name in self.manifests[plugin_id].device_channels:
+                    if len(routes) < MAX_CHANNELS:
+                        routes.setdefault(name, plugin_id)
+        self._podlink.poll(routes, deliver)
 
     def _supervise(self):
         children = {}
@@ -375,7 +401,9 @@ class PluginHost:
                             else:
                                 children[plugin_id] = child
                                 self._status(plugin_id, 'waiting', detail='Starting plugin')
+                    self._poll_podlink(selector, children, now)
             finally:
+                self._podlink.close(lambda *_: False)
                 for child in children.values():
                     self._signal(child.process, signal.SIGKILL)
                     child.process.wait()

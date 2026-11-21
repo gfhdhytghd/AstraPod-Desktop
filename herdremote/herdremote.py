@@ -32,6 +32,7 @@ import podlink  # noqa: E402  podlink.py: the PodLink frame codec
 import hrdisk
 import hragent
 import hrdesktop
+import hrpluginlink
 import hrfallback
 import hrdetect  # noqa: E402
 import hrdetail  # noqa: E402
@@ -223,6 +224,7 @@ class Daemon:
         self.t3_focus_worker = None
         self.t3_focus_job = None
         self.desktop = hrdesktop.Server(self)
+        self.plugin_link = hrpluginlink.PluginLink()
         self.voice_worker = None
         self.voice_jobs = {}
         self.remote_log = hrremotelog.Writer()
@@ -563,6 +565,7 @@ class Daemon:
 
     def close_link(self):
         self.disk_control.reset()
+        self.plugin_link.link_lost()
         if self.cider is not None:
             self.cider.disconnect()
         self.reset_session()
@@ -1085,12 +1088,17 @@ class Daemon:
                 self.desktop.start()
             except OSError as error:
                 log.warning("Desktop socket unavailable: %s", error)
+            try:
+                self.plugin_link.start()
+            except OSError as error:
+                log.warning("Plugin PodLink socket unavailable: %s", error)
             self.run_loop()
         finally:
             self.stopping.set()
             if self.watcher is not None:
                 self.watcher.stopping.set()
             self.desktop.close()
+            self.plugin_link.close()
             self.agents.client.close()
             self.disk_control.close()
             self.remote_log.close()
@@ -1115,6 +1123,7 @@ class Daemon:
             now = time.monotonic()
             self.disk_control.poll(self.link)
             if not self.link:
+                self.plugin_link.poll(None)
                 self.pump_reads()
                 self.poll_desktop()
                 if self.disk_control.serial_lease is None and now >= next_probe:
@@ -1127,6 +1136,8 @@ class Daemon:
                 self.link.poll()
                 while self.link.frames:
                     frame = self.link.frames.popleft()
+                    if self.plugin_link.receive(frame):
+                        continue
                     if frame.type == podlink.TEXT:
                         self.command(frame.payload)
                 if self.cider is not None:
@@ -1143,6 +1154,7 @@ class Daemon:
                 self.push()
                 if self.cider is not None:
                     self.cider.poll(self.link.send, self.link.best_effort_delay)
+                self.plugin_link.poll(self.link)
                 self.poll_desktop()
             except (podlink.LinkClosed, hrcider.SessionExpired) as error:
                 log.info("PodLink closed (%s): %s", error.code, error.reason)

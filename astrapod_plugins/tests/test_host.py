@@ -259,7 +259,7 @@ sys.stdin.read()
 
         rows = json.loads(cli('list', '--json'))
         self.assertEqual({row['id']: row['enabled'] for row in rows},
-                         {'apple-ir': False, 'fake-input': False})
+                         {'apple-ir': False, 'fake-input': False, 'podlink-echo': False})
         cli('enable', 'fake-input')
         log_path = self.root / 'events.jsonl'
         with log_path.open('wb') as output:

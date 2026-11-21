@@ -1,0 +1,18 @@
+{
+  "id": "podlink-echo",
+  "name": "PodLink Echo",
+  "version": "1.0.0",
+  "kind": "podlink",
+  "entry": "plugin.py",
+  "api": 1,
+  "description": "Echo messages and exchange files with the iPod companion.",
+  "device_channels": ["astrapod.echo"],
+  "permissions": [],
+  "settings": {
+    "directory": {
+      "type": "string",
+      "default": "",
+      "description": "Directory for files exchanged with the device."
+    }
+  }
+}
