@@ -121,7 +121,7 @@ class FakeLink:
                 f"MS3 SUMMARY ipod6g\tbuild\t80000000000\t9000000000\t"
                 f"{len(self.rows)}\t51\t1\t0".encode())
             return b"MS3 MORE"
-        if command == b"FILES" or command.startswith(b"ARTBIN "):
+        if command == b"FILES" or command.startswith((b"ARTBIN ", b"STREAM ")):
             return b"MS3 ERR command"
         if command == b"DB":
             self.pending.append(b"MS3 MORE")
@@ -253,10 +253,10 @@ class LibraryTests(unittest.TestCase):
         self.assertIsNone(library.artwork(link, TRACK))
         link.art_reply = b"MS3 PLACEHOLDER"
         self.assertIsNone(library.artwork(link, TRACK))
+        binary, text = b"MS3 ARTBIN coverflow ", b"MS3 ART coverflow "
         self.assertEqual(link.requests, [
             command + TRACK.path.encode()
-            for _ in range(2)
-            for command in (b"MS3 ARTBIN coverflow ", b"MS3 ART coverflow ")
+            for command in (b"MS3 STREAM ARTBIN coverflow ", binary, text, binary, text)
         ])
 
     def test_artwork_rejects_truncated_stream(self):
@@ -396,7 +396,53 @@ class BulkLink(FakeLink):
         return super().library_command(command)
 
 
+class StreamLink(BulkLink):
+    """A peer that queues a window behind the legacy metadata."""
+    def send(self, kind, payload):
+        if payload.startswith(b"MS3 STREAM FILE "):
+            super().send(kind, b"MS3 " + payload[11:])
+            self.requests[-1] = payload
+        elif payload == b"MS3 CREDIT":
+            self.requests.append(payload)
+        elif payload == b"MS3 STOP":
+            self.requests.append(payload)
+            reply = self.library_command(b"STOP")
+            self.frames.append(SimpleNamespace(type=podlink.TEXT, payload=reply))
+            return
+        else:
+            super().send(kind, payload)
+            return
+
+        for _ in range(8):
+            data = self.files[self.selected]
+            chunk = data[self.offset:self.offset + self.max_message - 8]
+            if not chunk:
+                reply = self.library_command(b"NEXT")
+                self.frames.append(SimpleNamespace(type=podlink.TEXT, payload=reply))
+                break
+            frame = b"MSF1" + struct.pack("<I", self.offset + self.offset_error) + chunk
+            self.frames.append(SimpleNamespace(type=podlink.BINARY, payload=frame))
+            self.offset += len(chunk)
+
+
 class BulkLibraryTests(unittest.TestCase):
+    def test_stream_uses_credits_without_next_round_trips(self):
+        link = StreamLink()
+        link.max_message = 48
+        self.assertEqual(library.tracks(link), fixture_walk())
+        self.assertIn(b"MS3 CREDIT", link.requests)
+        self.assertNotIn(b"MS3 NEXT", link.requests)
+        self.assertEqual(link.manifests, 2)
+
+    def test_stream_stop_drains_already_queued_frames(self):
+        link = StreamLink()
+        link.max_message = 48
+        link.offset_error = 1
+        with self.assertRaisesRegex(RuntimeError, "invalid database chunk"):
+            library.tracks(link)
+        self.assertEqual(link.requests[-1], b"MS3 STOP")
+        self.assertFalse(link.frames)
+
     def test_bulk_artwork(self):
         class ArtLink(BulkLink):
             def library_command(self, command):

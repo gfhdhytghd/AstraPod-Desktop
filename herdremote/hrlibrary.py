@@ -71,6 +71,7 @@ class Artwork:
 
 ART_DIMENSIONS = {"list": 44, "coverflow": 128, "wps": 300}
 COUNT_REPLY_TIMEOUT = 30.0
+STREAM_WINDOW = 8
 
 
 class _MS3Error(RuntimeError):
@@ -80,9 +81,13 @@ class _MS3Error(RuntimeError):
 
 
 def _request(link, command, *, timeout=None, binary=False):
-    # Other resident services can announce themselves on the same link.
     link.send(podlink.TEXT, b"MS3 " + command)
     deadline = time.monotonic() + (link.timeout if timeout is None else timeout)
+    return _receive(link, deadline, binary=binary)
+
+
+def _receive(link, deadline, *, binary=False, stopping=False):
+    # Other resident services can announce themselves on the same link.
     while (remaining := deadline - time.monotonic()) > 0:
         message = link.receive(remaining)
         if (binary and message.type == podlink.BINARY
@@ -93,6 +98,8 @@ def _request(link, command, *, timeout=None, binary=False):
         if len(message.payload) > 500:
             raise RuntimeError("Oversized MS3 reply")
         reply = message.payload[4:]
+        if stopping and reply not in (b"STOPPED", b"ERR busy"):
+            continue
         if reply.startswith(b"ERR "):
             raise _MS3Error(reply[4:])
         return reply
@@ -101,7 +108,8 @@ def _request(link, command, *, timeout=None, binary=False):
 
 def _stop(link):
     with suppress(OSError, RuntimeError, ValueError, TimeoutError):
-        _request(link, b"STOP")
+        link.send(podlink.TEXT, b"MS3 STOP")
+        _receive(link, time.monotonic() + link.timeout, stopping=True)
 
 
 def _parse_bool(value):
@@ -258,11 +266,30 @@ def _manifest(reply):
     return (int(commit), int(generation), int(removed), int(stats)), files
 
 
-def _read_binary(link, size, label, progress=None):
+def _open_binary(link, command):
+    if not getattr(link, "_ms3_stream_unavailable", False):
+        try:
+            return _request(link, b"STREAM " + command), True
+        except _MS3Error as error:
+            if error.reason != b"command":
+                raise
+            link._ms3_stream_unavailable = True
+    return _request(link, command), False
+
+
+def _read_binary(link, size, label, progress=None, *, streaming=False):
     data = bytearray()
     crc = 0
+    credits = STREAM_WINDOW
     while True:
-        reply = _request(link, b"NEXT", binary=True)
+        if streaming:
+            if not credits:
+                link.send(podlink.TEXT, b"MS3 CREDIT")
+                credits = STREAM_WINDOW
+            reply = _receive(link, time.monotonic() + link.timeout, binary=True)
+            credits -= 1
+        else:
+            reply = _request(link, b"NEXT", binary=True)
         if not reply.startswith(b"MSF1"):
             if len(data) != size or reply != f"DONE {size} {crc:08x}".encode("ascii"):
                 raise ValueError(f"{label} length or CRC mismatch")
@@ -271,7 +298,7 @@ def _read_binary(link, size, label, progress=None):
                 or struct.unpack_from("<I", reply, 4)[0] != len(data)
                 or len(data) + len(reply) - 8 > size):
             raise ValueError(f"invalid {label} chunk")
-        chunk = reply[8:]
+        chunk = memoryview(reply)[8:]
         data.extend(chunk)
         crc = crc32(chunk, crc)
         if progress is not None:
@@ -291,11 +318,12 @@ def _bulk_tracks(link, manifest, byte_progress, expected_commit):
     for name, size in sizes.items():
         complete = False
         try:
-            opened = _request(link, b"FILE " + name.encode("ascii"))
+            opened, streaming = _open_binary(link, b"FILE " + name.encode("ascii"))
             if opened != f"FILE {size}".encode("ascii"):
                 raise ValueError("database file length changed")
             files[name] = _read_binary(
-                link, size, "database", progress if byte_progress is not None else None)
+                link, size, "database", progress if byte_progress is not None else None,
+                streaming=streaming)
             done += size
             complete = True
         finally:
@@ -375,7 +403,7 @@ def artwork(link: podlink.Link, track: DeviceTrack, size="coverflow") -> Artwork
     args = size.encode("ascii") + b" " + _path(track)
     command = b"ARTBIN"
     try:
-        reply = _request(link, command + b" " + args)
+        reply, streaming = _open_binary(link, command + b" " + args)
     except _MS3Error as error:
         if error.reason != b"command":
             raise
@@ -393,7 +421,7 @@ def artwork(link: podlink.Link, track: DeviceTrack, size="coverflow") -> Artwork
             raise ValueError("invalid artwork dimensions or layout")
         expected = width * height * 2
         if command == b"ARTBIN":
-            pixels = _read_binary(link, expected, "artwork")
+            pixels = _read_binary(link, expected, "artwork", streaming=streaming)
             ended = True
         else:
             pixels = bytearray()

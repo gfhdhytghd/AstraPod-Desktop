@@ -252,7 +252,7 @@ def connect_device(port):
     if not identity:
         raise RuntimeError("PodLink sync requires an iPod with a USB serial number")
     with podlink.serial_port(device, 10) as serial:
-        link = podlink.Link(serial, 10)
+        link = podlink.Link(serial, 10, max_message=podlink.CDC_RING_PAYLOAD)
         link.open()
         try:
             yield link, identity

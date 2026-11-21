@@ -8,7 +8,7 @@ import time
 import usb.core
 
 
-COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4}
+COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4, "open-bench": 5}
 REQUEST, INDEX = 0x5D, 0x4951
 
 

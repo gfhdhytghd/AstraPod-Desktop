@@ -3,7 +3,7 @@
 
 Dependencies: pyserial; 'serve' also requires websockets >= 14.
 'import-media' uses ffprobe and uses ffmpeg for downsampling.
-Open System > PodLink while unplugged, then connect USB.
+Open System > Debug > PodLink on the device, or use PodLink Shell open-bench.
 """
 import argparse
 import asyncio
@@ -29,6 +29,8 @@ MAGIC = b"PLNK"
 HEADER = struct.Struct("<4sBBHII")
 OPEN, TEXT, BINARY, PING, PONG, CLOSE, HELLO = range(1, 8)
 MAX_MESSAGE = 16384
+# Fit a complete frame in the iPod CDC transmit ring.
+CDC_RING_PAYLOAD = 16384 - HEADER.size - 4
 MEDIA_MAX_BYTES = 128 * 1024 * 1024
 HELLO_DATA = struct.pack("<HI", 1, MAX_MESSAGE)
 
@@ -81,11 +83,14 @@ class Decoder:
             if len(self.buffer) < total:
                 break
             crc = struct.unpack_from("<I", self.buffer, total - 4)[0]
-            if crc != zlib.crc32(self.buffer[4:total - 4]):
+            with memoryview(self.buffer) as data_view:
+                valid = crc == zlib.crc32(data_view[4:total - 4])
+                if valid:
+                    payload = bytes(data_view[HEADER.size:total - 4])
+            if not valid:
                 self.crc_errors += 1
                 del self.buffer[0]
                 continue
-            payload = bytes(self.buffer[HEADER.size:total - 4])
             del self.buffer[:total]
             frames.append(Frame(kind, seq, payload))
         return frames
@@ -103,10 +108,15 @@ def pattern(offset, count):
 
 
 class Link:
-    def __init__(self, port, timeout=10):
+    def __init__(self, port, timeout=10, *, max_message=None):
         self.port, self.timeout = port, timeout
         self.decoder, self.frames = Decoder(), deque()
-        self.seq, self.max_message = 1, MAX_MESSAGE
+        self.local_max_message = MAX_MESSAGE if max_message is None else max_message
+        if not len(HELLO_DATA) <= self.local_max_message <= MAX_MESSAGE:
+            raise ValueError("invalid local message maximum")
+        self.offer = (HELLO_DATA if max_message is None
+                      else struct.pack("<HI", 1, self.local_max_message))
+        self.seq, self.max_message = 1, self.local_max_message
         self.opened = False
         self.last_rx = time.monotonic()
         self.keepalive = None
@@ -209,8 +219,9 @@ class Link:
                     time.sleep(.001)
 
     def open(self):
-        self.max_message = MAX_MESSAGE
-        seq = self.send(OPEN, HELLO_DATA)
+        self._ms3_stream_unavailable = False
+        self.max_message = self.local_max_message
+        seq = self.send(OPEN, self.offer)
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             frame = self.receive(max(0, deadline - time.monotonic()))
@@ -256,6 +267,10 @@ class Link:
         while time.monotonic() < deadline:
             frame = self.receive(deadline - time.monotonic())
             if frame.type == HELLO:
+                continue
+            # Resident capability records may be queued just after OPEN.
+            if (frame.type == TEXT and frame.payload != payload
+                    and frame.payload.startswith((b"DH\t1\t", b"ci\t1\t"))):
                 continue
             if frame.type != kind or (payload is not None and frame.payload != payload):
                 raise RuntimeError(f"unexpected message: {frame}")
@@ -585,6 +600,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", help="override tty discovery (VID 05ac, PID 1261)")
     parser.add_argument("--timeout", type=float, default=10)
+    parser.add_argument("--max-message", type=int,
+                        help="override the payload offer for direct USB commands")
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("ping", "info"):
         sub.add_parser(name)
@@ -610,7 +627,7 @@ def main():
                 directory = Path(stack.enter_context(TemporaryDirectory(prefix="podlink-media-")))
                 tracks = prepare_media(args.files, directory)
             port = stack.enter_context(serial_port(args.port, args.timeout))
-            link = Link(port, args.timeout)
+            link = Link(port, args.timeout, max_message=args.max_message)
             link.open()
             try:
                 if args.command == "echo": result = link.echo(args.text)
