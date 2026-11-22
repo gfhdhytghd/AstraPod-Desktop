@@ -16,14 +16,14 @@ import podlink_m3
 import podlink_settings
 
 try:
-    from PySide6 import QtCore, QtGui, QtWidgets
+    from PySide6 import QtCore, QtGui, QtSvg, QtWidgets
 
     Signal = QtCore.Signal
     Slot = QtCore.Slot
     QT_BINDING = "PySide6"
 except ImportError:
     try:
-        from PyQt6 import QtCore, QtGui, QtWidgets
+        from PyQt6 import QtCore, QtGui, QtSvg, QtWidgets
 
         Signal = QtCore.pyqtSignal
         Slot = QtCore.pyqtSlot
@@ -1274,31 +1274,38 @@ def _render_icon(size: int, draw_fn) -> QtGui.QIcon:
     return QtGui.QIcon(pixmap)
 
 
-def make_app_icon(tokens: ThemeTokens, size: int = 32) -> QtGui.QIcon:
-    def draw(p: QtGui.QPainter, s: float) -> None:
-        grad = QtGui.QLinearGradient(0, 0, s, s)
-        grad.setColorAt(0.0, QtGui.QColor(tokens.accent))
-        grad.setColorAt(1.0, QtGui.QColor(tokens.accent_pressed))
-        p.setPen(QtCore.Qt.PenStyle.NoPen)
-        p.setBrush(grad)
-        p.drawRoundedRect(QtCore.QRectF(1.5, 1.5, s - 3.0, s - 3.0), s * 0.24, s * 0.24)
+BRAND_DIR = Path(__file__).resolve().parent / "astrapod_desktop" / "assets"
+BRAND_ICON_SIZES = (16, 22, 24, 32, 48, 64, 128, 256)
 
-        # Minimalist AstraPod silhouette (screen + click wheel)
-        body = QtCore.QRectF(s * 0.27, s * 0.16, s * 0.46, s * 0.68)
-        p.setBrush(QtGui.QColor("#FFFFFF"))
-        p.drawRoundedRect(body, s * 0.08, s * 0.08)
 
-        screen = QtCore.QRectF(s * 0.33, s * 0.22, s * 0.34, s * 0.24)
-        p.setBrush(QtGui.QColor(tokens.accent_pressed))
-        p.drawRoundedRect(screen, s * 0.04, s * 0.04)
+def _svg_icon(name: str) -> QtGui.QIcon:
+    renderer = QtSvg.QSvgRenderer(str(BRAND_DIR / name))
+    icon = QtGui.QIcon()
+    for size in BRAND_ICON_SIZES:
+        image = QtGui.QImage(size, size, QtGui.QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(QtCore.Qt.GlobalColor.transparent)
+        painter = QtGui.QPainter(image)
+        try:
+            renderer.render(painter)
+        finally:
+            painter.end()
+        icon.addPixmap(QtGui.QPixmap.fromImage(image))
+    return icon
 
-        center = QtCore.QPointF(s * 0.50, s * 0.66)
-        wheel_r = s * 0.125
-        p.setPen(QtGui.QPen(QtGui.QColor(tokens.accent), max(1.6, s * 0.065)))
-        p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        p.drawEllipse(center, wheel_r, wheel_r)
 
-    return _render_icon(size, draw)
+def make_app_icon() -> QtGui.QIcon:
+    """The AstraPod B series app icon, at every size a window or dock asks for."""
+    return _svg_icon("astrapod-app.svg")
+
+
+def make_tray_icon() -> QtGui.QIcon:
+    """The app icon, or on macOS the single-colour mark as a template image,
+    which the menu bar tints to match its own appearance."""
+    if sys.platform != "darwin":
+        return make_app_icon()
+    icon = _svg_icon("astrapod-mono.svg")
+    icon.setIsMask(True)
+    return icon
 
 
 def make_eye_icon(visible: bool, color: str, size: int = 16) -> QtGui.QIcon:
@@ -1472,7 +1479,7 @@ class ThemeManager(QtCore.QObject):
 
             self.app.setPalette(build_palette(tokens))
             self.app.setStyleSheet(build_stylesheet(tokens))
-            self.app.setWindowIcon(make_app_icon(tokens, 32))
+            self.app.setWindowIcon(make_app_icon())
         finally:
             self._applying = False
 

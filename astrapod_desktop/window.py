@@ -450,7 +450,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_theme(self, _mode, _resolved) -> None:
         t = self.theme_manager.tokens
-        icon = make_app_icon(t, 32)
+        icon = make_app_icon()
         self.brand_icon.setPixmap(icon.pixmap(32, 32))
         self.setWindowIcon(icon)
         self.ripples.tokens = t
