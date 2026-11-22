@@ -10,8 +10,8 @@ import time
 
 import podlink
 from astrapod_plugins.podlink_wire import (
-    MAGIC, MAX_LOCAL, REGISTER, Op, Packet, Status, decode_local, encode_local,
-    parse_registration, socket_path,
+    HEADER, MAGIC, MAX_DATA, MAX_LOCAL, REGISTER, U16, Op, Packet, Status,
+    decode_local, encode_local, parse_registration, socket_path,
 )
 
 
@@ -27,6 +27,7 @@ class Binding:
     token: int
     peer: socket.socket
     deadline: float | None
+    answered: bool = False
 
 
 class PluginLink:
@@ -34,8 +35,11 @@ class PluginLink:
         self.path = Path(path) if path is not None else socket_path()
         self.listener = self.lock = None
         self.peers = {}
+        self.owners = {}
         self.binding = None
         self.out = deque()
+        self.rejections = deque()
+        self.termination = None
         self.tokens = count(1)
 
     def start(self):
@@ -80,12 +84,30 @@ class PluginLink:
     def link_lost(self):
         self._release(Status.LOST, notify_peer=True)
         self.out.clear()
+        self.rejections.clear()
+        self.termination = None
+
+    def _register(self, peer, names):
+        previous = self.peers[peer]
+        self.peers[peer] = names
+        for name in previous - names:
+            if self.owners[name] is not peer:
+                continue
+            del self.owners[name]
+            for waiting, registered in self.peers.items():
+                if name in registered:
+                    self.owners[name] = waiting
+                    break
+        for name in names - previous:
+            self.owners.setdefault(name, peer)
+        if (self.binding is not None and self.binding.peer is peer
+                and self.binding.name not in names):
+            self._release(Status.LOST, notify_device=True)
 
     def _drop_peer(self, peer):
-        self.peers.pop(peer, None)
+        self._register(peer, frozenset())
+        del self.peers[peer]
         peer.close()
-        if self.binding is not None and self.binding.peer is peer:
-            self._release(Status.LOST, notify_device=True)
 
     def _local(self, binding, packet):
         try:
@@ -100,17 +122,17 @@ class PluginLink:
         if binding is None:
             return
         self.binding = None
-        self.out = deque(packet for packet in self.out
-                         if packet.channel != binding.channel)
+        self.out.clear()
         packet = Packet.stop(binding.channel, status)
         if notify_peer:
             self._local(binding, packet)
         if notify_device:
-            self._queue_control(packet)
+            self.termination = packet
 
-    def _queue_control(self, packet):
-        if len(self.out) < MAX_OUT + 1:
-            self.out.append(packet)
+    def _reject(self, channel, status):
+        # Another channel's rejected OPEN must not consume the active queue.
+        if len(self.rejections) < MAX_OUT:
+            self.rejections.append(Packet.stop(channel, status))
 
     def receive(self, frame):
         """Consume only APL1 BINARY envelopes from the established link."""
@@ -119,6 +141,15 @@ class PluginLink:
         try:
             packet = Packet.decode(frame.payload)
         except ValueError:
+            if self.binding is not None and len(frame.payload) >= HEADER.size:
+                _, op, channel, transfer = HEADER.unpack_from(frame.payload)
+                if channel == self.binding.channel:
+                    status = Status.BAD_FRAME
+                    if (op in (Op.TEXT, Op.BINARY) and not transfer
+                            and frame.payload[5:8] == b"\0\0\0"
+                            and len(frame.payload) > HEADER.size + MAX_DATA):
+                        status = Status.LIMIT
+                    self._release(status, notify_device=True, notify_peer=True)
             return True
         if packet.op == Op.OPEN:
             self._open(packet)
@@ -129,19 +160,21 @@ class PluginLink:
         if packet.op == Op.CLOSE:
             self._release(Status.OK)
             self._local(binding, packet)
-        elif binding.deadline is None and packet.op != Op.OPEN_OK:
+        elif packet.op in (Op.OPEN_OK, Op.ACCEPT):
+            self._release(Status.BAD_FRAME, notify_device=True, notify_peer=True)
+        elif binding.deadline is None:
             self._local(binding, packet)
         return True
 
     def _open(self, packet):
         if self.binding is not None:
             if self.binding.channel != packet.channel:
-                self._queue_control(Packet.stop(packet.channel, Status.BUSY))
+                self._reject(packet.channel, Status.BUSY)
             return
         name = packet.data.decode("ascii")
-        peer = next((peer for peer, names in self.peers.items() if name in names), None)
+        peer = self.owners.get(name)
         if peer is None:
-            self._queue_control(Packet.stop(packet.channel, Status.NO_HANDLER))
+            self._reject(packet.channel, Status.NO_HANDLER)
             return
         binding = Binding(name, packet.channel, next(self.tokens), peer,
                           time.monotonic() + OPEN_TIMEOUT)
@@ -150,10 +183,7 @@ class PluginLink:
 
     def _from_peer(self, peer, raw):
         if raw.startswith(REGISTER):
-            self.peers[peer] = parse_registration(raw)
-            if (self.binding and self.binding.peer is peer
-                    and self.binding.name not in self.peers[peer]):
-                self._release(Status.LOST, notify_device=True)
+            self._register(peer, parse_registration(raw))
             return
         token, packet = decode_local(raw)
         binding = self.binding
@@ -161,17 +191,16 @@ class PluginLink:
                 or binding.token != token or binding.channel != packet.channel):
             return
         if packet.op == Op.CLOSE:
-            self._release(Status.OK)
-            self._queue_control(packet)
+            self._release(U16.unpack(packet.data)[0], notify_device=True)
             return
-        if binding.deadline is not None:
+        if not binding.answered:
             if packet.op != Op.OPEN_OK:
                 return
-            binding.deadline = None
+            binding.answered = True
         elif packet.op in (Op.OPEN, Op.OPEN_OK, Op.PUSH, Op.PULL):
             self._release(Status.BAD_FRAME, notify_device=True, notify_peer=True)
             return
-        if len(self.out) >= MAX_OUT:
+        if len(self.out) >= MAX_OUT + (packet.op == Op.CANCEL):
             self._release(Status.BUSY, notify_device=True, notify_peer=True)
             return
         self.out.append(packet)
@@ -207,10 +236,20 @@ class PluginLink:
         binding = self.binding
         if binding and binding.deadline is not None and binding.deadline <= time.monotonic():
             self._release(Status.TIMEOUT, notify_device=True, notify_peer=True)
-        if link is not None and self.out and link.best_effort_delay() is not None:
+        if (link is None or not (self.termination or self.out or self.rejections)
+                or link.best_effort_delay() is None):
+            return
+        if self.termination is not None:
+            packet, self.termination = self.termination, None
+        elif self.out:
             packet = self.out.popleft()
-            payload = packet.encode()
-            if len(payload) <= link.max_message:
-                link.send(podlink.BINARY, payload)
-            elif self.binding is not None and packet.channel == self.binding.channel:
-                self._release(Status.LIMIT, notify_device=True, notify_peer=True)
+        else:
+            packet = self.rejections.popleft()
+
+        payload = packet.encode()
+        if len(payload) <= link.max_message:
+            link.send(podlink.BINARY, payload)
+            if packet.op == Op.OPEN_OK:
+                self.binding.deadline = None
+        elif self.binding is not None and packet.channel == self.binding.channel:
+            self._release(Status.LIMIT, notify_device=True, notify_peer=True)

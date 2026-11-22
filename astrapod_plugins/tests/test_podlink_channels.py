@@ -8,20 +8,23 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import zlib
 
 import pytest
 
 from astrapod_plugins.host import PluginHost
 from astrapod_plugins.manifest import load_manifest
+from astrapod_plugins.podlink_client import Binding, HostLink, QUEUE_LIMIT
 from astrapod_plugins.podlink_files import PodLinkFiles
 from astrapod_plugins.podlink_wire import (
-    END, MAX_CREDIT, MAX_DATA, MAX_LOCAL, MSF1, U16, U32,
+    END, MAX_CREDIT, MAX_DATA, MAX_FILE, MAX_LOCAL, MSF1, U16, U32,
     Op, Packet, Status, decode_local, encode_local, registration,
 )
 import podlink
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "herdremote"))
+import hrpluginlink
 from hrpluginlink import PluginLink
 
 
@@ -37,6 +40,7 @@ class Harness:
         self.from_host = deque()
         self.seq = 1
         self.max_message = podlink.MAX_MESSAGE
+        self.delay = .01
 
     def send(self, kind, payload):
         if len(payload) > self.max_message:
@@ -47,7 +51,7 @@ class Harness:
         self.from_host.append(Packet.decode(decoded.payload))
 
     def best_effort_delay(self):
-        return .01
+        return self.delay
 
     def device(self, packet):
         raw = podlink.encode(podlink.BINARY, self.seq, packet.encode())
@@ -171,6 +175,7 @@ def bridged(tmp_path, monkeypatch):
         harness = Harness(bridge)
         try:
             harness.spin(lambda: any("astrapod.echo" in names for names in bridge.peers.values()))
+            harness.host = host
             yield harness, directory
         finally:
             host.stop()
@@ -239,23 +244,32 @@ def test_firmware_peer_round_trip(bridged, tmp_path):
         deadline = time.monotonic() + 15
         try:
             while time.monotonic() < deadline:
-                pending += process.stdout.read1(8192)
-                *records, pending = pending.split(b"\n")
-                for record in records:
-                    harness.device(Packet.decode(bytes.fromhex(record.decode("ascii"))))
-                if process.poll() is not None:
+                try:
+                    incoming = os.read(process.stdout.fileno(), 8192)
+                except BlockingIOError:
+                    incoming = None
+                if incoming == b"":
+                    process.wait(timeout=max(.01, deadline - time.monotonic()))
                     break
-                harness.bridge.poll(harness)
-                while harness.from_host:
-                    packet = harness.from_host.popleft()
-                    process.stdin.write(packet.encode().hex().encode("ascii") + b"\n")
-                    process.stdin.flush()
+                if incoming:
+                    pending += incoming
+                    *records, pending = pending.split(b"\n")
+                    for record in records:
+                        harness.device(Packet.decode(bytes.fromhex(record.decode("ascii"))))
+                if process.poll() is None:
+                    harness.bridge.poll(harness)
+                    while harness.from_host:
+                        packet = harness.from_host.popleft()
+                        process.stdin.write(packet.encode().hex().encode("ascii") + b"\n")
+                        process.stdin.flush()
                 time.sleep(.005)
         finally:
             if process.poll() is None:
                 process.kill()
             process.wait()
         assert process.returncode == 0, process.stderr.read().decode(errors="replace")
+        assert not pending
+        assert harness.bridge.binding is None
 
     assert (directory / "from-ipod.bin").read_bytes() == fixture
     assert (rockbox / "podlink-echo.out").read_bytes() == fixture
@@ -334,3 +348,188 @@ def test_unmatched_duplicate_and_stale_tokens():
                 assert not harness.from_host
         finally:
             bridge.close()
+
+
+
+def test_first_registration_keeps_its_claim_until_disconnect():
+    with tempfile.TemporaryDirectory(prefix="apl1-") as run:
+        bridge = PluginLink(Path(run) / "plugin.sock")
+        bridge.start()
+        harness = Harness(bridge)
+        try:
+            with (socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as waiting,
+                  socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as owner):
+                for peer in (waiting, owner):
+                    peer.settimeout(.25)
+                    peer.connect(str(bridge.path))
+                harness.spin(lambda: len(bridge.peers) == 2)
+                owner.send(registration([NAME.decode()]))
+                harness.spin(lambda: sum(bool(names) for names in bridge.peers.values()) == 1)
+                waiting.send(registration([NAME.decode()]))
+                harness.spin(lambda: sum(bool(names) for names in bridge.peers.values()) == 2)
+                harness.device(Packet(Op.OPEN, CHANNEL, data=NAME))
+                token, opened = decode_local(owner.recv(MAX_LOCAL))
+                assert opened.op == Op.OPEN
+                owner.send(encode_local(token, Packet(Op.OPEN_OK, CHANNEL)))
+                harness.expect(Op.OPEN_OK)
+                owner.close()
+                assert harness.expect(Op.CLOSE) == U16.pack(Status.LOST)
+                harness.device(Packet(Op.OPEN, CHANNEL + 1, data=NAME))
+                new, opened = decode_local(waiting.recv(MAX_LOCAL))
+                assert opened.channel == CHANNEL + 1
+                assert new != token
+                waiting.send(encode_local(new, Packet(Op.OPEN_OK, CHANNEL + 1)))
+                harness.expect(Op.OPEN_OK, channel=CHANNEL + 1)
+        finally:
+            bridge.close()
+
+
+def test_rejected_opens_leave_data_and_close_capacity(bridged):
+    harness, _ = bridged
+    harness.device(Packet(Op.OPEN, CHANNEL, data=NAME))
+    harness.expect(Op.OPEN_OK)
+    harness.delay = None
+    for channel in range(CHANNEL + 1, CHANNEL + 20):
+        harness.device(Packet(Op.OPEN, channel, data=NAME))
+    harness.device(Packet(Op.TEXT, CHANNEL, data=b"echo with rejections queued"))
+    harness.spin(lambda: any(packet.op == Op.TEXT for packet in harness.bridge.out)
+                 or harness.bridge.binding is None)
+    assert harness.bridge.binding is not None
+
+    peer = harness.bridge.binding.peer
+    peer.shutdown(socket.SHUT_RDWR)
+    harness.spin(lambda: harness.bridge.binding is None)
+    harness.delay = .01
+    assert harness.expect(Op.CLOSE) == U16.pack(Status.LOST)
+
+
+def test_open_ack_waiting_for_serial_still_expires(bridged, monkeypatch):
+    harness, _ = bridged
+    now = [0]
+    monkeypatch.setattr(hrpluginlink, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    harness.delay = None
+    harness.device(Packet(Op.OPEN, CHANNEL, data=NAME))
+    harness.spin(lambda: bool(harness.bridge.out))
+    now[0] += hrpluginlink.OPEN_TIMEOUT
+    harness.delay = .01
+    assert harness.expect(Op.CLOSE) == U16.pack(Status.TIMEOUT)
+    assert harness.bridge.binding is None
+
+
+
+def test_failed_commit_preserves_file_and_oversize_source_is_rejected(tmp_path, monkeypatch):
+    files = PodLinkFiles(tmp_path)
+    target = tmp_path / "data.bin"
+    target.write_bytes(b"previous")
+    with (tmp_path / "large.bin").open("wb") as source:
+        source.truncate(MAX_FILE + 1)
+    assert files.handle(1, Packet(Op.PULL, CHANNEL, 1, b"large.bin")) == (
+        Packet.stop(CHANNEL, Status.LIMIT, 1),)
+    assert files.transfer is None
+
+    def fail(_fd):
+        raise OSError("simulated sync failure")
+
+    monkeypatch.setattr(os, "fsync", fail)
+    files.handle(1, Packet(Op.PUSH, CHANNEL, 2, U32.pack(3) + b"data.bin"))
+    files.handle(1, Packet(Op.CHUNK, CHANNEL, 2, MSF1 + U32.pack(0) + b"new"))
+    finish = Packet(Op.FINISH, CHANNEL, 2, END.pack(3, zlib.crc32(b"new")))
+    assert files.handle(1, finish) == (Packet.stop(CHANNEL, Status.IO, 2),)
+    assert files.transfer is None
+    assert target.read_bytes() == b"previous"
+    assert not list(tmp_path.glob(".apl1-*"))
+
+
+def test_close_and_cancel_have_capacity_at_host_and_bridge():
+    with tempfile.TemporaryDirectory(prefix="apl1-") as run:
+        bridge = PluginLink(Path(run) / "plugin.sock")
+        bridge.start()
+        harness = Harness(bridge)
+        host = HostLink(bridge.path)
+        received = deque()
+
+        def deliver(plugin, token, packet):
+            received.append((plugin, token, packet))
+            return True
+
+        def poll():
+            host.poll({NAME.decode(): "echo"}, deliver)
+            return any(bridge.peers.values())
+
+        try:
+            harness.spin(poll)
+            harness.device(Packet(Op.OPEN, CHANNEL, data=NAME))
+            host.poll({NAME.decode(): "echo"}, deliver)
+            _, token, _ = received.popleft()
+            host.send("echo", token, Packet(Op.OPEN_OK, CHANNEL))
+            host.poll({NAME.decode(): "echo"}, deliver)
+            harness.expect(Op.OPEN_OK)
+            assert host.binding == Binding(NAME.decode(), "echo", token, CHANNEL)
+
+            message = Packet(Op.TEXT, CHANNEL, data=b"queued")
+            for _ in range(QUEUE_LIMIT):
+                host.send("echo", token, message)
+            cancel = Packet.stop(CHANNEL, Status.CANCELLED, 1)
+            host.send("echo", token, cancel)
+            host.poll({NAME.decode(): "echo"}, deliver)
+            harness.delay = None
+            bridge.poll(harness)
+            assert len(bridge.out) == QUEUE_LIMIT
+            host.poll({NAME.decode(): "echo"}, deliver)
+            bridge.poll(harness)
+            assert bridge.out[-1] == cancel
+
+            for _ in range(QUEUE_LIMIT):
+                host.send("echo", token, message)
+            host.send("echo", token, Packet.stop(CHANNEL, Status.OK))
+            assert len(host.out) == 1
+            host.poll({NAME.decode(): "echo"}, deliver)
+            bridge.poll(harness)
+            assert not bridge.out
+            harness.delay = .01
+            assert harness.expect(Op.CLOSE) == U16.pack(Status.OK)
+        finally:
+            host.close(deliver)
+            bridge.close()
+
+
+@pytest.mark.parametrize("reason", [Status.BAD_FRAME, Status.LIMIT])
+def test_active_invalid_frame_closes_only_its_channel(bridged, reason):
+    harness, _ = bridged
+    harness.device(Packet(Op.OPEN, CHANNEL, data=NAME))
+    harness.expect(Op.OPEN_OK)
+
+    def invalid(channel):
+        raw = bytearray(Packet(Op.TEXT, channel).encode())
+        if reason == Status.BAD_FRAME:
+            raw[5] = 1
+        else:
+            raw.extend(b"A" * (MAX_DATA + 1))
+        assert harness.bridge.receive(podlink.Frame(podlink.BINARY, 1, bytes(raw)))
+
+    invalid(CHANNEL + 1)
+    assert harness.bridge.binding is not None
+    invalid(CHANNEL)
+    assert harness.expect(Op.CLOSE) == U16.pack(reason)
+    assert harness.bridge.binding is None
+    harness.device(Packet(Op.OPEN, CHANNEL + 2, data=NAME))
+    harness.expect(Op.OPEN_OK, channel=CHANNEL + 2)
+
+
+def test_companion_disable_releases_channel_and_cleans_file(bridged):
+    harness, directory = bridged
+    target = directory / "prior.bin"
+    target.write_bytes(b"previous")
+    harness.device(Packet(Op.OPEN, CHANNEL, data=NAME))
+    harness.expect(Op.OPEN_OK)
+    harness.device(Packet(Op.PUSH, CHANNEL, 1, U32.pack(20) + b"prior.bin"))
+    harness.expect(Op.ACCEPT, 1)
+    harness.expect(Op.CREDIT, 1)
+    assert list(directory.glob(".apl1-*"))
+
+    harness.host.enable("podlink-echo", False)
+    assert harness.expect(Op.CLOSE) == U16.pack(Status.LOST)
+    harness.spin(lambda: not list(directory.glob(".apl1-*")))
+    assert target.read_bytes() == b"previous"
+    harness.device(Packet(Op.OPEN, CHANNEL + 1, data=NAME))
+    assert harness.expect(Op.CLOSE, channel=CHANNEL + 1) == U16.pack(Status.NO_HANDLER)

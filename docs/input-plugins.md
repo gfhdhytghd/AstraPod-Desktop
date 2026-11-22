@@ -203,8 +203,9 @@ plugin. Give the companion `"kind": "podlink"` and declare its channel names:
 
 Each name has 1–32 ASCII bytes. Use lowercase letters, digits, dots,
 underscores and hyphens. Start with a letter or digit. Match the name
-the device requests, including its case. A connected channel has one
-active companion. Open the device plugin after its companion starts.
+the device requests. The first live registration owns the name. If that
+registration ends, another running companion can take the name for the
+next open. Open the device plugin after its companion starts.
 
 Use the regular plugin host with the updated HerdRemote daemon running:
 
@@ -231,7 +232,9 @@ Use `Packet` and `Op` from `astrapod_plugins.podlink_wire`. Reply to
 payload is UTF-8. Each receive contains one complete message.
 When the negotiated PodLink frame limit cannot hold a queued payload,
 the bridge closes the channel with `Status.LIMIT`. The resident link
-stays open.
+stays open. Reply to OPEN within three seconds. If the channel closes,
+discard its token and wait for a new OPEN. Keep outgoing messages bounded.
+If the bridge queue fills, it closes the channel with `Status.BUSY`.
 
 Use `PodLinkFiles(directory)` from `astrapod_plugins.podlink_files`
 to serve file requests. Pass received packets to `handle(token, packet)`
@@ -243,9 +246,11 @@ the matching request. See the bundled
 [echo companion](../astrapod_plugins/podlink-echo/plugin.py) for a full loop.
 
 The helper resolves single-segment file names inside its directory. It
-copies at most 64 MiB in 2 KiB chunks. It verifies the entire CRC32 before
-publishing a received file. On cancellation or a failed check it removes
-its temporary file and preserves any existing destination.
+copies at most 64 MiB in 2 KiB chunks. A PULL reads a regular file in that
+directory. It verifies the entire CRC32 before publishing a received file.
+On cancellation or a failed check it removes its temporary file and
+preserves any existing destination. Call `expire()` periodically to end a
+transfer after 10 seconds without progress.
 
 ### Echo companion files
 
@@ -256,8 +261,8 @@ the object named by the device in that folder. Device PULL of that name
 returns the same bytes. Keep the companion running through both operations.
 
 To test the real companion and daemon bridge against the firmware peer,
-build the firmware's `podlink_apl` fixture and run this from the desktop
-repository. Use its absolute path.
+build `podlink_apl` from the matching firmware checkout. Use the
+fixture's absolute path and run this from the desktop repository.
 
 ```sh
 ASTRAPOD_FIRMWARE_APL_PEER=/absolute/path/to/podlink_apl \

@@ -56,11 +56,12 @@ class HostLink:
         if (binding is None or binding.plugin != plugin or binding.token != token
                 or binding.channel != packet.channel):
             return
-        if len(self.out) >= QUEUE_LIMIT:
+        if packet.op == Op.CLOSE:
+            self.out.clear()
+            self.binding = None
+        elif len(self.out) >= QUEUE_LIMIT + (packet.op == Op.CANCEL):
             raise OSError("plugin PodLink queue full")
         self.out.append(encode_local(token, packet))
-        if packet.op == Op.CLOSE:
-            self.binding = None
 
     def _receive(self, token, packet, deliver):
         binding = self.binding
