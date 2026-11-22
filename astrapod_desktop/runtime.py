@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import sys
 
-from podlink_ui_theme import make_app_icon, tokens_for
+from podlink_ui_theme import make_tray_icon
 
 from .qt import TOOLS_DIR, QtCore, QtWidgets
 
@@ -50,16 +50,12 @@ class DesktopRuntime(QtCore.QObject):
             self.menu.addAction("退出 AstraPod", self.quit)
             self.tray.setContextMenu(self.menu)
             self.tray.activated.connect(self.activate_tray)
-            window.theme_manager.theme_changed.connect(self.update_icon)
-            self.update_icon(window.theme_manager.mode, window.theme_manager.resolved)
+            self.tray.setIcon(make_tray_icon())
             self.tray.show()
             app.setQuitOnLastWindowClosed(False)
         self.start_remote()
         if start_plugins and os.environ.get("ASTRAPOD_PLUGIN_HOST", "on") != "off":
             self.start_plugins()
-
-    def update_icon(self, _mode, resolved) -> None:
-        self.tray.setIcon(make_app_icon(tokens_for(resolved)))
 
     def show_window(self) -> None:
         self.window.showNormal()

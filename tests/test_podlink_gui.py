@@ -332,6 +332,26 @@ class MaterialThemeTests(unittest.TestCase):
         self.assertIsNone(podlink_m3.seed_from_pixels([0xFF808080] * 10))
 
 
+class BrandIconTests(GuiCase):
+    def test_app_icon_is_the_b_mark_at_every_size(self) -> None:
+        icon = podlink_ui_theme.make_app_icon()
+        sizes = {(size.width(), size.height()) for size in icon.availableSizes()}
+        for size in (16, 32, 64, 256):
+            self.assertIn((size, size), sizes)
+            image = icon.pixmap(size, size).toImage()
+            # The rounded square's corner is clear; its centre is the dot.
+            self.assertEqual(image.pixelColor(0, 0).alpha(), 0)
+            centre = image.pixelColor(size // 2, size // 2)
+            self.assertEqual(centre.alpha(), 255)
+            self.assertGreater(centre.blue(), centre.red())
+
+    def test_tray_icon_is_a_template_mask_only_on_macos(self) -> None:
+        with patch.object(podlink_ui_theme.sys, "platform", "darwin"):
+            self.assertTrue(podlink_ui_theme.make_tray_icon().isMask())
+        with patch.object(podlink_ui_theme.sys, "platform", "linux"):
+            self.assertFalse(podlink_ui_theme.make_tray_icon().isMask())
+
+
 class SystemThemeTests(GuiCase):
     def test_default_follows_the_desktop_accent_and_scheme_live(self) -> None:
         self.assertEqual(self.theme.mode, "system")
