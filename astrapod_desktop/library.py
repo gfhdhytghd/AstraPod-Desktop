@@ -34,6 +34,12 @@ class LibraryState(QtCore.QObject):
         self.art.set_serial(self.serial)
         self.changed.emit()
 
+    def snapshot(self):
+        if self.serial and self.summary is not None and self.summary.database_ready:
+            if len(self.tracks) == self.summary.track_count:
+                return self.serial, self.summary.commit_id, tuple(self.tracks)
+        return None
+
     def refresh(self, full: bool = False) -> None:
         """Summary first; tracks come from the cache unless the commit moved."""
         if self.loading:
@@ -49,7 +55,7 @@ class LibraryState(QtCore.QObject):
                 summary = session.summary()
                 serial = session.identity
                 tracks = None if full else library.cache.load(serial, summary.commit_id)
-                if tracks is None:
+                if tracks is None or len(tracks) != summary.track_count:
                     total = max(1, summary.track_count)
 
                     def progress(done):

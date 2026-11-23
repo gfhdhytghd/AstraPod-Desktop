@@ -197,7 +197,7 @@ class FakeSession:
                                      if t.index != track.index]
         self.library._bump()
 
-    def import_files(self, paths, progress, skip_duplicates=True):
+    def import_files(self, paths, progress, skip_duplicates=True, *, cached_library=None):
         stored = 0
         for path in paths:
             progress({"file": str(path), "state": "probe", "sent": 0, "total": 0, "error": None})
@@ -266,9 +266,13 @@ class FakeLibrary:
         self.sessions += 1
         yield FakeSession(self)
 
-    def import_disk(self, paths, progress, skip_duplicates=True):
-        with self.session() as session:
-            return session.import_files(paths, progress, skip_duplicates=skip_duplicates)
+    def import_disk(self, paths, progress, skip_duplicates=True, *, volume, on_write):
+        def report(event):
+            if event["state"] == "done":
+                on_write()
+            progress(event)
+
+        return FakeSession(self).import_files(paths, report, skip_duplicates=skip_duplicates)
 
     def remember(self, serial, summary):
         pass
@@ -332,7 +336,9 @@ class FakeJellyfinError(OSError):
 class FakeSync:
     demo = True
 
-    def __init__(self, delay: float = 0.2, fail: Exception | None = None, session=None):
+    def __init__(self, delay: float = 0.2, fail: Exception | None = None, session=None,
+                 daemon=None):
+        self.daemon = daemon
         self.delay = delay
         self.fail = fail
         self.borrow = False
@@ -400,8 +406,13 @@ class FakeSync:
             buffer, "PNG")
         return bytes(buffer.data())
 
-    def preview(self, source, scope, port):
+    def preview(self, source, scope, port, *, cached_library=None):
         self.calls.append(("preview", scope, port))
+        self._wait()
+        return FakePlan(scope)
+
+    def preview_disk(self, source, scope, volume):
+        self.calls.append(("preview_disk", scope, volume))
         self._wait()
         return FakePlan(scope)
 
@@ -410,10 +421,39 @@ class FakeSync:
         self._wait()
         return len(plan.additions), len(plan.removals)
 
-    def apply_disk(self, source, plan, port):
-        self.calls.append(("apply_disk", plan, port))
+    def apply_disk(self, source, plan, volume, *, on_write):
+        self.calls.append(("apply_disk", plan, volume))
         self._wait()
+        on_write()
         return len(plan.additions), len(plan.removals)
+
+    @staticmethod
+    def disk_serial(port, live_port, live_serial):
+        return live_serial
+
+    @staticmethod
+    def disk_volume(link_mode, port, selected_serial):
+        return "fake-volume" if link_mode == "disk" else None
+
+    @staticmethod
+    def disk_player(volume):
+        return "fake-usb", fake_state()["link"]["serial"]
+
+    def enter_disk(self, port):
+        self.calls.append(("enter_disk", port))
+        self._wait()
+        state = self.daemon.state
+        self.daemon.push({**state, "link": {**state["link"], "mode": "disk",
+                                           "port": None, "serial": None}})
+
+    def eject_disk(self, volume):
+        self.calls.append(("eject_disk", volume))
+        self._wait()
+        self.daemon.push({**self.daemon.state, "link": fake_state()["link"]})
+
+    def refresh_disk(self, device):
+        self.calls.append(("refresh_disk", device))
+        self._wait()
 
 
 class FakeProber:

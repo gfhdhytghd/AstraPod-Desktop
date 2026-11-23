@@ -789,7 +789,7 @@ class SyncTests(GuiCase):
         page.connect_source()
         wait_until(self.app, lambda: self.errors)
         self.assertFalse(page.busy)
-        self.assertEqual(page.status.text(), "操作失败。")
+        self.assertEqual(page.status.text(), "操作失败：boom")
         self.assertIsNone(self.services.sync.stored_session)
 
     def test_sign_in_is_kept_without_the_password(self) -> None:

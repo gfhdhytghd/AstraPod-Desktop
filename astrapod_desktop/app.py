@@ -20,8 +20,9 @@ def demo_services(count: int = 0, delay: bool = True, appearance=None) -> Servic
     from .fakes import FakeDaemon, FakeLibrary, FakePluginHost, FakeProber, FakeSync
     host = FakePluginHost()
     host.start()
-    return Services(library=FakeLibrary(count, delay=delay), daemon=FakeDaemon(),
-                    plugins=PluginBridge(host), sync=FakeSync(), prober=FakeProber(),
+    daemon = FakeDaemon()
+    return Services(library=FakeLibrary(count, delay=delay), daemon=daemon,
+                    plugins=PluginBridge(host), sync=FakeSync(daemon=daemon), prober=FakeProber(),
                     appearance=appearance)
 
 

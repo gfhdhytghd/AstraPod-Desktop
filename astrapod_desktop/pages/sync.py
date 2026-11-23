@@ -16,19 +16,33 @@ KIND_ROLE = Qt.ItemDataRole.UserRole + 40
 SCOPE_PREFIXES = {"all": "", "library": "音乐库：", "playlist": "播放列表："}
 
 
-def disk_mode_option(window, layout, key, action):
+class DiskModeSwitch(ToggleSwitch):
+    hint = "开启后挂载 iPod 的 USB 磁盘。关闭后安全弹出。"
+
+    def __init__(self, disk):
+        super().__init__()
+        self.disk = disk
+        self.setAccessibleName("磁盘模式")
+        self.setAccessibleDescription(self.hint)
+        self.disk.changed.connect(self.refresh)
+        self.toggled.connect(self.disk.request)
+        self.refresh()
+
+    def refresh(self):
+        with QtCore.QSignalBlocker(self):
+            self.setChecked(self.disk.mode == "disk")
+        self.setEnabled(self.disk.can_switch)
+        self.setToolTip(self.disk.problem or self.hint)
+
+
+def disk_mode_option(window, layout):
     row = QtWidgets.QHBoxLayout()
     column = QtWidgets.QVBoxLayout()
     column.setSpacing(2)
     column.addWidget(label("磁盘模式", "field-label"))
-    hint = f"传输更快。{action}期间，iPod 显示 USB 画面。"
-    column.addWidget(label(hint, "helper", wrap=True))
+    column.addWidget(label(DiskModeSwitch.hint, "helper", wrap=True))
     row.addLayout(column, 1)
-    switch = ToggleSwitch()
-    switch.setAccessibleName("磁盘模式")
-    switch.setAccessibleDescription(hint)
-    switch.setChecked(window.prefs.get(key) is True)
-    switch.toggled.connect(lambda checked: window.save_pref(key, checked))
+    switch = DiskModeSwitch(window.disk)
     row.addWidget(switch)
     layout.addLayout(row)
     return switch
@@ -207,10 +221,10 @@ class SyncPage(Page):
         scope_layout.addLayout(port_row)
         self._show_port()
         window.port_changed.connect(self._port_changed)
-        self.disk_mode = disk_mode_option(window, scope_layout, "sync_disk_mode", "同步")
+        self.disk_mode = disk_mode_option(window, scope_layout)
         scope_layout.addStretch(1)
         scope_row = QtWidgets.QHBoxLayout()
-        scope_row.addWidget(label("预览时，iPod 必须处于 PodLink USB 模式", "helper", wrap=True), 1)
+        scope_row.addStretch(1)
         self.preview_button = button("预览", None, "sync", self.preview)
         scope_row.addWidget(self.preview_button)
         scope_layout.addLayout(scope_row)
@@ -268,6 +282,7 @@ class SyncPage(Page):
         column = QtWidgets.QVBoxLayout()
         column.setSpacing(6)
         self.status = label("连接 iPod 后预览同步变更。", None, wrap=True)
+        window.disk.status.connect(self.status.setText)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
@@ -287,6 +302,8 @@ class SyncPage(Page):
         for field in (self.url, self.username, self.password, self.token):
             field.textChanged.connect(self.invalidate_source)
             field.returnPressed.connect(self._connect_return)
+        self._disk_target = None
+        window.disk.changed.connect(self._disk_changed)
         self._auth_hint()
         self._update_metrics(None)
         try:
@@ -429,18 +446,30 @@ class SyncPage(Page):
         self._show_port()
         self.invalidate_plan()
 
+    def _disk_changed(self):
+        disk = self.window_.disk
+        key = (disk.mode, disk.volume, disk.serial)
+        if key != self._disk_target:
+            self._disk_target = key
+            if self.plan is not None:
+                self.invalidate_plan()
+                self.status.setText("iPod 的连接已更改，请重新预览。")
+        self.update_buttons()
+
     # State ------------------------------------------------------------
     def update_buttons(self) -> None:
         interactive = not self.busy and not self.restoring
         for control in (self.username, self.password, self.token, self.scope,
-                        self.port_button, self.connect_button, self.sign_out_button, self.disk_mode):
+                        self.port_button, self.connect_button, self.sign_out_button):
             control.setEnabled(interactive)
         self.url.setEnabled(interactive and self.session is None)
         self.auth_switch.set_options_enabled(interactive)
         index = self.scope.currentIndex()
-        self.preview_button.setEnabled(interactive and self.source is not None
+        disk = self.window_.disk
+        transfer_ready = not disk.transition and disk.available
+        self.preview_button.setEnabled(interactive and transfer_ready and self.source is not None
                                        and 0 <= index < len(self.scopes))
-        self.apply_button.setEnabled(interactive and self.plan is not None
+        self.apply_button.setEnabled(interactive and transfer_ready and self.plan is not None
                                      and bool(self.plan.additions or self.plan.removals))
         self.progress.setVisible(self.busy or self.restoring)
         if self.busy:
@@ -492,7 +521,7 @@ class SyncPage(Page):
     def _failed(self, error) -> None:
         self.busy = False
         self.invalidate_plan()
-        self.status.setText("操作失败。")
+        self.status.setText(f"操作失败：{error}")
         self.update_buttons()
         self.window_.show_error(error)
 
@@ -547,11 +576,29 @@ class SyncPage(Page):
 
     def preview(self) -> None:
         index = self.scope.currentIndex()
-        if self.busy or self.source is None or not 0 <= index < len(self.scopes):
+        disk = self.window_.disk
+        if (self.busy or disk.transition or not disk.available or self.source is None
+                or not 0 <= index < len(self.scopes)):
             return
         scope, source, port = self.scopes[index], self.source, self.port()
-        self.job("正在比较 Jellyfin 和 iPod 的曲库…",
-                 lambda: self.backend.preview(source, scope, port), self.show_plan)
+        volume = disk.volume
+        cache = self.window_.library_state.snapshot()
+        target = (disk.mode, volume, disk.serial)
+
+        def work():
+            if volume is not None:
+                return self.backend.preview_disk(source, scope, volume)
+            return self.backend.preview(source, scope, port, cached_library=cache)
+
+        def done(plan):
+            if target == (disk.mode, disk.volume, disk.serial):
+                self.show_plan(plan)
+            else:
+                self.invalidate_plan()
+                self.status.setText("iPod 的连接已更改，请重新预览。")
+
+        self._disk_target = target
+        self.job("正在比较 Jellyfin 和 iPod 的曲库…", work, done)
 
     def show_plan(self, plan) -> None:
         self.plan = plan
@@ -613,11 +660,18 @@ class SyncPage(Page):
 
     def sync(self, plan) -> None:
         source, port = self.source, self.port()
-        disk_mode = self.disk_mode.isChecked()
-        apply = self.backend.apply_disk if disk_mode else self.backend.apply
-        status = ("正在通过磁盘模式同步…" if disk_mode
-                  else "正在同步。高采样率音频会先在电脑上转换…")
-        self.job(status, lambda: apply(source, plan, port), self.sync_complete)
+        disk = self.window_.disk
+        if disk.transition or not disk.available:
+            return
+        volume, player = disk.volume, disk.player
+        if volume is None:
+            self.job("正在同步。高采样率音频会先在电脑上转换…",
+                     lambda: self.backend.apply(source, plan, port), self.sync_complete)
+        else:
+            self.job("正在通过磁盘模式同步…",
+                     lambda: self.backend.apply_disk(source, plan, volume,
+                                                     on_write=lambda: disk.written.emit(player)),
+                     self.sync_complete)
 
     def sync_complete(self, result) -> None:
         added, removed = result

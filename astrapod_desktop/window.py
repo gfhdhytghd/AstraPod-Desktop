@@ -18,6 +18,7 @@ from podlink_ui_theme import DEFAULT_SEED, make_app_icon, ui_prefs_path
 from . import icons
 from .artwork import NO_ART, ArtStore
 from .contracts import album_key
+from .disk_mode import DiskMode
 from .jellyfin import JellyfinLibrary
 from .jobs import JobRunner
 from .library import LibraryState
@@ -237,13 +238,17 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda key: self._ambient_art_ready(key, self.jellyfin.art))
         self._ambient_art = self.art
         self.daemon = services.daemon
+        self.disk = DiskMode(services.sync, self.daemon, self.runner, self)
         self.runner.activity.connect(self._activity)
         self.library_state.changed.connect(self._library_changed)
         self.library_state.track_removed.connect(self.songs_model.remove_track)
 
         self.ipods: list[dict] = []
         self._link_key = None
+        self._disk_link_key = None
         self._build()
+        self.disk.set_port(services.library.port)
+        self.port_changed.connect(self.disk.set_port)
         self.daemon.state_changed.connect(self._daemon_state)
         self.daemon.connection_changed.connect(lambda _c: self._daemon_state(self.daemon.state))
         self.theme_manager.theme_changed.connect(self._apply_theme)
@@ -675,6 +680,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # Daemon state ---------------------------------------------------------
     def _daemon_state(self, state: dict) -> None:
         link = state.get("link") or {}
+        disk_key = (self.daemon.connected, link.get("mode"), link.get("serial"),
+                    link.get("port"), link.get("borrowed"))
+        if disk_key != self._disk_link_key:
+            self._disk_link_key = disk_key
+            self.disk.update()
         t = self.theme_manager.tokens
         if not self.daemon.connected:
             self.link_chip.dot.set_state(QtGui.QColor(t.idle), False)

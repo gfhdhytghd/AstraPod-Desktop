@@ -297,7 +297,7 @@ class ImportPage(Page):
         self.progress.setVisible(False)
         column.addWidget(self.summary)
         column.addWidget(self.progress)
-        self.disk_mode = disk_mode_option(window, column, "import_disk_mode", "导入")
+        self.disk_mode = disk_mode_option(window, column)
         footer_layout.addLayout(column, 1)
         footer_layout.addWidget(label("跳过 iPod 上已有的歌曲", "field-label"))
         self.skip_check = ToggleSwitch()
@@ -313,6 +313,9 @@ class ImportPage(Page):
         footer_layout.addWidget(self.import_button)
         self.layout_.addWidget(footer)
         self.model.dataChanged.connect(lambda *_: self.update_summary())
+        self._duplicate_target = None
+        window.disk.changed.connect(self._disk_changed)
+        window.disk.status.connect(self.summary.setText)
         window.library_state.changed.connect(self._rebuild_duplicates)
         self._rebuild_duplicates()
         self.update_summary()
@@ -379,9 +382,21 @@ class ImportPage(Page):
         self.model.changed(item)
 
     # Duplicates ------------------------------------------------------
+    def _disk_changed(self):
+        disk = self.window_.disk
+        target = (disk.mode, disk.serial, disk.volume)
+        if target != self._duplicate_target:
+            self._duplicate_target = target
+            self._rebuild_duplicates()
+            self.update_summary()
+        self._update_import_enabled()
+
     def _rebuild_duplicates(self) -> None:
+        window = self.window_
+        library, disk = window.library_state, window.disk
+        tracks = library.tracks if disk.mode == "podlink" and disk.serial == library.serial else ()
         index: dict = {}
-        for track in self.window_.library_state.tracks:
+        for track in tracks:
             tags = music_tags_for(track.title, track.artist, track.album, track.length_ms,
                                   track.disc, track.track)
             if tags is not None:
@@ -390,9 +405,11 @@ class ImportPage(Page):
         for item in self.model.items:
             if item.state in ("ready", "duplicate") and item.probed is not None:
                 duplicate = self._is_duplicate(item.probed)
-                item.state = "duplicate" if duplicate else "ready"
                 if duplicate:
                     item.include = not self.skip_check.isChecked()
+                elif item.state == "duplicate" and self.skip_check.isChecked():
+                    item.include = True
+                item.state = "duplicate" if duplicate else "ready"
                 self.model.changed(item)
 
     def _is_duplicate(self, probed) -> bool:
@@ -414,7 +431,7 @@ class ImportPage(Page):
 
     def update_summary(self) -> None:
         items = self.model.items
-        if self.job is not None:
+        if self.job is not None or self.window_.disk.transition:
             return
         if not items:
             self.summary.setText("还没有选择文件。也可以把文件拖到窗口里。")
@@ -437,22 +454,30 @@ class ImportPage(Page):
             parts.append(f"{errors} 个无法导入")
         if converts:
             parts.append(f"{converts} 首高采样率音频会先在电脑上转换为 48 kHz 以内")
-        if not self.window_.library_state.tracks:
-            parts.append("还没有读取 iPod 资料库，无法检查重复")
+        if self.skip_check.isChecked() and not self.duplicate_index:
+            parts.append("导入时会读取 iPod 资料库查重")
         self.summary.setText("，".join(parts) + "。")
         self.import_button.setText(f"导入 {len(chosen)} 首（{fmt.size(size)}）" if chosen else "导入")
-        self.import_button.setEnabled(bool(chosen) and not probing)
+        self._update_import_enabled()
+
+    def _update_import_enabled(self):
+        disk = self.window_.disk
+        self.import_button.setEnabled(
+            self.job is None and disk.available and not disk.transition
+            and bool(self.selected()) and not any(i.state == "probing" for i in self.model.items))
 
     # Running --------------------------------------------------------
     def start(self) -> None:
         chosen = self.selected()
-        if not chosen or self.job is not None:
+        disk = self.window_.disk
+        if not chosen or self.job is not None or disk.transition or not disk.available:
             return
         for item in chosen:
             item.state, item.progress = "queued", 0.0
             self.model.changed(item)
         skip = self.skip_check.isChecked()
-        disk_mode = self.disk_mode.isChecked()
+        volume, player = disk.volume, disk.player
+        cached_library = self.window_.library_state.snapshot()
         library = self.window_.library_state.library
         paths = [item.path for item in chosen]
         counts = {"done": 0, "skip": 0, "error": 0}
@@ -465,12 +490,14 @@ class ImportPage(Page):
 
             try:
                 job.check()
-                if disk_mode:
-                    library.import_disk(paths, progress, skip_duplicates=skip)
+                if volume is not None:
+                    library.import_disk(paths, progress, skip_duplicates=skip, volume=volume,
+                                        on_write=lambda: disk.written.emit(player))
                 else:
                     with library.session() as session:
                         if hasattr(session, "import_files"):
-                            session.import_files(paths, progress, skip_duplicates=skip)
+                            session.import_files(paths, progress, skip_duplicates=skip,
+                                                 cached_library=cached_library)
                         else:
                             upload_each(session, paths, progress)
             except Cancelled:
@@ -506,10 +533,10 @@ class ImportPage(Page):
             self.table.scrollTo(self.model.index(self.model.rows[str(item.path)], 0))
 
         def done(result):
-            self._finish(result.get("cancelled"), counts, len(paths), None)
+            self._finish(result.get("cancelled"), counts, volume is not None, None)
 
         def failed(error):
-            self._finish(False, counts, len(paths), error)
+            self._finish(False, counts, volume is not None, error)
 
         self.job = self.window_.runner.run("正在导入到 iPod…", work, done, failed,
                                            on_progress=on_progress)
@@ -519,7 +546,7 @@ class ImportPage(Page):
         self.cancel_button.setEnabled(True)
         self.import_button.setEnabled(False)
         for widget in (self.add_files_button, self.add_folder_button, self.clear_button,
-                       self.skip_check, self.disk_mode):
+                       self.skip_check):
             widget.setEnabled(False)
         self.summary.setText(f"正在导入 {len(paths)} 首。可以在两首之间取消。")
 
@@ -529,7 +556,7 @@ class ImportPage(Page):
             self.cancel_button.setEnabled(False)
             self.summary.setText("当前这首上传完后停止…")
 
-    def _finish(self, cancelled: bool, counts: dict, total: int, error) -> None:
+    def _finish(self, cancelled: bool, counts: dict, disk: bool, error) -> None:
         self.job = None
         for item in self.model.items:
             if item.state in ("queued", "uploading"):
@@ -538,7 +565,7 @@ class ImportPage(Page):
         self.progress.setVisible(False)
         self.cancel_button.setVisible(False)
         for widget in (self.add_files_button, self.add_folder_button, self.clear_button,
-                       self.skip_check, self.disk_mode):
+                       self.skip_check):
             widget.setEnabled(True)
         text = f"已导入 {counts['done']} 首"
         if counts["skip"]:
@@ -549,7 +576,8 @@ class ImportPage(Page):
             text += "，其余已取消"
         text += "。"
         if counts["done"]:
-            text += "iPod 正在更新资料库，稍后重新读取即可看到新歌曲。"
+            text += ("关闭磁盘模式后，iPod 会更新资料库。" if disk else
+                     "iPod 正在更新资料库，稍后重新读取即可看到新歌曲。")
         if error is not None and not isinstance(error, Cancelled):
             text = f"导入中断：{error}。{text}"
             self.window_.show_error(error)

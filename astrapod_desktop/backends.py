@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 from . import contracts
@@ -86,9 +87,13 @@ class LibrarySession:
     def delete(self, track):
         return self.module.delete(self.link, track)
 
-    def import_files(self, paths, progress, skip_duplicates=True):
+    def import_files(self, paths, progress, skip_duplicates=True, *, cached_library=None):
+        snapshot = None
+        if cached_library is not None and cached_library[0] == self.identity:
+            snapshot = cached_library[1:]
         return self.module.import_files(self.link, paths, progress,
-                                        skip_duplicates=skip_duplicates)
+                                        skip_duplicates=skip_duplicates,
+                                        cached_snapshot=snapshot)
 
 
 class DeviceLibrary:
@@ -119,9 +124,11 @@ class DeviceLibrary:
         with serial_access(), hrmediasync.connect_device(self.port) as (link, identity):
             yield LibrarySession(self.module, link, identity)
 
-    def import_disk(self, paths, progress, skip_duplicates=True):
+    def import_disk(self, paths, progress, skip_duplicates=True, *, volume, on_write):
         import hrdisksync
-        return hrdisksync.import_files(self.port, paths, progress, skip_duplicates)
+        volume.mount()
+        return hrdisksync.import_mounted(volume, paths, progress, skip_duplicates,
+                                         on_write=on_write)
 
     # The last library seen, so the window can show it before the iPod is
     # plugged in again.
@@ -244,12 +251,21 @@ class SyncBackend:
     def library_tracks(self, source, progress=None):
         """Every audio item the signed-in account sees, as JellyfinTrack rows."""
         from .jellyfin import track_from_item
+        import hrmediasync
+
+        build_snapshot = getattr(source, "tracks_from_items", None)
+        if build_snapshot is not None:
+            source.browsed_tracks = None
         rows, offset, total = [], 0, None
+        consistent = True
         while total is None or offset < total:
-            page, total = source.client.page(
+            page, page_total = source.client.page(
                 source.session, "Items", offset, self.LIBRARY_PAGE, IncludeItemTypes="Audio",
                 Recursive="true", SortBy="SortName", EnableImages="false",
                 EnableUserData="true", Fields="Genres,People,MediaSources,DateCreated,Path")
+            if total is not None and page_total != total:
+                consistent = False
+            total = page_total
             if not page:
                 break
             rows.extend(page)
@@ -261,6 +277,12 @@ class SyncBackend:
             track = track_from_item(row, len(tracks))
             if track is not None:
                 tracks.append(track)
+        if build_snapshot is not None and consistent and offset == total:
+            try:
+                source.browsed_tracks = build_snapshot(hrmediasync.Scope("all", ""), rows)
+            except hrmediasync.JellyfinError:
+                # Browsing can still show items if the sync snapshot is invalid.
+                pass
         return tracks
 
     def album_art(self, source, track, pixels):
@@ -276,17 +298,84 @@ class SyncBackend:
                 return None
             raise
 
-    def preview(self, source, scope, port):
+    @staticmethod
+    def _source_tracks(source, scope):
+        return getattr(source, "browsed_tracks", None) if scope.kind == "all" else None
+
+    def preview(self, source, scope, port, *, cached_library=None):
         import hrmediasync
-        return hrmediasync.preview(source, scope, port, **self._serial())
+        return hrmediasync.preview(source, scope, port, cached_library=cached_library,
+                                    source_tracks=self._source_tracks(source, scope), **self._serial())
 
     def apply(self, source, plan, port):
         import hrmediasync
         return hrmediasync.apply(source, plan, port, **self._serial())
 
-    def apply_disk(self, source, plan, port):
+    @staticmethod
+    def disk_serial(port, live_port, live_serial):
+        if not port or (live_port and Path(port).resolve() == Path(live_port).resolve()):
+            return live_serial
         import hrdisksync
-        return hrdisksync.apply(source, plan, port)
+
+        identity = hrdisksync.usb_identity(hrdisksync.SYS_TTY / Path(port).resolve().name)
+        if identity is not None:
+            return identity[1]
+        if Path(port).parent == Path("/dev/serial/by-id"):
+            stable = re.search(r"_(2[0-9A-Fa-f]+)-if[0-9]+$", Path(port).name)
+            if stable is not None:
+                return stable[1]
+        return None
+
+    @staticmethod
+    def disk_volume(link_mode, port, selected_serial):
+        import hrdisksync
+
+        if (link_mode == "podlink" or port) and selected_serial is None:
+            return None
+        return hrdisksync.current_volume(selected_serial)
+
+    @staticmethod
+    def disk_player(volume):
+        import hrdisksync
+        return hrdisksync.disk_player(volume)
+
+    @staticmethod
+    def enter_disk(port):
+        import hrdisksync
+        return hrdisksync.mount_disk(port)
+
+    @staticmethod
+    def eject_disk(volume):
+        import hrdisksync
+        device = hrdisksync.disk_player(volume)
+        hrdisksync.eject_volume(volume)
+        if device is not None:
+            from serial.tools import list_ports
+
+            def returned():
+                for info in list_ports.comports():
+                    tty = hrdisksync.SYS_TTY / Path(info.device).name
+                    if hrdisksync.usb_identity(tty) == device:
+                        return True
+
+            hrdisksync.wait_for(returned, hrdisksync.WAIT_SECONDS, "等待 iPod 返回 PodLink 超时。")
+
+    @staticmethod
+    def refresh_disk(device):
+        import hrdisksync
+        import hrmediasync
+        hrdisksync.refresh_after_eject(device, hrmediasync.borrow_serial)
+
+    def preview_disk(self, source, scope, volume):
+        import hrdisksync
+        volume.mount()
+        return hrdisksync.preview_mounted(source, scope, volume,
+                                          source_tracks=self._source_tracks(source, scope))
+
+    def apply_disk(self, source, plan, volume, *, on_write):
+        import hrdisksync
+        volume.mount()
+        return hrdisksync.apply_mounted(source, plan, volume, on_write=on_write)
 
 
 # ----------------------------------------------------------------------
