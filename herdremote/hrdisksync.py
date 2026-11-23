@@ -102,6 +102,7 @@ class Volume:
     number: str
     usb: tuple
     manufacturer: str = ""
+    filesystem: str = "vfat"
 
     def present(self):
         try:
@@ -162,8 +163,9 @@ class Volume:
         mounts = self.mounts()
         if not mounts:
             raise RuntimeError("iPod FAT 卷未挂载。请挂载后重试。")
-        if len(mounts) != 1 or mounts[0][2:] != ("/", "vfat"):
-            raise RuntimeError("找不到唯一的 iPod FAT 根挂载点。")
+        if len(mounts) != 1 or mounts[0][2:] != ("/", self.filesystem):
+            raise RuntimeError("找不到唯一的 iPod FAT 根挂载点。"
+                               if self.filesystem == "vfat" else "找不到唯一的 iPod 根挂载点。")
         return mounts[0]
 
     def eject(self):
@@ -201,7 +203,7 @@ class Volume:
             raise RuntimeError("等待 UDisks 弹出 iPod 超时。") from error
 
 
-def _find_volume(matches):
+def _find_volume(matches, filesystems=("vfat",)):
     found = {}
     for uuid_path in UUIDS.glob("*"):
         try:
@@ -215,14 +217,15 @@ def _find_volume(matches):
         try:
             fs = run_host("lsblk", "--nodeps", "--noheadings", "--output", "FSTYPE",
                           str(block), timeout=2).strip()
-            if fs == "vfat":
+            if fs in filesystems:
                 number = (sys_block / "dev").read_text().strip()
-                found[block] = Volume(uuid_path, block, number, usb, usb_manufacturer(usb[0]))
+                found[block] = Volume(uuid_path, block, number, usb, usb_manufacturer(usb[0]), fs)
         except (OSError, RuntimeError):
             if usb_identity(sys_block) == usb:
                 raise
     if len(found) > 1:
-        raise RuntimeError("所选 iPod 有多个 FAT 卷，无法确定音乐资料库的位置。")
+        volume_type = "FAT 卷" if filesystems == ("vfat",) else "数据卷"
+        raise RuntimeError(f"所选 iPod 有多个 {volume_type}，无法确定音乐资料库的位置。")
     return next(iter(found.values()), None)
 
 
@@ -233,10 +236,10 @@ def disk_player(volume):
     return None
 
 
-def current_volume(podlink_serial=None):
-    """Find one Apple FAT volume by disk serial, without opening a tty."""
+def current_volume(podlink_serial=None, *, filesystems=("vfat",)):
+    """Find one Apple data volume by disk serial, without opening a tty."""
     expected = None if podlink_serial is None else "1" + podlink_serial[1:]
-    return _find_volume(lambda usb: expected is None or usb[1] == expected)
+    return _find_volume(lambda usb: expected is None or usb[1] == expected, filesystems)
 
 
 def find_volume(device):

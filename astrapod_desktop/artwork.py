@@ -158,6 +158,8 @@ class ArtStore(QtCore.QObject):
                         on_progress=progress)
 
     def _fetch(self) -> None:
+        if not self.enabled:
+            self._queued.clear()
         if not self._queued:
             return
         serial = self.serial
@@ -165,10 +167,12 @@ class ArtStore(QtCore.QObject):
         for key, _track in batch:
             self._inflight.add((serial, key))
         library = self.library
+        session_for_device = getattr(library, "session_for_device", None)
+        open_session = session_for_device() if session_for_device else library.session
         remaining = {key for key, _track in batch}
 
         def work(job):
-            with library.session() as session:
+            with open_session() as session:
                 for key, track in batch:
                     if job.cancelled:
                         break

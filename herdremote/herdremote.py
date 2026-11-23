@@ -541,7 +541,7 @@ class Daemon:
         else:
             from serial.tools import list_ports
             device = find_device(list_ports.comports())
-        if not device:
+        if not device or not os.path.exists(device):
             return False
         try:
             self.port = podlink.serial_port(device, 2)

@@ -188,6 +188,7 @@ class LinkChip(QtWidgets.QWidget):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    device_changed = Signal()
     port_changed = Signal(str)          # the saved iPod port; empty is auto-detect
 
     def __init__(self, theme_manager, services: Services, parent=None):
@@ -195,6 +196,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.theme_manager = theme_manager
         self.services = services
         self.runtime = None
+        self.device = None
+        self._stock_read_started = False
         self.setWindowTitle("AstraPod")
         self.setMinimumSize(720, 560)
         self.resize(1260, 820)
@@ -259,6 +262,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.library_state.load_cached()
         self.navigate(self.prefs.get("page") if self.prefs.get("page") in self.pages else "songs")
         self._daemon_state(self.daemon.state)
+        self._device_timer = QtCore.QTimer(self)
+        self._device_timer.setInterval(1500)
+        self._device_timer.timeout.connect(self._poll_device)
+        if hasattr(services.library, "detect_device"):
+            self._poll_device()
+            self._device_timer.start()
         if self._settings_error is not None:
             QtCore.QTimer.singleShot(0, lambda: self.show_error(self._settings_error))
 
@@ -288,6 +297,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.services.library.port = value
         self.save_prefs()
         if key == "port" and changed:
+            self._poll_device()
             self.port_changed.emit(value)
 
     # Layout -------------------------------------------------------------
@@ -592,14 +602,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def track_detail(self, track, callback) -> None:
         """callback(track, detail, error) on the GUI thread; cached per track."""
-        key = (self.library_state.serial, track.index, track.path)
+        state = self.library_state
+        key = (state.art_identity, track.index, track.path)
+        if self.device is not None and state.source != "device":
+            callback(track, None, RuntimeError("请连接歌曲来源的 iPod 并读取资料库。"))
+            return
         if key in self.details:
             callback(track, self.details[key], None)
             return
         library = self.services.library
 
+        session_for_device = getattr(library, "session_for_device", None)
+        open_session = session_for_device() if session_for_device else library.session
+
         def work(_job):
-            with library.session() as session:
+            with open_session() as session:
                 return session.detail(track)
 
         def done(detail):
@@ -618,6 +635,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.info_dialog = dialog
 
     def confirm_delete(self, tracks) -> None:
+        if not self.library_state.can_delete:
+            return
         managed = [t for t in tracks if t.managed]
         if not managed:
             self.flash("只能删除用 PodLink 导入或 Jellyfin 同步到 iPod 的歌曲。")
@@ -678,29 +697,63 @@ class MainWindow(QtWidgets.QMainWindow):
             self.import_paths(paths)
 
     # Daemon state ---------------------------------------------------------
-    def _daemon_state(self, state: dict) -> None:
-        link = state.get("link") or {}
+    def _poll_device(self) -> None:
+        library = self.services.library
+        detect = getattr(library, "detect_device", None)
+        if detect is None:
+            return
+        device = detect()
+        if device != self.device:
+            self.device = library.device = device
+            self._stock_read_started = False
+            self.library_state.device_changed(device)
+            self.disk.set_device(device)
+            self.device_changed.emit()
+            self._daemon_state(self.daemon.state)
+        self._maybe_read_stock()
+
+    def _maybe_read_stock(self) -> None:
+        state = self.library_state
+        if (self.device is not None and self.device.kind == "stock"
+                and self.isVisible() and not self.isMinimized() and not self.busy
+                and not state.loading and not self._stock_read_started):
+            self._stock_read_started = True
+            state.refresh(False)
+
+    def link_state(self) -> dict:
+        remote = self.daemon.state.get("link") or {}
+        device = self.device
+        if device is None:
+            return remote
+        mode = device.link_mode
+        return dict(connected=mode != "none", mode=mode, serial=device.serial,
+                    port=device.port, borrowed=mode == "podlink" and remote.get("borrowed", False),
+                    firmware=remote.get("firmware") if mode == "podlink" else None)
+
+    def _daemon_state(self, _state: dict) -> None:
+        link = self.link_state()
         disk_key = (self.daemon.connected, link.get("mode"), link.get("serial"),
                     link.get("port"), link.get("borrowed"))
         if disk_key != self._disk_link_key:
             self._disk_link_key = disk_key
             self.disk.update()
         t = self.theme_manager.tokens
-        if not self.daemon.connected:
+        if not self.daemon.connected and not link.get("connected"):
             self.link_chip.dot.set_state(QtGui.QColor(t.idle), False)
             self.link_chip.title.setText("后台服务未连接")
             self.link_chip.detail.setText("远程、Agent 和 Usage 暂不可用")
         elif link.get("connected"):
             self.link_chip.dot.set_state(QtGui.QColor(t.working), link.get("borrowed", False))
             self.link_chip.title.setText("iPod 已连接")
-            mode = {"podlink": "PodLink", "disk": "磁盘模式"}.get(link.get("mode"), "")
+            mode = {"podlink": "PodLink", "disk": "磁盘模式",
+                    "stock": "Apple 原厂固件"}.get(link.get("mode"), "")
             detail = "电脑正在使用串口" if link.get("borrowed") else " ".join(
                 x for x in (mode, link.get("port") or "") if x)
             self.link_chip.detail.setText(detail)
         else:
             self.link_chip.dot.set_state(QtGui.QColor(t.idle), False)
             self.link_chip.title.setText("iPod 未连接")
-            self.link_chip.detail.setText("用 USB 连接并打开 PodLink")
+            self.link_chip.detail.setText("用 USB 连接 iPod Classic")
         self.link_chip.refresh_tooltip()
         key = (bool(link.get("connected")), link.get("port"), link.get("mode"))
         if key != self._link_key:
@@ -711,10 +764,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_lcd(self) -> None:
         if self.lcd.activity:
             return
-        link = self.daemon.state.get("link") or {}
+        link = self.link_state()
         state = self.library_state
         if link.get("connected"):
-            detail = f"{len(state.tracks):,} 首歌曲" if state.tracks else "已连接，尚未读取资料库"
+            if state.source == "device":
+                detail = f"{len(state.tracks):,} 首歌曲"
+            else:
+                detail = "Apple 原厂固件" if link.get("mode") == "stock" else "已连接，尚未读取资料库"
             self.lcd.set_idle("iPod 已连接", detail, connected=True)
         elif state.tracks:
             self.lcd.set_idle("AstraPod", f"资料库：{len(state.tracks):,} 首歌曲（上次读取）")
@@ -806,6 +862,10 @@ class MainWindow(QtWidgets.QMainWindow):
     @property
     def busy(self) -> bool:
         return self.runner.busy
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._maybe_read_stock()
 
     def closeEvent(self, event) -> None:
         if self.busy or (self.runtime is not None and self.runtime.tray is not None):

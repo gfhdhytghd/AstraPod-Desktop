@@ -237,8 +237,24 @@ def _open_database(device, stage, *, artwork_only=False):
         checksum=device.checksum, sqlite=device.sqlite, artwork_only=artwork_only)
 
 
+def _ownership(root, owners, tracks):
+    by_id = {track.id: track for track in tracks}
+    result = {}
+    for name, owner in owners.items():
+        track = by_id.get(owner.id)
+        if (track and _row_path(track.path).casefold() == owner.path.casefold()
+                and track.size_bytes == owner.size):
+            path = checked_path(root, *_music_parts(owner.path))
+            # A missing file can be repaired by replacing its old DB record.
+            # A differently sized file may belong to another library manager.
+            if path is None or path.stat().st_size == owner.size:
+                result[name] = (owner.id, path)
+    return result
+
+
+
 class _Session:
-    def __init__(self, device, root, tunes, check, stage):
+    def __init__(self, device, root, tunes, check, stage, volume_key=None):
         self.device = device
         self.root = root
         self.tunes = tunes
@@ -266,8 +282,10 @@ class _Session:
                         digest.update(chunk)
                     fingerprint.update(digest.digest())
         fingerprint.update(self.owners_raw or b"")
-        opened = root.stat()
-        fingerprint.update(f"{opened.st_dev}:{opened.st_ino}".encode())
+        if volume_key is None:
+            opened = root.stat()
+            volume_key = (opened.st_dev, opened.st_ino)
+        fingerprint.update(json.dumps(volume_key).encode())
         self.identity = "stock:" + fingerprint.hexdigest()
 
     def validate_snapshot(self):
@@ -280,18 +298,7 @@ class _Session:
         return _open_database(self.device, self.stage)
 
     def ownership(self, tracks):
-        by_id = {track.id: track for track in tracks}
-        result = {}
-        for name, owner in self.owners.items():
-            track = by_id.get(owner.id)
-            if (track and _row_path(track.path).casefold() == owner.path.casefold()
-                    and track.size_bytes == owner.size):
-                path = checked_path(self.root, *_music_parts(owner.path))
-                # A missing file can be repaired by replacing its old DB record.
-                # A differently sized file may belong to another library manager.
-                if path is None or path.stat().st_size == owner.size:
-                    result[name] = (owner.id, path)
-        return result
+        return _ownership(self.root, self.owners, tracks)
 
     def inventory(self, identity, candidates, tracks):
         owned = self.ownership(tracks)
@@ -371,10 +378,10 @@ class _Session:
 
 
 @contextmanager
-def _session(root, *, write=False):
+def _session(root, *, write=False, volume_key=None):
     with (_volume(root, write=write) as (device, pinned, tunes, check),
           TemporaryDirectory(prefix="astrapod-stock-") as directory):
-        session = _Session(device, pinned, tunes, check, Path(directory))
+        session = _Session(device, pinned, tunes, check, Path(directory), volume_key)
         with session.open_database() as database:
             yield session, database
 
@@ -390,22 +397,67 @@ def _device_row(track, managed):
         last_played=track.last_played, mtime=track.mtime, managed=managed)
 
 
+def _library_files(device, pinned, tunes):
+    primary = pinned / device.database.relative_to(device.root)
+    yield _STOCK_FILES[primary.name.casefold()], primary
+    sidecars = ["Play Counts", "iTunesStats", "PlayCounts.plist", "OTGPlaylistInfo"]
+    sidecars.extend(sorted(item.name for item in tunes.iterdir()
+                           if re.fullmatch(r"OTGPlaylistInfo_\d+", item.name, re.I)))
+    for name in sidecars:
+        path = checked_path(tunes, name)
+        if path is not None:
+            yield name, path
+
+
 def read_library(root):
-    with _session(root) as (session, database):
-        tracks = database.tracks
-        managed = {track_id for track_id, _ in session.ownership(tracks).values()}
-        return StockLibrary(tuple(_device_row(track, track.id in managed) for track in tracks),
-                            database.playlists)
+    with (_volume(root) as (device, pinned, tunes, check),
+          TemporaryDirectory(prefix="astrapod-stock-library-") as directory):
+        stage = Path(directory)
+        target = stage / "iPod_Control/iTunes"
+        target.mkdir(parents=True)
+        for name, path in _library_files(device, pinned, tunes):
+            shutil.copyfile(path, target / name, follow_symlinks=False)
+        _stage_sysinfo(device, stage)
+        _, owners = _read_owners(pinned, tunes)
+        with _open_database(device, stage) as database:
+            tracks = database.tracks
+            managed = {track_id for track_id, _ in _ownership(pinned, owners, tracks).values()}
+            result = StockLibrary(tuple(_device_row(track, track.id in managed) for track in tracks),
+                                  database.playlists)
+        check()
+        return result
 
 
-def random_artwork(root, previous=None):
+def library_identity(root):
+    """Content identity for cached stock tracks, playlists and artwork."""
+    with _volume(root) as (device, pinned, tunes, check):
+        digest = sha256()
+        files = list(_library_files(device, pinned, tunes))
+        files.extend((name, path) for name, path in (
+            (_OWNERS, checked_path(tunes, _OWNERS)),
+            ("ArtworkDB", checked_path(pinned, "iPod_Control", "Artwork", "ArtworkDB")),
+        ) if path is not None)
+        for name, path in files:
+            value = sha256()
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    value.update(chunk)
+            digest.update(os.fsencode(name) + b"\0" + value.digest())
+        check()
+        return digest.hexdigest()
+
+
+@contextmanager
+def artwork_library(root):
+    """Open the native artwork index once for a batch of cover requests."""
     with (_volume(root) as (device, pinned, _tunes, check),
           TemporaryDirectory(prefix="astrapod-stock-art-") as directory,
           ExitStack() as thumbnails):
         artwork = checked_path(pinned, "iPod_Control", "Artwork", directory=True)
         index = checked_path(artwork, "ArtworkDB") if artwork else None
         if index is None:
-            return None
+            yield None
+            return
 
         stage = Path(directory)
         stage_art = stage / "iPod_Control/Artwork"
@@ -430,30 +482,36 @@ def random_artwork(root, previous=None):
             (stage_art / path.name).symlink_to(f"/proc/self/fd/{fd}")
         check()
         with _open_database(device, stage, artwork_only=True) as database:
-            result = database.random_artwork(previous, size=256)
+            yield database
         check()
+
+
+def random_artwork(root, previous=None):
+    with artwork_library(root) as database:
+        result = database.random_artwork(previous, size=256) if database else None
         if result is not None:
             album, thumbnail = result
             return album, hrlibrary.Artwork(*thumbnail)
 
 
-def inventory(root, identity, tracks=()):
-    with _session(root) as (session, database):
+def inventory(root, identity, tracks=(), *, volume_key=None):
+    with _session(root, volume_key=volume_key) as (session, database):
         return session.inventory(identity, tracks, database.tracks)
 
 
-def preview(root, source, scope):
+def preview(root, source, scope, *, volume_key=None):
+    """Use the caller-validated physical volume key across remounts, if supplied."""
     tracks = source.tracks(scope)
-    current = inventory(root, source.identity, tracks)
+    current = inventory(root, source.identity, tracks, volume_key=volume_key)
     return hrmediasync.Plan(source.identity, scope, current.device, tracks,
                             current.owned, current.matched)
 
 
-def apply(root, source, plan):
+def apply(root, source, plan, *, volume_key=None):
     if not plan.device.startswith("stock:"):
         raise RuntimeError("Build a stock iPod preview before applying this plan")
     hrmediasync.validate_source(source, plan)
-    with _session(root, write=True) as (session, database):
+    with _session(root, write=True, volume_key=volume_key) as (session, database):
         tracks = database.tracks
         current = session.inventory(plan.identity, plan.tracks, tracks)
         if current != StockInventory(plan.device, plan.owned, plan.matched):
@@ -491,7 +549,7 @@ def apply(root, source, plan):
     return len(additions), len(plan.removals)
 
 
-def import_files(root, paths, progress=None, skip_duplicates=True):
+def import_files(root, paths, progress=None, skip_duplicates=True, *, before_commit=None):
     def event(path, state, *, sent=0, total=0, error=None):
         if progress is not None:
             progress(dict(file=str(path), state=state, sent=sent, total=total, error=error))
@@ -527,6 +585,8 @@ def import_files(root, paths, progress=None, skip_duplicates=True):
                 known[tags.key].append(tags)
 
         if stored:
+            if before_commit is not None:
+                before_commit()
             uploads = {session.root / device_path[1:]: (path, media)
                        for path, media, device_path in stored}
 

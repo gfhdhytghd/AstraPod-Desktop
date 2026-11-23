@@ -462,7 +462,7 @@ class FakeProber:
     def __init__(self):
         self.thumbs = Path(tempfile.mkdtemp(prefix="astrapod-thumbs-"))
 
-    def probe(self, path):
+    def probe(self, path, *, stock=False):
         path = Path(path)
         time.sleep(0.01)
         digest = hashlib.sha1(str(path).encode()).digest()
@@ -470,13 +470,14 @@ class FakeProber:
         artist, _, title = stem.partition(" - ")
         result = ProbedFile(path, title=title or stem, artist=artist if title else "",
                             album="Demo Imports", length_ms=180_000 + digest[0] * 600,
-                            codec={".flac": "flac", ".mp3": "mp3", ".m4a": "aac"}.get(
+                            codec={".flac": "flac", ".mp3": "mp3", ".m4a": "aac",
+                                   ".wav": "pcm_s16le"}.get(
                                 path.suffix.lower(), ""),
                             sample_rate=96000 if digest[1] % 3 == 0 else 44100,
                             bits=24 if digest[1] % 3 == 0 else 16,
                             bitrate_kbps=900, size_bytes=20_000_000 + digest[2] * 10000,
                             track=digest[3] % 12 + 1)
-        if not result.supported:
+        if not result.supported and not (stock and path.suffix.lower() == ".wav"):
             result.error = "只能导入 FLAC、M4A 和 MP3 文件"
             return result
         target = self.thumbs / f"{digest.hex()[:16]}.png"

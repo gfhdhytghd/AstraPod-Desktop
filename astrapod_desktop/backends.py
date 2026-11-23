@@ -5,8 +5,9 @@ never test which one they hold.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from functools import partial
 import hashlib
 import json
 import os
@@ -97,7 +98,7 @@ class LibrarySession:
 
 
 class DeviceLibrary:
-    """Opens a PodLink session per job, borrowing the port from the daemon."""
+    """Open a library session for the selected firmware."""
 
     demo = False
 
@@ -110,18 +111,50 @@ class DeviceLibrary:
             self.cache = FallbackLibraryCache(self.cache_dir)
         self.borrow = False
         self.port = ""
+        self.device = None
+        self._selected_port = None
+        self._selected_serial = None
 
     @property
     def available(self) -> bool:
         return self.module is not None
 
+    def detect_device(self):
+        import hrstockdevice
+        if self._selected_port != self.port:
+            self._selected_port = self.port
+            self._selected_serial = None
+        device = hrstockdevice.current_device(self.port, podlink_serial=self._selected_serial)
+        if self.port and device.kind == "podbox-podlink":
+            self._selected_serial = device.serial
+        return device
+
+    def session_for_device(self, *, authorize=False):
+        return partial(self.session, device=self.device, authorize=authorize)
+
     @contextmanager
-    def session(self):
+    def session(self, *, device=None, authorize=False):
+        if device is None:
+            device = self.device or self.detect_device()
+        if device != self.device and self.device is not None:
+            raise RuntimeError("所选 iPod 已更改。")
+        if device.kind == "stock":
+            from hrstockdevice import stock_mount
+            from .stock_library import StockLibrarySession
+
+            with ExitStack() as stack:
+                root = stack.enter_context(stock_mount(device, authorize=authorize))
+                yield StockLibrarySession(root, device.serial, stack)
+            return
+        if device.kind != "podbox-podlink":
+            raise RuntimeError("请用 USB 连接 iPod Classic。PodBox 须进入 PodLink 模式。")
         if self.module is None:
             raise RuntimeError("这个版本缺少 iPod 资料库模块（hrlibrary）。")
         import hrmediasync
         serial_access = hrmediasync.borrow_serial if self.borrow else nullcontext
-        with serial_access(), hrmediasync.connect_device(self.port) as (link, identity):
+        with serial_access(), hrmediasync.connect_device(device.port or self.port) as (link, identity):
+            if device.serial and device.serial != identity:
+                raise RuntimeError("所选 iPod 已更改。")
             yield LibrarySession(self.module, link, identity)
 
     def import_disk(self, paths, progress, skip_duplicates=True, *, volume, on_write):
@@ -135,15 +168,16 @@ class DeviceLibrary:
     def _last_path(self) -> Path:
         return self.cache_dir / "last.json"
 
-    def remember(self, serial, summary) -> None:
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        payload = {"serial": serial,
+    def remember(self, serial, summary, *, stock=False) -> None:
+        from podlink_settings import write_private
+
+        payload = {"serial": serial, "stock": stock,
                    "summary": {name: getattr(summary, name)
                                for name in contracts.DeviceSummary.__dataclass_fields__}}
-        self._last_path().write_text(json.dumps(payload), "utf-8")
+        write_private(self._last_path(), json.dumps(payload))
 
     def last(self):
-        """(serial, summary, tracks) from the cache, or None."""
+        """The last cached library, with playlists for an Apple database."""
         try:
             payload = json.loads(self._last_path().read_text("utf-8"))
             summary = contracts.DeviceSummary(**payload["summary"])
@@ -152,6 +186,10 @@ class DeviceLibrary:
         tracks = self.cache.load(payload["serial"], summary.commit_id)
         if tracks is None:
             return None
+        if payload.get("stock"):
+            from .stock_library import cached_playlists
+            playlists = cached_playlists(self.cache_dir, payload["serial"], summary.commit_id)
+            return payload["serial"], summary, tracks, playlists or ()
         return payload["serial"], summary, tracks
 
     def art_path(self, serial, track, size) -> Path:
@@ -601,6 +639,7 @@ class ProbedFile:
 
 
 IMPORT_SUFFIXES = {".flac", ".m4a", ".mp3"}
+STOCK_IMPORT_SUFFIXES = IMPORT_SUFFIXES | {".wav"}
 
 
 def _leading_int(value) -> int:
@@ -621,7 +660,7 @@ class FileProber:
     def __init__(self, thumbs: Path | None = None):
         self.thumbs = Path(thumbs) if thumbs else cache_root() / "import-thumbs"
 
-    def probe(self, path: Path) -> ProbedFile:
+    def probe(self, path: Path, *, stock=False) -> ProbedFile:
         import subprocess
         result = ProbedFile(Path(path))
         try:
@@ -629,8 +668,10 @@ class FileProber:
         except OSError as error:
             result.error = str(error)
             return result
-        if not result.supported:
-            result.error = "只能导入 FLAC、M4A 和 MP3 文件"
+        suffixes = STOCK_IMPORT_SUFFIXES if stock else IMPORT_SUFFIXES
+        if result.path.suffix.lower() not in suffixes:
+            result.error = ("只能导入 FLAC、M4A、MP3 和 WAV 文件" if stock else
+                            "只能导入 FLAC、M4A 和 MP3 文件")
             return result
         try:
             out = subprocess.run(
@@ -685,9 +726,10 @@ class FileProber:
         return target if target.exists() else None
 
 
-def expand_paths(paths) -> list[Path]:
+def expand_paths(paths, *, stock=False) -> list[Path]:
     """Files as given, folders recursively, in a stable order."""
     found: list[Path] = []
+    suffixes = STOCK_IMPORT_SUFFIXES if stock else IMPORT_SUFFIXES
     for raw in paths:
         path = Path(raw)
         if path.is_dir():
@@ -695,7 +737,7 @@ def expand_paths(paths) -> list[Path]:
                 dirs.sort()
                 for name in sorted(files):
                     candidate = Path(root) / name
-                    if candidate.suffix.lower() in IMPORT_SUFFIXES:
+                    if candidate.suffix.lower() in suffixes:
                         found.append(candidate)
         elif path.is_file():
             found.append(path)

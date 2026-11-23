@@ -11,7 +11,7 @@ from ..qt import QtCore, QtGui, QtSvg, QtWidgets, Qt
 from ..widgets import (CapacityBar, PageHeader, button, label, make_badge,
                        make_card, set_badge)
 from . import Page
-from .stock_screen import StockCoverPanel, StockMount, discover_stock
+from .stock_screen import StockCoverPanel
 
 R = QtCore.QRectF
 P = QtCore.QPointF
@@ -61,7 +61,7 @@ class IPodDrawing(QtWidgets.QWidget):
         self.setFixedSize(round(230 * scale), round(380 * scale))
         self.update()
 
-    def set_state(self, model: str, connected: bool, stock: StockMount | None) -> None:
+    def set_state(self, model: str, connected: bool, stock) -> None:
         self.model = model or "ipod6g"
         self.connected = connected
         self.stock = stock is not None
@@ -204,13 +204,9 @@ class DevicePage(Page):
         self.layout_.addWidget(self.scroll)
         self.scroll.viewport().installEventFilter(self)
 
-        self.stock_mount = StockMount()
-        self._probing = False
-        self._probe_timer = QtCore.QTimer(self)
-        self._probe_timer.setInterval(2000)
-        self._probe_timer.timeout.connect(self._probe_stock)
         window.installEventFilter(self)
         window.library_state.changed.connect(self.update_view)
+        window.device_changed.connect(self.update_view)
         window.daemon.state_changed.connect(lambda _s: self.update_view())
         self.update_view()
 
@@ -235,7 +231,6 @@ class DevicePage(Page):
         self._sync_screen_activity()
 
     def hideEvent(self, event) -> None:
-        self._probe_timer.stop()
         self.drawing.cover_panel.set_visible(False, self.window_.motion)
         super().hideEvent(event)
 
@@ -243,77 +238,50 @@ class DevicePage(Page):
         window = self.window_
         visible = self.isVisible() and not window.isMinimized()
         self.drawing.cover_panel.set_visible(visible, window.motion)
-        link = window.daemon.state.get("link") or {}
-        if visible and not (window.daemon.demo or link.get("connected") or link.get("borrowed")):
-            if not self._probe_timer.isActive():
-                self._probe_timer.start()
-                self._probe_stock()
-        else:
-            self._probe_timer.stop()
-
-    def _probe_stock(self, force: bool = False) -> None:
-        if self._probing:
-            return
-        previous = StockMount() if force else self.stock_mount
-        self._probing = True
-
-        def done(result):
-            self._probing = False
-            if self._probe_timer.isActive() and (force or result != self.stock_mount):
-                if force:
-                    self.drawing.cover_panel.set_source(None)
-                self.stock_mount = result
-                self.update_view()
-
-        self.window_.runner.run("识别原厂 iPod", lambda _job: discover_stock(previous),
-                                done, lambda _error: done(StockMount()),
-                                foreground=False, device=False)
 
     def refresh(self) -> None:
-        if self._probe_timer.isActive() and (self.stock_mount.root or self.stock_mount.unsupported):
-            self._probe_stock(force=True)
-            return
-        self.window_.library_state.refresh(False)
+        stock = self.window_.link_state().get("mode") == "stock"
+        self.window_.library_state.refresh(stock)
 
     def update_view(self) -> None:
         state = self.window_.library_state
-        link = self.window_.daemon.state.get("link") or {}
-        if link.get("connected") or link.get("borrowed"):
-            self.stock_mount = StockMount()
-        stock = self.stock_mount if self.stock_mount.root is not None else None
-        summary = None if stock else state.summary
-        connected = bool(stock or link.get("connected") or state.source == "device")
+        link = self.window_.link_state()
+        stock = self.window_.device if link.get("mode") == "stock" else None
+        info = state.stock_info if stock and state.serial == stock.serial else None
+        summary = state.summary if (info or not (stock or state.stock)) else None
+        connected = bool(link.get("connected") or state.source == "device")
         model = summary.model if summary else "ipod6g"
-        self.name.setText(MODEL_NAMES.get(model, "iPod"))
-        if stock:
-            set_badge(self.link_badge, "已连接，原厂固件", "success")
-        elif link.get("connected"):
-            mode = {"podlink": "PodLink", "disk": "磁盘模式"}.get(link.get("mode"), "已连接")
+        display_model = info.model if info else MODEL_NAMES.get(model, model)
+        self.name.setText(display_model)
+        if link.get("connected"):
+            mode = {"podlink": "PodLink", "disk": "磁盘模式",
+                    "stock": "原厂固件"}.get(link.get("mode"), "已连接")
             set_badge(self.link_badge, f"已连接，{mode}", "success")
         elif state.loading:
             set_badge(self.link_badge, "正在读取…", "busy")
         else:
             set_badge(self.link_badge, "未连接", "neutral")
         if stock:
-            self.tagline.setText("显示原厂 iPod Classic 的主菜单。")
-        elif self.stock_mount.unsupported:
-            self.tagline.setText("原厂固件仅支持 iPod Classic 第六、六点五和第七代。")
+            self.tagline.setText("Apple 原厂固件")
         elif summary is None:
-            self.tagline.setText("用 USB 连接 iPod 并打开 PodLink，然后点刷新读取它的信息。")
+            self.tagline.setText("用 USB 连接 iPod Classic，然后点刷新读取它的信息。")
         elif state.source == "cache":
             self.tagline.setText("显示的是上次读取的信息。")
         else:
             self.tagline.setText("信息来自刚才连接的 iPod。")
-        serial = None if stock else link.get("serial") or state.serial
+        serial = (info.serial_number if info else None) or link.get("serial") or state.serial
+        firmware = (summary.firmware if summary else link.get("firmware")) or "—"
+        if stock:
+            firmware = f"Apple 原厂固件 {firmware}" if firmware != "—" else "Apple 原厂固件"
         values = {
-            "model": MODEL_NAMES.get(model, model) + ("（第六、七代）" if model == "ipod6g" else
-                                                      "（第五代）" if model == "ipodvideo" else ""),
-            "firmware": ("Apple 原厂固件" if stock else
-                         (summary.firmware if summary else link.get("firmware")) or "—"),
+            "model": (f"{display_model}（{info.model_number}）" if info and info.model_number
+                      else display_model),
+            "firmware": firmware,
             "serial": serial or "—",
             "capacity": fmt.size(summary.total_bytes) if summary else "—",
             "tracks": f"{summary.track_count:,} 首" if summary else "—",
             "database": ("—" if summary is None else
+                         "iTunes 资料库" if stock else
                          f"就绪，第 {summary.commit_id} 次提交" if summary.database_ready
                          else "正在更新"),
         }
@@ -337,9 +305,7 @@ class DevicePage(Page):
         self._sync_screen_activity()
 
     def shown(self) -> None:
-        state = self.window_.library_state
-        if state.summary is not None:
-            self.update_view()
+        self.update_view()
 
     def apply_theme(self, tokens) -> None:
         self.capacity.tokens = tokens

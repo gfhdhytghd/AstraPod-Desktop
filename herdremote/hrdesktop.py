@@ -22,7 +22,7 @@ import hrvoice
 from hrrufin import RufinClient, loopback_url
 from hrjellyfin import JellyfinClient, https_base
 import podlink_settings
-from podlink_disk import UUID_PATH
+from hrstockdevice import current_device
 
 log = logging.getLogger("herdremote.desktop")
 
@@ -596,11 +596,14 @@ def detail_record(payload):
 def link_state(daemon):
     active = bool(daemon.link and daemon.link.opened)
     borrowed = daemon.disk_control.serial_lease is not None
-    disk = not active and not borrowed and os.path.exists(UUID_PATH)
-    return dict(connected=active or disk, port=daemon.link_device if active or borrowed else None,
-                mode="podlink" if active or borrowed else "disk" if disk else "none",
-                serial=daemon.link_serial if active or borrowed else None,
-                borrowed=borrowed, firmware=None)
+    if active or borrowed:
+        return dict(connected=active, mode="podlink", port=daemon.link_device,
+                    serial=daemon.link_serial, borrowed=borrowed, firmware=None)
+
+    device = current_device(getattr(daemon.args, "port", ""))
+    mode = device.link_mode
+    return dict(connected=mode in ("disk", "stock"), mode=mode, port=device.port,
+                serial=device.serial or None, borrowed=False, firmware=None)
 
 
 def workspace_state(model, state_seen):

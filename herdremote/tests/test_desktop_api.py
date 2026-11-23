@@ -20,6 +20,7 @@ import hrdisk
 import hrdesktop
 import hrherdr
 import hrproto
+from hrstockdevice import DeviceState
 import hrusage
 
 
@@ -28,7 +29,8 @@ class DesktopAPI(unittest.TestCase):
         runtime = TemporaryDirectory(dir=os.environ.get("XDG_RUNTIME_DIR"))
         self.addCleanup(runtime.cleanup)
         self.enterContext(patch.dict(os.environ, XDG_RUNTIME_DIR=runtime.name))
-        self.enterContext(patch.object(hrdesktop, "UUID_PATH", runtime.name + "/fake-volume"))
+        self.device = self.enterContext(patch.object(hrdesktop, "current_device",
+                                                     return_value=DeviceState("none")))
         self.make_bridge = self.enterContext(patch.object(hrdesktop, "make_bridge",
             side_effect=AssertionError("unexpected iPod bridge startup")))
         self.daemon = herdremote.Daemon(SimpleNamespace(socket=runtime.name + "/fake-herdr",
@@ -90,6 +92,11 @@ class DesktopAPI(unittest.TestCase):
         self.assertEqual(self.call("subscribe", client, **args),
                          dict(id=7, ok=True, result=None))
         return self.receive(client)["state"]
+
+    def test_stock_link_state_has_no_podlink_port(self):
+        self.device.return_value = DeviceState("stock", serial="APPLE")
+        self.assertEqual(self.subscribe()["link"], dict(connected=True, mode="stock",
+                         port=None, serial="APPLE", borrowed=False, firmware=None))
 
     def test_hello_multiple_clients_unknown_and_utf8_lines(self):
         second = self.connect()

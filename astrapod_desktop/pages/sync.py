@@ -1,11 +1,9 @@
-"""Jellyfin sync: log in, choose a scope, preview the difference, apply.
-A successful sign-in is kept across restarts until the owner signs out, and
-the 资料库 pages browse Jellyfin through it. The iPod is the one the device
-page's serial port reaches."""
+"""Jellyfin sync: log in, choose a scope, preview the difference, apply."""
 from __future__ import annotations
 
 import os
 
+from .. import stock_transfer
 from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal
 from ..widgets import (ChevronComboBox, PageHeader, PasswordLineEdit, SegmentedControl, ToggleSwitch,
                        button, label, make_badge, make_card, qcolor, set_badge)
@@ -18,21 +16,27 @@ SCOPE_PREFIXES = {"all": "", "library": "音乐库：", "playlist": "播放列�
 
 class DiskModeSwitch(ToggleSwitch):
     hint = "开启后挂载 iPod 的 USB 磁盘。关闭后安全弹出。"
+    stock_hint = "Apple 原厂固件使用 USB 磁盘传输，无需切换磁盘模式。"
 
-    def __init__(self, disk):
+    def __init__(self, disk, hint_label):
         super().__init__()
         self.disk = disk
+        self.hint_label = hint_label
         self.setAccessibleName("磁盘模式")
-        self.setAccessibleDescription(self.hint)
         self.disk.changed.connect(self.refresh)
         self.toggled.connect(self.disk.request)
         self.refresh()
 
     def refresh(self):
+        stock = self.disk.mode == "stock"
+        hint = self.stock_hint if stock else self.hint
         with QtCore.QSignalBlocker(self):
             self.setChecked(self.disk.mode == "disk")
-        self.setEnabled(self.disk.can_switch)
-        self.setToolTip(self.disk.problem or self.hint)
+        self.setVisible(not stock)
+        self.setEnabled(not stock and self.disk.can_switch)
+        self.hint_label.setText(hint)
+        self.setAccessibleDescription(hint)
+        self.setToolTip(self.disk.problem or hint)
 
 
 def disk_mode_option(window, layout):
@@ -40,9 +44,10 @@ def disk_mode_option(window, layout):
     column = QtWidgets.QVBoxLayout()
     column.setSpacing(2)
     column.addWidget(label("磁盘模式", "field-label"))
-    column.addWidget(label(DiskModeSwitch.hint, "helper", wrap=True))
+    hint = label("", "helper", wrap=True)
+    column.addWidget(hint)
     row.addLayout(column, 1)
-    switch = DiskModeSwitch(window.disk)
+    switch = DiskModeSwitch(window.disk, hint)
     row.addWidget(switch)
     layout.addLayout(row)
     return switch
@@ -440,7 +445,12 @@ class SyncPage(Page):
 
     def _show_port(self) -> None:
         port = self.port()
-        self.port_label.setText(f"iPod 串口：{port}" if port else "iPod 串口：自动识别")
+        stock = self.window_.disk.mode == "stock"
+        self.port_button.setVisible(not stock)
+        if stock:
+            self.port_label.setText("iPod 连接：Apple 原厂固件")
+        else:
+            self.port_label.setText(f"iPod 串口：{port}" if port else "iPod 串口：自动识别")
 
     def _port_changed(self, _port: str) -> None:
         self._show_port()
@@ -448,9 +458,10 @@ class SyncPage(Page):
 
     def _disk_changed(self):
         disk = self.window_.disk
-        key = (disk.mode, disk.volume, disk.serial)
+        key = (disk.mode, disk.volume, disk.serial, disk.stock)
         if key != self._disk_target:
             self._disk_target = key
+            self._show_port()
             if self.plan is not None:
                 self.invalidate_plan()
                 self.status.setText("iPod 的连接已更改，请重新预览。")
@@ -581,17 +592,19 @@ class SyncPage(Page):
                 or not 0 <= index < len(self.scopes)):
             return
         scope, source, port = self.scopes[index], self.source, self.port()
-        volume = disk.volume
+        volume, stock = disk.volume, disk.stock
         cache = self.window_.library_state.snapshot()
-        target = (disk.mode, volume, disk.serial)
+        target = (disk.mode, volume, disk.serial, stock)
 
         def work():
+            if stock is not None:
+                return stock_transfer.preview(stock, source, scope)
             if volume is not None:
                 return self.backend.preview_disk(source, scope, volume)
             return self.backend.preview(source, scope, port, cached_library=cache)
 
         def done(plan):
-            if target == (disk.mode, disk.volume, disk.serial):
+            if target == (disk.mode, disk.volume, disk.serial, disk.stock):
                 self.show_plan(plan)
             else:
                 self.invalidate_plan()
@@ -664,7 +677,12 @@ class SyncPage(Page):
         if disk.transition or not disk.available:
             return
         volume, player = disk.volume, disk.player
-        if volume is None:
+        stock = disk.stock
+        if stock is not None:
+            self.job("正在同步到 Apple 原厂固件。完成后安全弹出…",
+                     lambda: stock_transfer.apply(stock, source, plan),
+                     lambda result: self.sync_complete(result, stock=True))
+        elif volume is None:
             self.job("正在同步。高采样率音频会先在电脑上转换…",
                      lambda: self.backend.apply(source, plan, port), self.sync_complete)
         else:
@@ -673,10 +691,13 @@ class SyncPage(Page):
                                                      on_write=lambda: disk.written.emit(player)),
                      self.sync_complete)
 
-    def sync_complete(self, result) -> None:
+    def sync_complete(self, result, *, stock=False) -> None:
         added, removed = result
         self.invalidate_plan()
-        self.status.setText(f"同步完成：写入 {added} 首，删除 {removed} 首。")
+        text = f"同步完成：写入 {added} 首，删除 {removed} 首。"
+        if stock:
+            text += "iPod 已安全弹出。"
+        self.status.setText(text)
         self.window_.flash(f"Jellyfin 同步完成：写入 {added} 首，删除 {removed} 首")
 
     def apply_theme(self, tokens) -> None:

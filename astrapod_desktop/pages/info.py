@@ -193,19 +193,25 @@ class InfoDialog(QtWidgets.QDialog):
         self.next_button.setEnabled(self.position < len(self.tracks) - 1)
         folder, _, filename = t.path.rpartition("/")
         stars = t.rating / 2
+        stock = self.window_.library_state.stock
+        rating = "未评分"
+        if t.rating:
+            rating = f"{stars:g} 星" if stock else f"{stars:g} 星（Rockbox {t.rating}/10）"
+        managed = ("由 Jellyfin 同步" if t.managed else "未纳入 Jellyfin 同步") if stock else (
+            "是，PodLink 导入" if t.managed else "否，只能在 iPod 上管理")
         values = {
             "title": t.title, "artist": t.artist, "album_artist": t.album_artist,
             "album": t.album, "composer": t.composer, "grouping": t.grouping,
             "genre": t.genre, "year": str(t.year or ""),
             "track_no": str(t.track or ""), "disc_no": str(t.disc or ""),
-            "rating": (f"{stars:g} 星（Rockbox {t.rating}/10）" if t.rating else "未评分"),
+            "rating": rating,
             "comment": t.comment,
             "sort_title": sort_name(t.title), "sort_artist": sort_name(t.artist),
             "sort_album_artist": sort_name(t.album_artist), "sort_album": sort_name(t.album),
             "sort_composer": sort_name(t.composer),
             "play_count": str(t.play_count), "play_time": fmt.long_duration(t.play_time_ms),
             "last_played": model.display(t, "last_played") or "从未播放",
-            "managed": "是，PodLink 导入" if t.managed else "否，只能在 iPod 上管理",
+            "managed": managed,
             "path": t.path, "folder": folder or "/", "filename": filename,
             "mtime": fmt.date(t.mtime) or "未知", "index": str(t.index),
             "kind": fmt.kind(t.path), "kind_file": fmt.kind(t.path),
@@ -239,7 +245,8 @@ class InfoDialog(QtWidgets.QDialog):
         self._set("size", fmt.size(detail.size_bytes))
         self._set("size_file", f"{fmt.size(detail.size_bytes)}（{detail.size_bytes:,} 字节）")
         self._set("sample_rate", f"{detail.sample_rate / 1000:g} kHz" if detail.sample_rate else "未知")
-        self._set("channels", {1: "单声道", 2: "立体声"}.get(detail.channels, f"{detail.channels} 声道"))
+        channels = {0: "未知", 1: "单声道", 2: "立体声"}
+        self._set("channels", channels.get(detail.channels, f"{detail.channels} 声道"))
         self._set("codec", detail.codec.upper() if detail.codec else "未知")
         self._set("kind", fmt.kind(track.path, detail.codec))
         self._set("kind_file", fmt.kind(track.path, detail.codec))

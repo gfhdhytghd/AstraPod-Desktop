@@ -1,4 +1,4 @@
-"""Identify an Apple stock-firmware iPod Classic from an explicitly selected volume.
+"""Discover the active iPod firmware and identify mounted stock Classics.
 
 Detection reads the iPod layout and device metadata. Linux can also associate
 the volume's filesystem device number with its USB disk in sysfs. Classic models share a USB product ID, which cannot identify the exact
@@ -9,6 +9,7 @@ Passive enumeration may disable interactive authorization.
 References: libgpod's itdb_device.c and tools/ipod-scsi.c, the USB ID
 Repository, and the iPod SysInfoExtended captures at dstaley/ipod-sysinfo.
 """
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -18,8 +19,13 @@ import shutil
 import stat
 import subprocess
 import sys
+from threading import RLock
 from xml.etree import ElementTree
 from xml.parsers.expat import ExpatError
+
+import hrdisksync
+import podlink
+from serial.tools import list_ports
 
 
 SYS_DEV_BLOCK = Path("/sys/dev/block")
@@ -41,6 +47,7 @@ UPDATER_GENERATIONS = {
     24: "classic-6g", 33: "classic-6.5g", 35: "classic-7g", 38: "classic-7g",
 }
 CLASSIC_USB_PRODUCT = "1261"
+PODBOX_SERIAL = re.compile(r".AA0000000000360", re.IGNORECASE)
 DISPLAY_MODELS = {
     "classic-6g": "iPod Classic 6G",
     "classic-6.5g": "iPod Classic 6.5G",
@@ -80,6 +87,153 @@ class StockDevice:
     sqlite: bool
     checksum: int | None
     sysinfo_extended: bytes | None = field(repr=False)
+    firmware_version: str | None = None
+    serial_number: str | None = field(default=None, repr=False)
+    capacity_bytes: int = 0
+    free_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class DeviceState:
+    kind: str
+    volume: hrdisksync.Volume | None = None
+    port: str | None = None
+    serial: str = field(default="", repr=False)
+
+    @property
+    def link_mode(self):
+        return {"podbox-podlink": "podlink", "podbox-disk": "disk",
+                "stock": "stock", "none": "none"}[self.kind]
+
+
+def _podbox_usb(manufacturer, serial):
+    return (manufacturer.casefold().startswith(("podbox", "rockbox"))
+            or PODBOX_SERIAL.fullmatch(serial) is not None)
+
+
+def _disk_selection(port, podlink_serial):
+    if podlink_serial and re.fullmatch(r"2[0-9A-Fa-f]+", podlink_serial):
+        return podlink_serial
+    node = Path(port or "")
+    if node.parent == Path("/dev/serial/by-id"):
+        match = re.fullmatch(r"usb-.+_(2[0-9A-Fa-f]+)-if[0-9A-Fa-f]+(?:-port[0-9]+)?", node.name)
+        if match:
+            return match[1]
+    return None
+
+
+def _disk_state(podlink_serial):
+    if podlink_serial:
+        volume = hrdisksync.current_volume(podlink_serial)
+        if volume is not None and _podbox_usb(volume.manufacturer, volume.usb[1]):
+            return DeviceState("podbox-disk", volume=volume, serial=volume.usb[1])
+    volume = hrdisksync.current_volume(filesystems=("vfat", "hfsplus"))
+    if volume is None:
+        return DeviceState("none")
+    _, serial = volume.usb
+    if _podbox_usb(volume.manufacturer, serial):
+        if not podlink_serial and volume.filesystem == "vfat" and (
+                hrdisksync.disk_player(volume) is not None
+                or (PODBOX_SERIAL.fullmatch(serial) and serial.startswith("1"))):
+            return DeviceState("podbox-disk", volume=volume, serial=serial)
+        return DeviceState("none")
+    if _recently_ejected(volume):
+        return DeviceState("none")
+    return DeviceState("stock", volume=volume, serial=serial)
+
+
+def _current_device(port, podlink_serial):
+    podlink_ports = [
+        entry for entry in list_ports.comports()
+        if (entry.vid, entry.pid) == (podlink.VID, podlink.PID)
+    ]
+    if port:
+        selected = Path(port).resolve()
+        podlink_ports = [entry for entry in podlink_ports
+                         if Path(entry.device).resolve() == selected]
+    if len(podlink_ports) == 1:
+        entry = podlink_ports[0]
+        return DeviceState("podbox-podlink", port=entry.device, serial=entry.serial_number or "")
+    if podlink_ports or not sys.platform.startswith("linux"):
+        return DeviceState("none")
+    return _disk_state(_disk_selection(port, podlink_serial))
+
+
+def current_device(port="", *, podlink_serial=None):
+    """Identify one Classic without opening its tty or mounting its disk."""
+    try:
+        return _current_device(port, podlink_serial)
+    except (OSError, RuntimeError):
+        # An unplug or an ambiguous disk inventory is retried on the next scan.
+        return DeviceState("none")
+
+
+_mount_lock = RLock()
+_ejected_attachment = None
+
+
+def _attachment(volume):
+    try:
+        link = volume.uuid_path.lstat()
+    except FileNotFoundError:
+        return None
+    return volume.usb, volume.uuid_path, link.st_ino, link.st_ctime_ns
+
+
+def _recently_ejected(volume):
+    return _ejected_attachment is not None and _attachment(volume) == _ejected_attachment
+
+
+def _udisks_filesystem(operation, block, *, authorize, read_only=False):
+    command = ["udisksctl", operation, "-b", str(block)]
+    if not authorize:
+        command.append("--no-user-interaction")
+    if read_only:
+        command.extend(("-o", "ro"))
+    hrdisksync.run_host(*command, timeout=60 if authorize else 10)
+
+
+@contextmanager
+def stock_mount(state, *, write=False, authorize=False):
+    """Borrow the selected stock volume, mounting it for the operation if needed."""
+    global _ejected_attachment
+    volume = state.volume
+    if (state.kind != "stock" or volume is None
+            or _podbox_usb(volume.manufacturer, volume.usb[1])):
+        raise RuntimeError("No Apple stock iPod is selected")
+    with _mount_lock:
+        if not volume.present() or _recently_ejected(volume):
+            raise RuntimeError("The selected iPod is no longer connected")
+        attachment = _attachment(volume)
+        if write and volume.filesystem != "vfat":
+            raise RuntimeError("Stock iPod writes require a FAT-formatted iPod")
+        mounts = volume.mounts()
+        if mounts and write and os.statvfs(volume.mounted()[1]).f_flag & os.ST_RDONLY:
+            _udisks_filesystem("unmount", volume.block, authorize=authorize)
+            mounts = []
+        owned = not mounts
+        if owned:
+            _udisks_filesystem("mount", volume.block, authorize=authorize, read_only=not write)
+        try:
+            root = volume.mounted()[1]
+            info = root.stat()
+            number = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
+            if not volume.present() or number != volume.number:
+                raise RuntimeError("The selected iPod mount changed")
+            read_only = bool(os.statvfs(root).f_flag & os.ST_RDONLY)
+            if (owned or write) and read_only != (not write):
+                raise RuntimeError("The iPod volume has unexpected mount permissions")
+            yield root
+        finally:
+            if volume.present():
+                if write:
+                    try:
+                        volume.eject()
+                    finally:
+                        if not volume.mounts():
+                            _ejected_attachment = attachment
+                elif owned and volume.mounts():
+                    _udisks_filesystem("unmount", volume.block, authorize=authorize)
 
 
 @dataclass(frozen=True)
@@ -132,8 +286,15 @@ def checked_path(root, *parts, directory=False, required=False):
 
 
 def assert_stock_layout(root):
-    """Reject a volume with Rockbox or PodLink markers, including broken links."""
+    """Validate the running firmware when USB information is available."""
     root = Path(root)
+    usb = _usb_disk(root.stat().st_dev) if sys.platform.startswith("linux") else None
+    if usb is not None:
+        if usb.vendor != "05ac" or _podbox_usb(usb.manufacturer, usb.serial):
+            raise StockLayoutError("USB device is not running Apple stock firmware")
+        if usb.product != CLASSIC_USB_PRODUCT:
+            raise _unsupported_model()
+        return usb
     if _child(root, ".rockbox")[1] is not None:
         raise StockLayoutError("Rockbox volume cannot be accessed as a stock iPod")
     music = checked_path(root, "Music", directory=True)
@@ -205,6 +366,46 @@ def _number(value):
     return None
 
 
+_VERSION = r"[0-9]{1,3}(?:\.[0-9]{1,3}){1,3}"
+
+
+def _version(value):
+    if isinstance(value, str):
+        value = value.strip()
+        match = re.fullmatch(rf"0[xX][0-9A-Fa-f]{{8}}\s*\(({_VERSION})\)", value)
+        if match:
+            return match[1]
+        if re.fullmatch(_VERSION, value):
+            return value
+        if not re.fullmatch(r"0[xX][0-9A-Fa-f]{8}", value):
+            return None
+        value = int(value, 16)
+    # A packed BuildID uses a BCD major byte and a minor/patch nibble each.
+    if type(value) is int and 0x01000000 <= value <= 0x9999FFFF:
+        major = f"{value >> 24:02x}"
+        minor, patch = (value >> 20) & 15, (value >> 16) & 15
+        if major.isdigit() and minor < 10 and patch < 10:
+            return f"{int(major)}.{minor}" + (f".{patch}" if patch else "")
+    return None
+
+
+def _firmware_version(basic, extended):
+    for key in ("visiblebuildid", "firmwareversion", "productversion", "buildid"):
+        for metadata in (extended, basic):
+            version = _version(metadata.get(key))
+            if version is not None:
+                return version
+    return None
+
+
+def _serial_number(metadata, usb):
+    for key in ("serialnumber", "pszserialnumber"):
+        value = metadata.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[A-Z0-9]{11,12}", value.strip().upper()):
+            return value.strip().upper()
+    return (usb.serial or None) if usb is not None else None
+
+
 def _read_metadata(path):
     if path is None:
         return b""
@@ -226,12 +427,13 @@ def _basic_metadata(path):
 def _extended_metadata(data):
     if not data:
         return {}, None
+    parse_errors = (plistlib.InvalidFileException, ValueError, TypeError, OverflowError,
+                    ExpatError, RecursionError)
     try:
         props = plistlib.loads(data)
-    except (plistlib.InvalidFileException, ValueError, TypeError, OverflowError, ExpatError,
-            RecursionError):
+    except parse_errors:
         # Early iPods put keyed entries in an array, which plistlib rejects.
-        # A few simple top-level properties still identify the device.
+        # Keep valid top-level entries, including the artwork format arrays.
         try:
             root = ElementTree.fromstring(data)
         except ElementTree.ParseError:
@@ -242,12 +444,25 @@ def _extended_metadata(data):
         for key, value in zip(elements, elements[1:]):
             if key.tag != "key" or not key.text:
                 continue
-            if value.tag == "integer" and _number(value.text) is not None:
-                props[key.text] = _number(value.text)
-            elif value.tag == "string" and value.text is not None:
-                props[key.text] = value.text
-            elif value.tag in {"true", "false"}:
-                props[key.text] = value.tag == "true"
+            if value.tag == "array" and key.text in {
+                    "AlbumArt", "AlbumArt2", "ImageSpecifications",
+                    "ImageSpecifications2", "ChapterImageSpecs"}:
+                # Apple sometimes puts a redundant format ID before each
+                # dictionary inside an array. Remove only matching ID keys.
+                children = list(value)
+                for entry, image in zip(children, children[1:]):
+                    format_id = next((item.text for name, item in zip(image, list(image)[1:])
+                                      if name.tag == "key" and name.text == "FormatId"
+                                      and item.tag == "integer"), None)
+                    if (entry.tag == "key" and image.tag == "dict" and format_id
+                            and entry.text == format_id):
+                        value.remove(entry)
+            wrapper = ElementTree.Element("plist", version="1.0")
+            ElementTree.SubElement(wrapper, "dict").extend((key, value))
+            try:
+                props.update(plistlib.loads(ElementTree.tostring(wrapper)))
+            except parse_errors:
+                continue
     if not isinstance(props, dict):
         return {}, None
     # Use a well-formed XML plist in staging, including when input is binary
@@ -284,6 +499,24 @@ def _model_generation(model_number, props):
         raise _unsupported_model()
     return (_GENERATION_BY_MODEL.get(model_number) or UPDATER_GENERATIONS.get(updater)
             or ("classic" if family == 11 else None))
+
+
+def _model_identity(basic, extended, *serials):
+    metadata = basic | extended
+    generation = _model_generation(None, metadata)
+    candidates = [_model_number(extended), _model_number(basic)]
+    candidates.extend(_model_number({"serialnumber": serial}) for serial in serials)
+    for model in candidates:
+        if model is not None and model not in _GENERATION_BY_MODEL:
+            raise _unsupported_model()
+    if generation in MODEL_NUMBERS:
+        # A restored or dual-boot data partition may retain an older SysInfo.
+        # The updater family identifies the hardware generation independently.
+        model = next((number for number in candidates
+                      if _GENERATION_BY_MODEL.get(number) == generation), None)
+        return model, generation
+    model = next((number for number in candidates if number is not None), None)
+    return model, _model_generation(model, metadata)
 
 
 def _path_checksum(path):
@@ -393,7 +626,7 @@ def detect(volume_root, *, authorize=True):
         root = Path(volume_root).resolve(strict=True)
         if not root.is_dir():
             return None
-        assert_stock_layout(root)
+        usb = assert_stock_layout(root)
         control = checked_path(root, "iPod_Control", directory=True)
         if control is None:
             return None
@@ -413,18 +646,8 @@ def detect(volume_root, *, authorize=True):
     except (FileNotFoundError, StockLayoutError):
         return None
 
-    usb = _usb_disk(root.stat().st_dev) if sys.platform.startswith("linux") else None
-    if usb and (usb.vendor != "05ac"
-                or usb.manufacturer.casefold().startswith(("podbox", "rockbox"))
-                or re.fullmatch(r".AA0000000000360", usb.serial, re.IGNORECASE)):
-        return None
-
-    if usb and usb.product != CLASSIC_USB_PRODUCT:
-        raise _unsupported_model()
-
     metadata = basic | props
-    model_number = _model_number(metadata)
-    generation = _model_generation(model_number, metadata)
+    model_number, generation = _model_identity(basic, props)
     guid = _guid(metadata.get("firewireguid"))
     if usb:
         try:
@@ -432,18 +655,16 @@ def detect(volume_root, *, authorize=True):
         except (OSError, UnicodeError):
             payload = ""
         guid = guid or _guid(usb.serial) or _guid(payload)
-        model_number = (model_number or _model_number({"serialnumber": usb.serial})
-                        or _model_number({"serialnumber": payload}))
-        generation = _model_generation(model_number, metadata)
-        if not guid or not model_number or (compressed is not None and not props):
+        model_number, generation = _model_identity(basic, props, usb.serial, payload)
+        if (not guid or not model_number
+                or (not props and (compressed is not None or not _firmware_version(basic, props)))):
             probe_props, probed = _extended_metadata(_probe_scsi(usb, authorize))
             if probe_props:
                 props = props | probe_props
                 extended = (plistlib.dumps(plistlib.loads(extended) | plistlib.loads(probed))
                             if extended else probed)
                 metadata = basic | props
-                model_number = _model_number(metadata) or model_number
-                generation = _model_generation(model_number, metadata) or generation
+                model_number, generation = _model_identity(basic, props, usb.serial, payload)
                 guid = _guid(metadata.get("firewireguid")) or guid
         generation = generation or "classic"
     if generation is None:
@@ -454,7 +675,9 @@ def detect(volume_root, *, authorize=True):
               or str(metadata.get("sqlitedb", "")).lower() in {"true", "1"})
     checksum = (header_checksum if header_checksum in {1, 2, 3}
                 else {4: 2, 5: 3}.get(db_version, 1))
+    usage = os.statvfs(root)
     return StockDevice(root, control, tunes, compressed or database, device_dir,
                        DISPLAY_MODELS[generation],
                        model_number, generation, guid, db_version, sqlite, checksum,
-                       extended)
+                       extended, _firmware_version(basic, props), _serial_number(metadata, usb),
+                       usage.f_blocks * usage.f_frsize, usage.f_bavail * usage.f_frsize)

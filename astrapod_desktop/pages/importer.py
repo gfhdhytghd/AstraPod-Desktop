@@ -5,8 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from .. import fmt, icons
-from ..backends import expand_paths, music_tags_for
+from .. import fmt, icons, stock_transfer
+from ..backends import IMPORT_SUFFIXES, STOCK_IMPORT_SUFFIXES, expand_paths, music_tags_for
 from ..jobs import Cancelled
 from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal
 from ..widgets import (DropFrame, PageHeader, ToggleSwitch, button, configure_table, draw_art,
@@ -16,6 +16,7 @@ from .sync import disk_mode_option
 
 R = QtCore.QRectF
 ITEM_ROLE = Qt.ItemDataRole.UserRole + 30
+WAV_REQUIRES_STOCK = "WAV 文件只能导入 Apple 原厂固件。"
 
 
 @dataclass
@@ -321,10 +322,16 @@ class ImportPage(Page):
         self.update_summary()
 
     # Adding ---------------------------------------------------------
+    @property
+    def formats(self) -> str:
+        return "FLAC、M4A、MP3 和 WAV" if self.window_.disk.stock else "FLAC、M4A 和 MP3"
+
     def add_files(self) -> None:
+        suffixes = STOCK_IMPORT_SUFFIXES if self.window_.disk.stock else IMPORT_SUFFIXES
+        filters = " ".join(f"*{suffix}" for suffix in sorted(suffixes))
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "添加到 iPod", str(Path.home() / "Music"),
-            "音乐文件 (*.flac *.m4a *.mp3);;所有文件 (*)")
+            f"音乐文件 ({filters});;所有文件 (*)")
         if paths:
             self.add_paths(paths)
 
@@ -338,10 +345,10 @@ class ImportPage(Page):
         if self.job is not None:
             self.window_.flash("正在导入，完成后再添加文件。")
             return
-        files = expand_paths(paths)
+        files = expand_paths(paths, stock=self.window_.disk.stock is not None)
         fresh = self.model.add(files)
         if not files:
-            self.window_.flash("没有找到可以导入的 FLAC、M4A 或 MP3 文件。")
+            self.window_.flash(f"没有找到可以导入的音频文件。支持 {self.formats}。")
         self.stack.setCurrentWidget(self.table if self.model.items else self.target)
         self.update_summary()
         if fresh:
@@ -356,9 +363,14 @@ class ImportPage(Page):
     def _probe(self, items) -> None:
         prober = self.window_.services.prober
 
+        def probe(item):
+            if item.path.suffix.lower() == ".wav":
+                return prober.probe(item.path, stock=True)
+            return prober.probe(item.path)
+
         def work(job):
             with ThreadPoolExecutor(max_workers=4) as pool:
-                for item, result in zip(items, pool.map(lambda i: prober.probe(i.path), items)):
+                for item, result in zip(items, pool.map(probe, items)):
                     job.progress(None, None, (item, result))
             return len(items)
 
@@ -374,6 +386,8 @@ class ImportPage(Page):
             item.cover = None if image.isNull() else image
         if result.error:
             item.state, item.error, item.include = "error", result.error, False
+        elif item.path.suffix.lower() == ".wav" and self.window_.disk.stock is None:
+            item.state, item.error, item.include = "error", WAV_REQUIRES_STOCK, False
         elif self._is_duplicate(result):
             item.state = "duplicate"
             item.include = not self.skip_check.isChecked()
@@ -384,9 +398,20 @@ class ImportPage(Page):
     # Duplicates ------------------------------------------------------
     def _disk_changed(self):
         disk = self.window_.disk
-        target = (disk.mode, disk.serial, disk.volume)
+        target = (disk.mode, disk.serial, disk.volume, disk.stock)
         if target != self._duplicate_target:
             self._duplicate_target = target
+            self.header.subtitle.setText(f"把电脑上的 {self.formats} 加入 iPod")
+            self.target.update()
+            for item in self.model.items:
+                if item.probed is None or item.probed.error or item.path.suffix.lower() != ".wav":
+                    continue
+                if item.state in ("ready", "duplicate") and disk.stock is None:
+                    item.state, item.error, item.include = "error", WAV_REQUIRES_STOCK, False
+                    self.model.changed(item)
+                elif item.state == "error" and disk.stock is not None:
+                    item.state, item.error, item.include = "ready", "", True
+                    self.model.changed(item)
             self._rebuild_duplicates()
             self.update_summary()
         self._update_import_enabled()
@@ -394,7 +419,8 @@ class ImportPage(Page):
     def _rebuild_duplicates(self) -> None:
         window = self.window_
         library, disk = window.library_state, window.disk
-        tracks = library.tracks if disk.mode == "podlink" and disk.serial == library.serial else ()
+        tracks = (library.tracks if disk.mode in ("podlink", "stock")
+                  and disk.serial == library.serial else ())
         index: dict = {}
         for track in tracks:
             tags = music_tags_for(track.title, track.artist, track.album, track.length_ms,
@@ -476,9 +502,11 @@ class ImportPage(Page):
             item.state, item.progress = "queued", 0.0
             self.model.changed(item)
         skip = self.skip_check.isChecked()
-        volume, player = disk.volume, disk.player
+        volume, player, stock = disk.volume, disk.player, disk.stock
         cached_library = self.window_.library_state.snapshot()
         library = self.window_.library_state.library
+        session_for_device = getattr(library, "session_for_device", None)
+        open_session = session_for_device() if session_for_device else library.session
         paths = [item.path for item in chosen]
         counts = {"done": 0, "skip": 0, "error": 0}
 
@@ -488,13 +516,20 @@ class ImportPage(Page):
                 if event.get("state") == "probe":
                     job.check()
 
+            def before_commit():
+                job.check()
+                job.progress(None, None, {"state": "commit"})
+
             try:
                 job.check()
-                if volume is not None:
+                if stock is not None:
+                    stock_transfer.import_files(stock, paths, progress, skip_duplicates=skip,
+                                                before_commit=before_commit)
+                elif volume is not None:
                     library.import_disk(paths, progress, skip_duplicates=skip, volume=volume,
                                         on_write=lambda: disk.written.emit(player))
                 else:
-                    with library.session() as session:
+                    with open_session() as session:
                         if hasattr(session, "import_files"):
                             session.import_files(paths, progress, skip_duplicates=skip,
                                                  cached_library=cached_library)
@@ -505,6 +540,10 @@ class ImportPage(Page):
             return {"cancelled": False}
 
         def on_progress(_fraction, _text, event):
+            if event.get("state") == "commit":
+                self.cancel_button.setEnabled(False)
+                self.summary.setText("正在写入 iPod，完成后安全弹出。")
+                return
             item = self.model.item(event.get("file"))
             if item is None:
                 return
@@ -528,15 +567,18 @@ class ImportPage(Page):
             finished = counts["done"] + counts["skip"] + counts["error"]
             fraction = (finished + (item.progress if item.state == "uploading" else 0)) / len(paths)
             self.progress.setValue(int(fraction * 1000))
-            self.window_.lcd.set_activity(f"正在导入「{item.title}」（{finished + 1}/{len(paths)}）",
+            current = min(finished + 1, len(paths))
+            self.window_.lcd.set_activity(f"正在导入「{item.title}」（{current}/{len(paths)}）",
                                           fraction)
             self.table.scrollTo(self.model.index(self.model.rows[str(item.path)], 0))
 
         def done(result):
-            self._finish(result.get("cancelled"), counts, volume is not None, None)
+            self._finish(result.get("cancelled"), counts, volume is not None, stock, None)
 
         def failed(error):
-            self._finish(False, counts, volume is not None, error)
+            cancelled = isinstance(error, Cancelled)
+            self._finish(cancelled, counts, volume is not None, stock,
+                         None if cancelled else error)
 
         self.job = self.window_.runner.run("正在导入到 iPod…", work, done, failed,
                                            on_progress=on_progress)
@@ -548,15 +590,17 @@ class ImportPage(Page):
         for widget in (self.add_files_button, self.add_folder_button, self.clear_button,
                        self.skip_check):
             widget.setEnabled(False)
-        self.summary.setText(f"正在导入 {len(paths)} 首。可以在两首之间取消。")
+        hint = "写入 iPod 前可以取消。" if stock is not None else "可以在两首之间取消。"
+        self.summary.setText(f"正在导入 {len(paths)} 首。{hint}")
 
     def cancel(self) -> None:
         if self.job is not None:
             self.job.cancel()
             self.cancel_button.setEnabled(False)
-            self.summary.setText("当前这首上传完后停止…")
+            self.summary.setText("等待音频准备完成后取消…" if self.window_.disk.stock is not None
+                                 else "当前这首上传完后停止…")
 
-    def _finish(self, cancelled: bool, counts: dict, disk: bool, error) -> None:
+    def _finish(self, cancelled: bool, counts: dict, disk: bool, stock, error) -> None:
         self.job = None
         for item in self.model.items:
             if item.state in ("queued", "uploading"):
@@ -575,7 +619,10 @@ class ImportPage(Page):
         if cancelled:
             text += "，其余已取消"
         text += "。"
-        if counts["done"]:
+        if stock is not None:
+            if error is None and not cancelled:
+                text += "iPod 已安全弹出。"
+        elif counts["done"]:
             text += ("关闭磁盘模式后，iPod 会更新资料库。" if disk else
                      "iPod 正在更新资料库，稍后重新读取即可看到新歌曲。")
         if error is not None and not isinstance(error, Cancelled):
@@ -667,5 +714,5 @@ class DropTarget(QtWidgets.QWidget):
         painter.setPen(QtGui.QColor(t.text_muted))
         painter.drawText(R(rect.left(), center.y() + 36, rect.width(), 40), Qt.AlignmentFlag.AlignCenter,
                          "文件或整个文件夹都可以，导入前会先列出每首歌让你确认。\n"
-                         "支持 FLAC、M4A 和 MP3；高于 48 kHz 的音频会先在电脑上转换。")
+                         f"支持 {self.page.formats}。高于 48 kHz 的音频会先在电脑上转换。")
         painter.end()

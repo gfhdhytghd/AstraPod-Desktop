@@ -5,15 +5,45 @@ for the mounted-volume dispatch contract. The transport runs on Linux and
 uses `libgpod.so.4`, `ffmpeg`, and `ffprobe`. On Arch, the `libgpod` package
 also brings in `sg3_utils` for the read-only SCSI fallback.
 
-This checklist exercises the transport directly. The transport supports iPod Classic 6G, 6.5G, and 7G. Other stock
-iPods raise `UnsupportedStockModel`. Repeat the checks on each supported
-generation. Use a FAT iPod with a stock iTunes library and an existing playlist.
-Disconnect any PodBox test iPod before starting.
+Repeat the checks on an iPod Classic 6G, 6.5G, and 7G. Use a FAT iPod
+with a stock iTunes library and an existing playlist. Disconnect other
+iPods before starting. A dual-boot volume can keep its PodBox and Apple
+files. Boot Apple firmware for these checks.
 
-1. Connect the stock iPod. Mount its FAT volume in the desktop file manager.
-   Confirm the mount contains `iPod_Control/iTunes/iTunesDB`. On the desktop
-   device page, check for the Classic main menu and the album cover slideshow.
-   With animation disabled in Settings, the cover stays still.
+## Desktop app
+
+1. Connect the stock iPod with its FAT volume unmounted. On the device page,
+   check the model, firmware version, serial, capacity, free space, Classic
+   main menu, and album covers. Disable animations in Settings and check
+   that the displayed cover stays still. Compare the device library and
+   playlists with the iPod's Music menu.
+2. Mount the volume in the file manager and back up the entire
+   `iPod_Control` directory to a fresh host directory. Safely unmount the
+   volume before returning to AstraPod.
+3. In **直接导入**, add four short tagged samples with distinct titles. Use
+   MP3, AAC-LC in M4A, PCM WAV, and 96 kHz FLAC. Include an embedded cover in
+   one sample. Check that the page explains USB disk transfer and hides the
+   Disk Mode switch.
+4. Import the samples. If polkit prompts for authorization, confirm the
+   request. Wait for the page to confirm safe ejection. On the iPod, play
+   each new song, seek near its end, and check the tags and cover. Play an
+   original song from the existing playlist. Reconnect the iPod and verify
+   that importing the same samples with duplicate skipping selected adds
+   no songs.
+5. In **Jellyfin 同步**, sign in to a test account and select a playlist with
+   one short track absent from the iPod. Preview and check one addition
+   and zero removals. Apply the preview and wait for safe ejection.
+   Play the track on the iPod. Reconnect and verify that preview shows
+   zero changes.
+6. Remove the track from the Jellyfin playlist. Preview the same scope and
+   check one removal and zero additions. Confirm removal and wait for safe
+   ejection. Verify that the iPod still plays the original and locally
+   imported tracks.
+
+## Direct transport
+
+1. Mount the iPod's FAT volume in the file manager. Confirm that the mount
+   contains `iPod_Control/iTunes/iTunesDB` or `iPod_Control/iTunes/iTunesCDB`.
 2. Back up the entire `iPod_Control` directory to a fresh host directory.
 3. Prepare four short, tagged samples with different titles: MP3, AAC-LC in
    M4A, PCM WAV, and 96 kHz FLAC. Include an embedded cover in one sample.

@@ -106,6 +106,41 @@ def test_jellyfin_reconciliation_keeps_other_accounts_and_originals(tmp_path, au
     assert (root / local_reference[1:]).is_file()
 
 
+def test_jellyfin_preview_survives_mount_path_change_for_same_device(tmp_path, audio):
+    root = tmp_path / "read-only-mount"
+    create_fixture(root)
+    remounted = tmp_path / "writable-mount"
+    shutil.copytree(root, remounted)
+    scope = hrmediasync.Scope("all", "fixture")
+    source = Source("a", audio)
+    key = ("usb-serial", "1234-ABCD")
+
+    plan = hrstock.preview(root, source, scope, volume_key=key)
+    with pytest.raises(RuntimeError, match="changed after preview"):
+        hrstock.apply(remounted, source, plan, volume_key=("different-serial", key[1]))
+    assert not hrstock.read_library(remounted).tracks
+    assert hrstock.apply(remounted, source, plan, volume_key=key) == (1, 0)
+
+
+def test_import_cancellation_before_commit_leaves_database_and_media_unchanged(tmp_path, audio):
+    root = tmp_path / "volume"
+    create_fixture(root)
+    database = root / ITUNES / "iTunesDB"
+    original = database.read_bytes()
+
+    class Cancelled(Exception):
+        pass
+
+    def before_commit():
+        raise Cancelled()
+
+    with pytest.raises(Cancelled):
+        hrstock.import_files(root, [audio], before_commit=before_commit)
+    assert database.read_bytes() == original
+    assert not database.with_name("iTunesDB.astrapod-bak").exists()
+    assert not tuple((root / "iPod_Control/Music").glob("F*/*.m4a"))
+
+
 def test_rockbox_markers_never_allow_transaction(tmp_path, audio):
     root = tmp_path / "volume"
     create_fixture(root)

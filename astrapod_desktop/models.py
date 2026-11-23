@@ -215,6 +215,7 @@ class SongsProxy(QtCore.QSortFilterProxyModel):
         super().__init__(parent)
         self.terms: list[str] = []
         self.constraints: dict[str, str] = {}
+        self.track_ids = None
         self.setDynamicSortFilter(False)
 
     def set_search(self, text: str) -> None:
@@ -230,8 +231,16 @@ class SongsProxy(QtCore.QSortFilterProxyModel):
             self.constraints = dict(constraints)
             self.endFilterChange()
 
+    def set_track_ids(self, track_ids) -> None:
+        if track_ids != self.track_ids:
+            self.beginFilterChange()
+            self.track_ids = track_ids
+            self.endFilterChange()
+
     def filterAcceptsRow(self, row, parent) -> bool:
         model = self.sourceModel()
+        if self.track_ids is not None and model.tracks[row].index not in self.track_ids:
+            return False
         if self.terms:
             hay = model.haystack[row]
             for term in self.terms:

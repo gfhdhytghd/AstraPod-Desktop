@@ -15,6 +15,8 @@ class DiskMode(QtCore.QObject):
         self.port = ""
         self.mode = "none"
         self.volume = None
+        self.device = None
+        self.stock = None
         self.serial = None
         self.player = None
         self.problem = ""
@@ -38,29 +40,46 @@ class DiskMode(QtCore.QObject):
         self.port = port
         self.update()
 
+    def set_device(self, device):
+        self.device = device
+        self.update()
+
     def update(self):
         link = self.daemon.state.get("link") or {}
         link_mode = (link.get("mode") or "none") if self.daemon.connected else "none"
-        live_serial = link.get("serial") if link_mode == "podlink" else None
-        live_port = link.get("port") if live_serial else None
+        device = self.device
+        stock = device if device is not None and device.kind == "stock" else None
+        if device is not None:
+            link_mode = device.link_mode
+        live_serial = (device.serial if device else link.get("serial")) if link_mode == "podlink" else None
+        volume = player = None
+        problem = ""
         try:
-            selected_serial = self.backend.disk_serial(self.port, live_port, live_serial)
-            if self.port and selected_serial:
-                self._known_serials[self.port] = selected_serial
-            if self.port and not selected_serial:
-                selected_serial = self._known_serials.get(self.port)
-            volume = self.backend.disk_volume(link_mode, self.port, selected_serial)
-            player = self.backend.disk_player(volume) if volume is not None else None
-            problem = ("暂不支持 Apple 原厂固件的音乐资料库。"
-                       if volume is not None and player is None else "")
+            if device is not None:
+                if link_mode == "disk":
+                    volume = device.volume
+            else:
+                live_port = link.get("port") if live_serial else None
+                selected_serial = self.backend.disk_serial(self.port, live_port, live_serial)
+                if self.port and selected_serial:
+                    self._known_serials[self.port] = selected_serial
+                if self.port and not selected_serial:
+                    selected_serial = self._known_serials.get(self.port)
+                volume = self.backend.disk_volume(link_mode, self.port, selected_serial)
+            if volume is not None:
+                player = self.backend.disk_player(volume)
+                if player is None:
+                    problem = "无法识别 PodBox 磁盘。"
         except (OSError, RuntimeError) as error:
             volume, player, problem = None, None, str(error)
-        mode = "disk" if volume is not None or link_mode == "disk" else link_mode
-        serial = live_serial if mode == "podlink" else None
+        mode = "disk" if volume is not None else link_mode
+        serial = stock.serial if stock else live_serial if mode == "podlink" else None
         borrowed = bool(link.get("borrowed")) if mode == "podlink" else False
-        values = (mode, volume, player, serial, problem, borrowed)
-        if (self.mode, self.volume, self.player, self.serial, self.problem, self.borrowed) != values:
-            self.mode, self.volume, self.player, self.serial, self.problem, self.borrowed = values
+        values = (mode, volume, player, serial, problem, borrowed, stock)
+        if (self.mode, self.volume, self.player, self.serial, self.problem,
+                self.borrowed, self.stock) != values:
+            (self.mode, self.volume, self.player, self.serial, self.problem,
+             self.borrowed, self.stock) = values
             self.changed.emit()
             if problem:
                 self.status.emit(problem)
@@ -70,7 +89,9 @@ class DiskMode(QtCore.QObject):
 
     @property
     def available(self):
-        return self.mode == "podlink" or self.player is not None
+        return (self.mode == "podlink" or self.player is not None
+                or (self.stock is not None and self.stock.volume is not None
+                    and getattr(self.stock.volume, "filesystem", "vfat") == "vfat"))
 
     @property
     def can_switch(self):

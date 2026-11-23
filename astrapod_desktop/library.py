@@ -19,6 +19,9 @@ class LibraryState(QtCore.QObject):
         self.art = art
         self.serial = None
         self.summary = None
+        self.stock_info = None
+        self.stock = False
+        self.playlists = ()
         self.tracks: list = []
         self.source = "none"          # none | cache | device
         self.loading = False
@@ -29,9 +32,31 @@ class LibraryState(QtCore.QObject):
         last = self.library.last()
         if last is None:
             return
-        self.serial, self.summary, self.tracks = last
+        self.serial, self.summary, self.tracks = last[:3]
+        self.stock = len(last) == 4
+        self.playlists = last[3] if self.stock else ()
         self.source = "cache"
-        self.art.set_serial(self.serial)
+        self.art.set_serial(self.art_identity)
+        self.changed.emit()
+
+    @property
+    def art_identity(self):
+        if self.stock and self.summary is not None:
+            return f"stock:{self.serial}:{self.summary.commit_id}"
+        return self.serial
+
+    @property
+    def can_delete(self):
+        device = getattr(self.library, "device", None)
+        return not self.stock and (device is None or
+                                   (device.kind == "podbox-podlink" and device.serial == self.serial))
+
+    def device_changed(self, device):
+        mode = "stock" if self.stock else "podbox-podlink"
+        if self.source == "device" and (device.serial != self.serial or device.kind != mode):
+            self.source = "cache"
+            self.stock_info = None
+        self.art.enabled = self.source == "device"
         self.changed.emit()
 
     def snapshot(self):
@@ -47,11 +72,18 @@ class LibraryState(QtCore.QObject):
         self.loading = True
         self.error = ""
         library = self.library
+        device = getattr(library, "device", None)
+        session_for_device = getattr(library, "session_for_device", None)
+        open_session = session_for_device(authorize=full) if session_for_device else library.session
         self.changed.emit()
 
         def work(job):
-            with library.session() as session:
+            with open_session() as session:
                 job.progress(None, "正在读取 iPod 信息…")
+                if device is not None and device.kind == "stock":
+                    summary, tracks, playlists, info = session.snapshot(library, full=full)
+                    library.remember(session.identity, summary, stock=True)
+                    return session.identity, summary, tracks, playlists, info
                 summary = session.summary()
                 serial = session.identity
                 tracks = None if full else library.cache.load(serial, summary.commit_id)
@@ -68,15 +100,26 @@ class LibraryState(QtCore.QObject):
                     tracks = session.tracks(progress, byte_progress=byte_progress)
                     library.cache.store(serial, summary.commit_id, tracks)
                 library.remember(serial, summary)
-                return serial, summary, tracks
+                return serial, summary, tracks, (), None
 
-        self.runner.run("正在读取 iPod 资料库…", work, self._loaded, self._failed)
+        def completed(callback, result):
+            if getattr(library, "device", None) == device:
+                callback(result)
+            else:
+                self.loading = False
+                self.changed.emit()
+
+        self.runner.run("正在读取 iPod 资料库…", work,
+                        lambda result: completed(self._loaded, result),
+                        lambda error: completed(self._failed, error))
 
     def _loaded(self, result) -> None:
-        self.serial, self.summary, self.tracks = result
+        self.serial, self.summary, self.tracks, self.playlists, self.stock_info = result
+        self.stock = self.stock_info is not None
         self.source = "device"
         self.loading = False
-        self.art.set_serial(self.serial)
+        self.art.set_serial(self.art_identity)
+        self.art.enabled = True
         self.art.reset_misses()
         self.changed.emit()
 
@@ -101,17 +144,23 @@ class LibraryState(QtCore.QObject):
         """(title, text, action, slot) for a page with nothing to show."""
         read = ("读取 iPod 资料库", lambda: self.refresh(True))
         if kind == "songs":
-            return ("还没有资料库", "用 USB 连接 iPod 并进入 PodLink 模式，然后读取资料库。"
+            return ("还没有资料库", "用 USB 连接 iPod Classic，然后读取资料库。"
                     "读取过的资料库会保存在电脑上，下次打开时直接显示。", *read)
         if kind == "albums":
             return "还没有专辑", "读取 iPod 资料库后，专辑和插图会显示在这里。", *read
         return f"还没有{noun}", f"读取 iPod 资料库后可以按{noun}浏览歌曲。", *read
 
     def delete(self, track, done=None) -> None:
+        if not self.can_delete:
+            if done is not None:
+                done(RuntimeError("请连接歌曲来源的 PodBox，或在 Jellyfin 同步中移除原厂固件的歌曲。"))
+            return
         library = self.library
+        session_for_device = getattr(library, "session_for_device", None)
+        open_session = session_for_device() if session_for_device else library.session
 
         def work(_job):
-            with library.session() as session:
+            with open_session() as session:
                 session.delete(track)
                 return session.summary()
 

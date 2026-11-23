@@ -131,7 +131,7 @@ class SongsTable(QtWidgets.QTableView):
                            lambda: self.info_requested.emit(tracks))
         menu.addAction(icons.icon("copy", t.text_secondary, 16), "复制歌曲信息",
                        lambda: self.copy(tracks))
-        if not self.library.editable:
+        if not self.library.editable or not self.library.can_delete:
             menu.exec(self.viewport().mapToGlobal(position))
             return
         menu.addSeparator()
@@ -150,7 +150,8 @@ class SongsTable(QtWidgets.QTableView):
 
     def keyPressEvent(self, event) -> None:
         editable = self.library.editable
-        if editable and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+        if (editable and self.library.can_delete
+                and event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace)):
             tracks = self.selected_tracks()
             if tracks:
                 self.delete_requested.emit(tracks)
@@ -225,6 +226,13 @@ class SongsPage(Page):
         self.library = library = library or window.library_state
         self.search_hint = library.search_hint
         self.header = PageHeader("歌曲")
+        self.playlist_filter = None
+        self._playlists = ()
+        if hasattr(library, "playlists"):
+            self.playlist_filter = self.header.add(QtWidgets.QComboBox())
+            self.playlist_filter.setAccessibleName("播放列表")
+            self.playlist_filter.hide()
+            self.playlist_filter.currentIndexChanged.connect(self._filter_playlist)
         if library.editable:
             self.refresh_button = self.header.add(button("读取 iPod", None, "refresh",
                                                          lambda: library.refresh(True)))
@@ -262,6 +270,30 @@ class SongsPage(Page):
         if tracks:
             self.window_.show_info(tracks)
 
+    def _filter_playlist(self) -> None:
+        index = self.playlist_filter.currentIndex()
+        ids = frozenset(self._playlists[index - 1].track_ids) if index > 0 else None
+        self.table.proxy.set_track_ids(ids)
+        self.update_status()
+
+    def _update_playlists(self) -> None:
+        combo = self.playlist_filter
+        if combo is None:
+            return
+        playlists = tuple(item for item in self.library.playlists if not item.is_master)
+        if self._playlists == playlists:
+            return
+        selected = combo.currentData()
+        self._playlists = playlists
+        with QtCore.QSignalBlocker(combo):
+            combo.clear()
+            combo.addItem("所有歌曲")
+            for playlist in playlists:
+                combo.addItem(playlist.name, playlist.id)
+            combo.setCurrentIndex(max(0, combo.findData(selected)))
+        combo.setVisible(bool(playlists))
+        self._filter_playlist()
+
     def update_state(self) -> None:
         library = self.library
         self.stack.setCurrentWidget(self.table if library.tracks else self.empty)
@@ -269,6 +301,7 @@ class SongsPage(Page):
             self.empty.set_content(*library.empty_content("songs", "歌曲"))
         self.refresh_button.setEnabled(not library.loading and (library.editable or
                                                                 library.connection is not None))
+        self._update_playlists()
         self.header.subtitle.setText(library.status_line())
         self.update_status()
 

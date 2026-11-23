@@ -1,8 +1,6 @@
-"""Passive stock Classic detection and the device drawing's cover slideshow."""
+"""Cover slideshow for the Apple firmware home screen."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import random
 
 import hrstockdevice
@@ -10,30 +8,6 @@ import hrstockdevice
 from ..artwork import artwork_to_image
 from ..contracts import album_key
 from ..qt import QtCore, QtGui, Qt
-
-
-@dataclass(frozen=True)
-class StockMount:
-    candidates: tuple[tuple[str, Path], ...] = ()
-    root: Path | None = None
-    unsupported: bool = False
-
-
-def discover_stock(previous: StockMount) -> StockMount:
-    candidates = hrstockdevice.mounted_apple_volumes()
-    if candidates == previous.candidates:
-        return previous
-    roots = []
-    unsupported = False
-    for _, path in candidates:
-        try:
-            if hrstockdevice.detect(path, authorize=False) is not None:
-                roots.append(path)
-        except hrstockdevice.UnsupportedStockModel:
-            unsupported = True
-        except OSError:
-            continue  # The volume may have gone away during discovery.
-    return StockMount(candidates, roots[0] if len(roots) == 1 else None, unsupported)
 
 
 def _cached_cover(library, serial, tracks, previous, job):
@@ -65,12 +39,13 @@ def _cached_cover(library, serial, tracks, previous, job):
     return None
 
 
-def _load_cover(root, library, serial, tracks, previous, job):
+def _load_cover(device, library, serial, tracks, previous, job):
     import hrstock
 
     job.check()
     try:
-        result = hrstock.random_artwork(root, previous)
+        with hrstockdevice.stock_mount(device) as root:
+            result = hrstock.random_artwork(root, previous)
     except (OSError, RuntimeError):
         result = None
     if result is not None:
@@ -105,8 +80,10 @@ class StockCoverPanel(QtCore.QObject):
         self.loading = False
         self.revision = 0
 
-    def set_source(self, mount: StockMount | None) -> None:
-        tracks, serial = self.state.tracks, self.state.serial
+    def set_source(self, mount) -> None:
+        matches = mount is not None and self.state.stock and self.state.serial == mount.serial
+        tracks = self.state.tracks if matches else ()
+        serial = self.state.art_identity if matches else None
         if mount != self.mount or (mount is not None and
                                    (tracks is not self.tracks or serial != self.serial)):
             self.mount, self.tracks, self.serial = mount, tracks, serial
@@ -141,12 +118,12 @@ class StockCoverPanel(QtCore.QObject):
     def _prefetch(self):
         if self.next is not None or self.loading or self.exhausted:
             return
-        root, revision = self.mount.root, self.revision
+        device, revision = self.mount, self.revision
         library, serial, tracks = self.state.library, self.serial, tuple(self.tracks)
         previous = self.current[0] if self.current is not None else None
 
         def work(job):
-            return _load_cover(root, library, serial, tracks, previous, job)
+            return _load_cover(device, library, serial, tracks, previous, job)
 
         def done(result):
             self.loading = False

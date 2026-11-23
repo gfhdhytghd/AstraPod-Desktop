@@ -15,7 +15,7 @@ class DeviceSummary:
     total_bytes: int
     free_bytes: int
     track_count: int
-    commit_id: int
+    commit_id: int | str
     database_ready: bool
 
 

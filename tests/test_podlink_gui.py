@@ -1,8 +1,10 @@
 """Offscreen tests for the AstraPod desktop app, run against the fakes."""
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import sys
 import threading
@@ -98,6 +100,20 @@ class GuiCase(unittest.TestCase):
         wait_until(self.app, lambda: self.window.library_state.source == "device"
                    and not self.window.busy)
 
+    def show_stock_transfer_target(self, serial="apple-serial"):
+        from hrdisksync import Volume
+        from hrstockdevice import DeviceState
+
+        disk = self.window.disk
+        disk.timer.stop()
+        volume = Volume(Path("/dev/disk/by-uuid/1234-ABCD"), Path("/dev/sdz1"), "65:1",
+                        (Path("/sys/devices/usb99"), serial), "Apple Inc.")
+        disk.stock = DeviceState(kind="stock", volume=volume, port=None)
+        disk.mode = "stock"
+        disk.serial = serial
+        disk.changed.emit()
+        return disk.stock
+
 
 class ThemeAndNavigationTests(GuiCase):
     def test_theme_persists_and_switches_live(self) -> None:
@@ -131,17 +147,14 @@ class ThemeAndNavigationTests(GuiCase):
         return image
 
     def _mount_stock_classic(self):
+        from hrstockdevice import DeviceState
+
         root = self.root / "Classic"
-        control = root / "iPod_Control"
-        (control / "iTunes").mkdir(parents=True)
-        (control / "iTunes" / "iTunesDB").touch()
-        (control / "Device").mkdir()
-        (control / "Device" / "SysInfo").write_text("ModelNumStr: MC297\n")
-        mount = patch("hrstockdevice.mounted_apple_volumes", return_value=(("1", root),))
-        self.addCleanup(mount.stop)
-        mount.start()
-        self.window.daemon.demo = False
+        self.enterContext(patch("hrstockdevice.stock_mount", side_effect=lambda _device: nullcontext(root)))
+        self.window._stock_read_started = True
+        self.window.device = DeviceState("stock", serial="APPLE")
         self.window.daemon.state["link"] = {"connected": False}
+        self.window._daemon_state(self.window.daemon.state)
         self.window.navigate("device")
         self.window.show()
         return root
@@ -157,6 +170,7 @@ class ThemeAndNavigationTests(GuiCase):
             self.assertEqual(page.drawing.model, "ipod6g")
             self.assertEqual(self._render_device_screen(page.drawing),
                              stock_png.convertToFormat(QtGui.QImage.Format.Format_RGB32))
+        self.window.device = None
         self.window.library_state.summary = contracts.DeviceSummary(
             "ipodvideo", "PodBox", 1000, 500, 0, 1, True)
         for mode in ("podlink", "disk", "unknown"):
@@ -221,9 +235,11 @@ class ThemeAndNavigationTests(GuiCase):
     def test_stock_cover_panel_falls_back_to_library_cache(self) -> None:
         state = self.window.library_state
         song = track(0, "Cached")
-        state.serial = self.services.library.serial
+        state.stock = True
+        state.serial = "APPLE"
+        state.summary = contracts.DeviceSummary("ipod6g", "2.0.4", 1000, 500, 1, "hash", True)
         state.tracks = [song]
-        cached = self.services.library.art_path(state.serial, song, "coverflow")
+        cached = self.services.library.art_path(state.art_identity, song, "coverflow")
         cached.parent.mkdir(parents=True, exist_ok=True)
         image = QtGui.QImage(80, 80, QtGui.QImage.Format.Format_RGB32)
         image.fill(QtGui.QColor("#173abc"))
@@ -628,6 +644,43 @@ class ModelTests(unittest.TestCase):
         self.assertGreater(proxy.rowCount(), 0)
 
 
+class StockLibraryTests(GuiCase):
+    def test_stock_snapshot_routes_library_and_reuses_cached_playlists(self):
+        from types import SimpleNamespace
+        from hrstock import StockLibrary
+        from hrstockdb import DatabasePlaylist
+        from hrstockdevice import DeviceState
+
+        state = self.window.library_state
+        library = backends.DeviceLibrary(self.root / "device-library")
+        state.library = self.services.library = self.window.art.library = library
+        self.window.device = library.device = DeviceState("stock", serial="APPLE")
+        tracks = (track(100, "First"), track(101, "Second"))
+        playlists = (DatabasePlaylist(7, "Favorite", (101,), False),)
+        device = SimpleNamespace(model="iPod Classic 7G", model_number="MC297",
+                                 serial_number="SERIAL", firmware_version="2.0.4",
+                                 capacity_bytes=1000, free_bytes=500)
+        with (patch("hrstockdevice.stock_mount", side_effect=lambda _device, **_: nullcontext(self.root)),
+              patch("hrstockdevice.detect", return_value=device),
+              patch("hrstock.library_identity", return_value="test-commit"),
+              patch("hrstock.read_library", return_value=StockLibrary(tracks, playlists)) as read,
+              patch("hrmediasync.connect_device") as connect):
+            self.load_library()
+            self.assertEqual(state.tracks, list(tracks))
+            self.assertEqual(state.playlists, playlists)
+            self.assertEqual(library.last()[3], playlists)
+            self.window.pages["device"].update_view()
+            self.assertIn("2.0.4", self.window.pages["device"].values["firmware"].text())
+            self.assertIn("MC297", self.window.pages["device"].values["model"].text())
+            page = self.window.pages["device.songs"]
+            page.playlist_filter.setCurrentIndex(1)
+            self.assertEqual(page.table.proxy.tracks(), [tracks[1]])
+            state.refresh(False)
+            wait_until(self.app, lambda: not state.loading)
+            read.assert_called_once()
+            connect.assert_not_called()
+
+
 class LibraryTests(GuiCase):
     def test_library_loads_into_every_view(self) -> None:
         self.load_library()
@@ -821,6 +874,40 @@ class ImportTests(GuiCase):
         self.assertEqual([i.state for i in page.model.items], ["done", "done"])
         self.assertIn("已导入 2 首", page.summary.text())
 
+    def test_stock_import_mounts_for_write_and_uses_stock_transaction(self) -> None:
+        device = self.show_stock_transfer_target()
+        page = self.window.pages["import"]
+        self.assertTrue(page.disk_mode.isHidden())
+        self.assertIn("Apple 原厂固件", page.disk_mode.hint_label.text())
+        page.add_paths([str(self.make_files(["a.wav"]))])
+        wait_until(self.app, lambda: page.import_button.isEnabled())
+        path = page.model.items[0].path
+        self.assertEqual(path.suffix, ".wav")
+        calls = []
+
+        @contextmanager
+        def mount(selected, *, write=False, authorize=False):
+            calls.append(("mount", selected, write, authorize))
+            try:
+                yield self.root
+            finally:
+                calls.append(("eject", selected))
+
+        def import_files(root, paths, progress, *, skip_duplicates, before_commit):
+            calls.append(("import", root, paths, skip_duplicates))
+            progress(dict(file=str(path), state="probe"))
+            before_commit()
+            progress(dict(file=str(path), state="done"))
+
+        with patch("hrstockdevice.stock_mount", mount), patch("hrstock.import_files", import_files):
+            page.start()
+            wait_until(self.app, lambda: page.job is None)
+        self.assertEqual(calls, [("mount", device, True, True), ("import", self.root, [path], True),
+                                 ("eject", device)])
+        self.assertEqual(self.services.library.sessions, 0)
+        self.assertEqual(page.model.items[0].state, "done")
+        self.assertIn("iPod 已安全弹出", page.summary.text())
+
     def test_unsupported_and_dropped_files(self) -> None:
         folder = self.root / "drop"
         folder.mkdir()
@@ -887,6 +974,42 @@ class SyncTests(GuiCase):
         wait_until(self.app, lambda: page.plan is None and not page.busy)
         self.assertTrue(any(c[0] == "apply" for c in self.services.sync.calls))
         self.assertIn("写入 5 首，删除 2 首", page.status.text())
+
+    def test_stock_preview_is_read_only_and_apply_mounts_for_write(self) -> None:
+        device = self.show_stock_transfer_target()
+        page = self.page()
+        page.connected((object(), self.services.sync.scopes()))
+        page.update_buttons()
+        self.assertTrue(page.disk_mode.isHidden())
+        self.assertTrue(page.port_button.isHidden())
+        self.assertIn("Apple 原厂固件", page.port_label.text())
+        calls = []
+        key = ("apple-serial", "1234-ABCD")
+        plan = fakes.FakePlan(page.scopes[0])
+
+        @contextmanager
+        def mount(selected, *, write=False, authorize=False):
+            calls.append(("mount", selected, write, authorize))
+            try:
+                yield self.root
+            finally:
+                calls.append(("unmount", selected, write))
+
+        with (patch("hrstockdevice.stock_mount", mount),
+              patch("hrstock.preview", return_value=plan) as preview,
+              patch("hrstock.apply", return_value=(5, 2)) as apply,
+              patch.object(page, "confirm_removals", return_value=True)):
+            page.preview()
+            wait_until(self.app, lambda: page.plan is plan and not page.busy)
+            preview.assert_called_once_with(self.root, page.source, page.scopes[0], volume_key=key)
+            page.confirm()
+            wait_until(self.app, lambda: not page.busy and page.plan is None)
+            apply.assert_called_once_with(self.root, page.source, plan, volume_key=key)
+        self.assertEqual(calls, [("mount", device, False, True), ("unmount", device, False),
+                                 ("mount", device, True, True), ("unmount", device, True)])
+        self.assertFalse(any(item[0] in ("preview", "preview_disk", "apply", "apply_disk")
+                             for item in self.services.sync.calls))
+        self.assertIn("iPod 已安全弹出", page.status.text())
 
     def test_credential_change_invalidates_and_failure_recovers(self) -> None:
         page = self.page()

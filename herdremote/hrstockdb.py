@@ -1,10 +1,11 @@
 """Native libgpod bridge for a disposable stock iPod metadata staging tree.
 
-Copy the iTunes, Device and Artwork directories into a private host directory
-before calling open_database(), including any iTunes Library.itlp, Play Counts,
-and OTGPlaylistInfo files. libgpod may modify metadata even while opening a
-database. Only pass staging paths here. A cover reader may stage references to
-pinned thumbnail blobs, provided it never calls save(). save() returns changed
+Stage database files in a private host directory before calling open_database().
+A writer stages iTunes, Device and Artwork in full. A track reader needs the
+active database, Play Counts and OTGPlaylistInfo sidecars. libgpod may modify
+metadata while opening a database. Only pass staging paths here. A cover reader
+may stage references to pinned thumbnail blobs, provided it never calls save().
+save() returns changed
 files relative to that directory. removed_files lists paths consumed or removed
 by libgpod.
 The caller publishes those changes and any media files as one transaction.
@@ -409,7 +410,9 @@ def _device_metadata(
         # libgpod handles format capabilities from this plist. Never let it run
         # SQL supplied by the mounted volume or override the verified model.
         extended.pop(_SQL_COMMANDS, None)
-        extended.pop("SerialNumber", None)
+        # An empty serial keeps libgpod on the selected model without
+        # triggering its NULL-serial assertion for every track.
+        extended["SerialNumber"] = ""
         extended["DBVersion"] = _DB_VERSIONS[scheme]
         extended["SQLiteDB"] = compressed
         if valid_guid:
@@ -471,6 +474,28 @@ class StockDatabase:
                 has_artwork=bool(_library().itdb_track_has_thumbnails(pointer)), **fields,
             ))
         return tuple(tracks)
+
+    def track_artwork(self, track_id, album_key, size):
+        """Use this track's thumbnail, or a thumbnail from the same album."""
+        library = _library()
+        fallback = []
+        for pointer in self._native_tracks():
+            track = pointer.contents
+            if not library.itdb_track_has_thumbnails(pointer):
+                continue
+            if (track.dbid or track.id) == track_id:
+                thumbnail = _thumbnail(pointer, size)
+                if thumbnail is not None:
+                    return thumbnail
+            elif album_key[0] and (
+                    _text(track.album).strip().casefold(),
+                    _text(track.albumartist or track.artist).strip().casefold()) == album_key:
+                fallback.append(pointer)
+        for pointer in fallback:
+            thumbnail = _thumbnail(pointer, size)
+            if thumbnail is not None:
+                return thumbnail
+        return None
 
     def random_artwork(self, previous, size):
         """Decode one random album thumbnail, excluding the previous album."""

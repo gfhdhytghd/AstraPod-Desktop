@@ -101,17 +101,19 @@ class DiskSyncTests(GuiCase):
         self.assertEqual(preview.call_args.kwargs["cached_library"], self.window.library_state.snapshot())
 
     def test_stock_mass_storage_has_clear_status_without_podlink(self):
+        from types import SimpleNamespace
+        from hrstockdevice import DeviceState
+
         sync, importer = self.window.pages["sync"], self.window.pages["import"]
         daemon = self.window.daemon
-        backend = self.services.sync
-        with patch.object(backend, "disk_volume", return_value="stock-volume"), \
-                patch.object(backend, "disk_player", return_value=None):
-            daemon.push({**daemon.state, "link": {"mode": "none"}})
-            self.assertTrue(sync.disk_mode.isChecked())
-            self.assertTrue(importer.disk_mode.isChecked())
-            self.assertTrue(sync.disk_mode.isEnabled())
-            self.assertFalse(sync.preview_button.isEnabled())
-            self.assertFalse(importer.import_button.isEnabled())
-            self.assertIn("Apple 原厂固件", sync.status.text())
-            self.assertIn("Apple 原厂固件", importer.summary.text())
+        daemon.push({**daemon.state, "link": {"mode": "none"}})
+        stock = DeviceState("stock", volume=SimpleNamespace(filesystem="vfat"), serial="APPLE")
+        self.window.disk.set_device(stock)
+        self.assertEqual(self.window.disk.mode, "stock")
+        self.assertIs(self.window.disk.stock, stock)
+        self.assertTrue(self.window.disk.available)
+        for switch in (sync.disk_mode, importer.disk_mode):
+            self.assertTrue(switch.isHidden())
+            self.assertFalse(switch.isEnabled())
+            self.assertIn("Apple 原厂固件", switch.hint_label.text())
         self.assertFalse(self.errors)
