@@ -4,7 +4,7 @@ import os
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (
-    QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter, QPen, QPolygonF,
+    QColor, QGuiApplication, QImage, QLinearGradient, QPainter, QPen, QPolygonF,
 )
 
 
@@ -26,13 +26,6 @@ def main():
         painter.fillRect(0, 0, 320, 27, gradient(0, 27, "#f8f8f8", "#b7bdc5"))
         painter.fillRect(0, 26, 320, 1, QColor("#8e969f"))
 
-        font = QFont("DejaVu Sans")
-        font.setPixelSize(17)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.setPen(QColor("#21252a"))
-        painter.drawText(QRectF(0, 0, 320, 26), Qt.AlignmentFlag.AlignCenter, "iPod")
-
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor("#354356"))
         painter.drawPolygon(QPolygonF([QPointF(9, 7), QPointF(9, 20), QPointF(19, 13.5)]))
@@ -42,16 +35,7 @@ def main():
         painter.fillRect(310, 10, 2, 6, QColor("#474e56"))
         painter.fillRect(288, 9, 20, 8, gradient(9, 17, "#a5e466", "#51983c"))
 
-        font.setPixelSize(16)
-        font.setBold(False)
-        painter.setFont(font)
-        items = ("Music", "Videos", "Photos", "Podcasts", "Extras", "Settings", "Shuffle Songs")
-        for index, item in enumerate(items):
-            y = 27 + index * 28
-            if index == 0:
-                painter.fillRect(0, y, 159, 28, gradient(y, y + 28, "#62b6f0", "#1b62bb"))
-            painter.setPen(QColor("#ffffff" if index == 0 else "#25292f"))
-            painter.drawText(QRectF(9, y, 135, 28), Qt.AlignmentFlag.AlignVCenter, item)
+        painter.fillRect(0, 27, 159, 28, gradient(27, 55, "#62b6f0", "#1b62bb"))
         painter.setPen(QPen(QColor("#ffffff"), 2))
         painter.drawPolyline(QPolygonF([QPointF(145, 36), QPointF(150, 41), QPointF(145, 46)]))
         painter.fillRect(159, 27, 1, 213, QColor("#b8bec5"))

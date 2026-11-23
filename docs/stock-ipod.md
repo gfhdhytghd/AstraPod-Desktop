@@ -114,3 +114,30 @@ files. Boot Apple firmware for these checks.
 If an operation reports an interrupted write, keep the stock volume mounted and
 run `hrstock.recover(root)` before reopening the library. An interrupted
 operation may require the original mount to be reconnected first.
+
+## Import the Classic preview font
+
+Run this from the AstraPod Desktop checkout with the application's Python
+environment and 7-Zip (`7zz` or `7z`) installed:
+
+```sh
+python -m astrapod_desktop.stock_font /path/to/iPod_35.2.0.4.ipsw
+```
+
+Use a local Apple iPod Classic restore image. The importer reads the firmware
+resource volume from the IPSW and verifies the SHA-256 of `HelveticaBold.ttf`
+before copying it to the user's private cache
+(`${XDG_CACHE_HOME:-~/.cache}/astrapod/stock-classic/`). Device access is not
+required. Restart AstraPod to load the font. Without the cached font, the
+preview uses Liberation Sans Bold when installed, or Qt's sans-serif fallback.
+
+The 11 Classic restore images checked across 6G (1.0.1 through 1.1.2),
+6.5G (2.0 and 2.0.1), and 7G (2.0.2 through 2.0.5) contain byte-identical
+Helvetica Regular and Helvetica Bold fonts. Apple returned HTTP 403 for
+6G 1.0 and 1.0.2.
+Both are TrueType outline fonts. The preview uses Bold at 14 LCD pixels for
+the title and 16 for the menu, based on glyph measurements from the
+[firmware framebuffer captures][captures]. The rounded pixel sizes are
+estimates. The preview draws its own chrome and overlays the album slideshow.
+
+[captures]: https://github.com/davidmonterocrespo24/qemu-ipod-classic/tree/1c33be87c7e97b56053142ae9d7f0686feaed504/docs/screenshots

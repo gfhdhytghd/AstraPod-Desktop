@@ -168,8 +168,12 @@ class ThemeAndNavigationTests(GuiCase):
             wait_until(self.app, lambda: page.drawing.cover_panel.exhausted)
             read.assert_called_once_with(root, None)
             self.assertEqual(page.drawing.model, "ipod6g")
-            self.assertEqual(self._render_device_screen(page.drawing),
-                             stock_png.convertToFormat(QtGui.QImage.Format.Format_RGB32))
+            screen = self._render_device_screen(page.drawing)
+            for rect in [QtCore.QRect(135, 0, 50, 26)] + [
+                    QtCore.QRect(5, 27 + row * 28, 130, 28) for row in range(7)]:
+                self.assertNotEqual(screen.copy(rect), stock_png.copy(rect))
+            panel = QtCore.QRect(160, 27, 160, 213)
+            self.assertEqual(screen.copy(panel), stock_png.copy(panel))
         self.window.device = None
         self.window.library_state.summary = contracts.DeviceSummary(
             "ipodvideo", "PodBox", 1000, 500, 0, 1, True)

@@ -1,4 +1,4 @@
-"""Cover slideshow for the Apple firmware home screen."""
+"""Typography and cover slideshow for the Classic home preview."""
 from __future__ import annotations
 
 import random
@@ -8,6 +8,64 @@ import hrstockdevice
 from ..artwork import artwork_to_image
 from ..contracts import album_key
 from ..qt import QtCore, QtGui, Qt
+from ..stock_font import font_path, is_stock_font
+
+
+TITLE_HEIGHT = 27
+MENU_ITEMS = ("Music", "Videos", "Photos", "Podcasts", "Extras", "Settings", "Shuffle Songs")
+FALLBACK_FAMILY = "Liberation Sans"
+
+
+def _preview_font(data: bytes, size: int) -> QtGui.QRawFont:
+    if data:
+        font = QtGui.QRawFont(data, size, QtGui.QFont.HintingPreference.PreferVerticalHinting)
+        if font.isValid():
+            return font
+    fallback = QtGui.QFont(FALLBACK_FAMILY)
+    fallback.setPixelSize(size)
+    fallback.setBold(True)
+    return QtGui.QRawFont.fromFont(fallback)
+
+
+def _draw_label(painter, font, label, x, y, height, center=False):
+    # These are fixed English labels. Lay them out directly from the face so
+    # an installed font with the same family name cannot replace the IPSW face.
+    glyphs = font.glyphIndexesForString(label)
+    positions = []
+    width = 0.0
+    for advance in font.advancesForGlyphIndexes(glyphs):
+        positions.append(QtCore.QPointF(width, 0))
+        width += advance.x()
+    run = QtGui.QGlyphRun()
+    run.setRawFont(font)
+    run.setGlyphIndexes(glyphs)
+    run.setPositions(positions)
+    if center:
+        x -= width / 2
+    baseline = y + (height + font.ascent() - font.descent()) / 2
+    painter.drawGlyphRun(QtCore.QPointF(x, baseline), run)
+
+
+def render_stock_home(background: QtGui.QImage) -> QtGui.QImage:
+    try:
+        with font_path().open("rb") as cached:
+            data = cached.read(512 * 1024)
+    except OSError:
+        data = b""
+    if not is_stock_font(data):
+        data = b""
+
+    title = _preview_font(data, 14)
+    menu = _preview_font(data, 16)
+    image = background.copy()
+    with QtGui.QPainter(image) as painter:
+        painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
+        painter.setPen(QtGui.QColor("#21252a"))
+        _draw_label(painter, title, "iPod", 160, 0, TITLE_HEIGHT - 1, center=True)
+        for index, label in enumerate(MENU_ITEMS):
+            painter.setPen(QtGui.QColor("#ffffff" if index == 0 else "#25292f"))
+            _draw_label(painter, menu, label, 9, TITLE_HEIGHT + index * 28, 28)
+    return image
 
 
 def _cached_cover(library, serial, tracks, previous, job):

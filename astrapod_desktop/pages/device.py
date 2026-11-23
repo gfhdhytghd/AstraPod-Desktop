@@ -11,7 +11,7 @@ from ..qt import QtCore, QtGui, QtSvg, QtWidgets, Qt
 from ..widgets import (CapacityBar, PageHeader, button, label, make_badge,
                        make_card, set_badge)
 from . import Page
-from .stock_screen import StockCoverPanel
+from .stock_screen import StockCoverPanel, TITLE_HEIGHT, render_stock_home
 
 R = QtCore.QRectF
 P = QtCore.QPointF
@@ -52,6 +52,7 @@ class IPodDrawing(QtWidgets.QWidget):
         self.model = "ipod6g"
         self.connected = False
         self.stock = False
+        self._stock_home = None
         self.cover_panel = StockCoverPanel(self, window.library_state)
         self.scale = 1.0
         self.setFixedSize(230, 380)
@@ -113,13 +114,17 @@ class IPodDrawing(QtWidgets.QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             return
         painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawImage(screen, _home_screen(self.stock))
-        if self.stock:
-            # Match the cover panel in the 320x240 menu asset.
-            title = screen.height() * 27 / 240
-            panel = R(screen.center().x(), screen.top() + title,
-                      screen.width() / 2, screen.height() - title)
-            self.cover_panel.paint(painter, panel)
+        if not self.stock:
+            painter.drawImage(screen, _home_screen(False))
+            return
+
+        if self._stock_home is None:
+            self._stock_home = render_stock_home(_home_screen(True))
+        painter.drawImage(screen, self._stock_home)
+        title = screen.height() * TITLE_HEIGHT / self._stock_home.height()
+        panel = R(screen.center().x(), screen.top() + title,
+                  screen.width() / 2, screen.height() - title)
+        self.cover_panel.paint(painter, panel)
 
 
 class DevicePage(Page):
