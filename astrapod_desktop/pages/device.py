@@ -11,6 +11,7 @@ from ..qt import QtCore, QtGui, QtSvg, QtWidgets, Qt
 from ..widgets import (CapacityBar, PageHeader, button, label, make_badge,
                        make_card, set_badge)
 from . import Page
+from .stock_screen import StockCoverPanel, StockMount, discover_stock
 
 R = QtCore.QRectF
 P = QtCore.QPointF
@@ -29,11 +30,11 @@ def device_name(summary) -> str:
     return MODEL_NAMES.get(summary.model, "iPod") if summary is not None else "iPod"
 
 
-def _home_screen() -> QtGui.QImage:
-    """The AstraPod home menu, captured from the simulator at 320x240."""
-    if "home" not in _renderers:
-        _renderers["home"] = QtGui.QImage(str(ASSETS / "home-screen.png"))
-    return _renderers["home"]
+def _home_screen(stock: bool) -> QtGui.QImage:
+    filename = "stock-classic-home.png" if stock else "home-screen.png"
+    if filename not in _renderers:
+        _renderers[filename] = QtGui.QImage(str(ASSETS / filename))
+    return _renderers[filename]
 
 
 def _front_renderer(model: str):
@@ -50,6 +51,8 @@ class IPodDrawing(QtWidgets.QWidget):
         self.window_ = window
         self.model = "ipod6g"
         self.connected = False
+        self.stock = False
+        self.cover_panel = StockCoverPanel(self, window.library_state)
         self.scale = 1.0
         self.setFixedSize(230, 380)
 
@@ -58,9 +61,11 @@ class IPodDrawing(QtWidgets.QWidget):
         self.setFixedSize(round(230 * scale), round(380 * scale))
         self.update()
 
-    def set_state(self, model: str, connected: bool) -> None:
+    def set_state(self, model: str, connected: bool, stock: StockMount | None) -> None:
         self.model = model or "ipod6g"
         self.connected = connected
+        self.stock = stock is not None
+        self.cover_panel.set_source(stock)
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -88,7 +93,7 @@ class IPodDrawing(QtWidgets.QWidget):
         screen = R(body.left() + body.width() * SCREEN[0], body.top() + body.height() * SCREEN[1],
                    body.width() * (SCREEN[2] - SCREEN[0]), body.height() * (SCREEN[3] - SCREEN[1]))
         painter.setPen(Qt.PenStyle.NoPen)
-        self._paint_screen(painter, screen, t)
+        self._paint_screen(painter, screen)
         glare = QtGui.QLinearGradient(screen.topLeft(), screen.bottomRight())
         glare.setColorAt(0, QtGui.QColor(255, 255, 255, 34))
         glare.setColorAt(0.45, QtGui.QColor(255, 255, 255, 0))
@@ -96,7 +101,7 @@ class IPodDrawing(QtWidgets.QWidget):
         painter.drawRect(screen)
         painter.end()
 
-    def _paint_screen(self, painter, screen, t) -> None:
+    def _paint_screen(self, painter, screen) -> None:
         if not self.connected:
             painter.setBrush(QtGui.QColor("#16171B"))
             painter.drawRect(screen)
@@ -108,7 +113,13 @@ class IPodDrawing(QtWidgets.QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             return
         painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.drawImage(screen, _home_screen())
+        painter.drawImage(screen, _home_screen(self.stock))
+        if self.stock:
+            # Match the cover panel in the 320x240 menu asset.
+            title = screen.height() * 27 / 240
+            panel = R(screen.center().x(), screen.top() + title,
+                      screen.width() / 2, screen.height() - title)
+            self.cover_panel.paint(painter, panel)
 
 
 class DevicePage(Page):
@@ -193,6 +204,12 @@ class DevicePage(Page):
         self.layout_.addWidget(self.scroll)
         self.scroll.viewport().installEventFilter(self)
 
+        self.stock_mount = StockMount()
+        self._probing = False
+        self._probe_timer = QtCore.QTimer(self)
+        self._probe_timer.setInterval(2000)
+        self._probe_timer.timeout.connect(self._probe_stock)
+        window.installEventFilter(self)
         window.library_state.changed.connect(self.update_view)
         window.daemon.state_changed.connect(lambda _s: self.update_view())
         self.update_view()
@@ -200,6 +217,9 @@ class DevicePage(Page):
     def eventFilter(self, watched, event) -> bool:
         if watched is self.scroll.viewport() and event.type() == QtCore.QEvent.Type.Resize:
             self._reflow(event.size().width())
+        elif watched is self.window_ and event.type() in (
+                QtCore.QEvent.Type.WindowStateChange, QtCore.QEvent.Type.DynamicPropertyChange):
+            self._sync_screen_activity()
         return super().eventFilter(watched, event)
 
     def _reflow(self, width: int) -> None:
@@ -210,34 +230,86 @@ class DevicePage(Page):
             self.drawing.set_scale(SMALL_SCALE if small else 1.0)
             self.hero_row.setSpacing(20 if small else 34)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._sync_screen_activity()
+
+    def hideEvent(self, event) -> None:
+        self._probe_timer.stop()
+        self.drawing.cover_panel.set_visible(False, self.window_.motion)
+        super().hideEvent(event)
+
+    def _sync_screen_activity(self) -> None:
+        window = self.window_
+        visible = self.isVisible() and not window.isMinimized()
+        self.drawing.cover_panel.set_visible(visible, window.motion)
+        link = window.daemon.state.get("link") or {}
+        if visible and not (window.daemon.demo or link.get("connected") or link.get("borrowed")):
+            if not self._probe_timer.isActive():
+                self._probe_timer.start()
+                self._probe_stock()
+        else:
+            self._probe_timer.stop()
+
+    def _probe_stock(self, force: bool = False) -> None:
+        if self._probing:
+            return
+        previous = StockMount() if force else self.stock_mount
+        self._probing = True
+
+        def done(result):
+            self._probing = False
+            if self._probe_timer.isActive() and (force or result != self.stock_mount):
+                if force:
+                    self.drawing.cover_panel.set_source(None)
+                self.stock_mount = result
+                self.update_view()
+
+        self.window_.runner.run("识别原厂 iPod", lambda _job: discover_stock(previous),
+                                done, lambda _error: done(StockMount()),
+                                foreground=False, device=False)
+
     def refresh(self) -> None:
+        if self._probe_timer.isActive() and (self.stock_mount.root or self.stock_mount.unsupported):
+            self._probe_stock(force=True)
+            return
         self.window_.library_state.refresh(False)
 
     def update_view(self) -> None:
         state = self.window_.library_state
         link = self.window_.daemon.state.get("link") or {}
-        summary = state.summary
-        connected = bool(link.get("connected")) or state.source == "device"
+        if link.get("connected") or link.get("borrowed"):
+            self.stock_mount = StockMount()
+        stock = self.stock_mount if self.stock_mount.root is not None else None
+        summary = None if stock else state.summary
+        connected = bool(stock or link.get("connected") or state.source == "device")
         model = summary.model if summary else "ipod6g"
         self.name.setText(MODEL_NAMES.get(model, "iPod"))
-        if link.get("connected"):
+        if stock:
+            set_badge(self.link_badge, "已连接，原厂固件", "success")
+        elif link.get("connected"):
             mode = {"podlink": "PodLink", "disk": "磁盘模式"}.get(link.get("mode"), "已连接")
             set_badge(self.link_badge, f"已连接，{mode}", "success")
         elif state.loading:
             set_badge(self.link_badge, "正在读取…", "busy")
         else:
             set_badge(self.link_badge, "未连接", "neutral")
-        if summary is None:
+        if stock:
+            self.tagline.setText("显示原厂 iPod Classic 的主菜单。")
+        elif self.stock_mount.unsupported:
+            self.tagline.setText("原厂固件仅支持 iPod Classic 第六、六点五和第七代。")
+        elif summary is None:
             self.tagline.setText("用 USB 连接 iPod 并打开 PodLink，然后点刷新读取它的信息。")
         elif state.source == "cache":
             self.tagline.setText("显示的是上次读取的信息。")
         else:
             self.tagline.setText("信息来自刚才连接的 iPod。")
-        serial = link.get("serial") or state.serial
+        serial = None if stock else link.get("serial") or state.serial
         values = {
             "model": MODEL_NAMES.get(model, model) + ("（第六、七代）" if model == "ipod6g" else
                                                       "（第五代）" if model == "ipodvideo" else ""),
-            "firmware": (summary.firmware if summary else link.get("firmware")) or "—",
+            "firmware": ("Apple 原厂固件" if stock else
+                         (summary.firmware if summary else link.get("firmware")) or "—"),
             "serial": serial or "—",
             "capacity": fmt.size(summary.total_bytes) if summary else "—",
             "tracks": f"{summary.track_count:,} 首" if summary else "—",
@@ -261,7 +333,8 @@ class DevicePage(Page):
         else:
             self.capacity.set_usage(1, 0, 0, 1, animate=False)
             self.cap_total.setText("")
-        self.drawing.set_state(model, connected)
+        self.drawing.set_state(model, connected, stock)
+        self._sync_screen_activity()
 
     def shown(self) -> None:
         state = self.window_.library_state

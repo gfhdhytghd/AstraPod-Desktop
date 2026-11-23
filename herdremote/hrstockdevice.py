@@ -1,9 +1,8 @@
-"""Identify an Apple stock-firmware iPod from an explicitly selected volume.
+"""Identify an Apple stock-firmware iPod Classic from an explicitly selected volume.
 
 Detection reads the iPod layout and device metadata. Linux can also associate
-the volume's filesystem device number with its USB disk in sysfs. Stock Video
-and Classic models share USB product IDs within each family, so a product ID
-alone cannot identify the exact generation. A raw SCSI inquiry is read-only,
+the volume's filesystem device number with its USB disk in sysfs. Classic models share a USB product ID, which cannot identify the exact
+generation. A raw SCSI inquiry is read-only,
 and uses polkit only if the unprivileged inquiry fails for lack of permission.
 Passive enumeration may disable interactive authorization.
 
@@ -24,10 +23,9 @@ from xml.parsers.expat import ExpatError
 
 
 SYS_DEV_BLOCK = Path("/sys/dev/block")
+MOUNTINFO = Path("/proc/self/mountinfo")
 MAX_SYSINFO = 256 * 1024
 MODEL_NUMBERS = {
-    "video-5g": ("MA002", "MA003", "MA146", "MA147", "MA452"),
-    "video-5.5g": ("MA444", "MA446", "MA448", "MA450", "MA664"),
     "classic-6g": ("MB029", "MB145", "MB147", "MB150"),
     "classic-6.5g": ("MB562", "MB565"),
     "classic-7g": ("MC293", "MC297"),
@@ -35,35 +33,32 @@ MODEL_NUMBERS = {
 _GENERATION_BY_MODEL = {number: generation for generation, numbers in MODEL_NUMBERS.items()
                         for number in numbers}
 SERIAL_MODELS = {
-    "SZ9": "MA002", "WEC": "MA002", "WED": "MA002", "WEG": "MA002",
-    "WEH": "MA002", "WEL": "MA002", "SZA": "MA003", "SZU": "MA003",
-    "TXK": "MA146", "TXM": "MA146", "WEF": "MA146", "WEJ": "MA146",
-    "WEK": "MA146", "TXL": "MA147", "TXN": "MA147",
-    "V9K": "MA444", "V9L": "MA444", "WU9": "MA444", "VQM": "MA446",
-    "V9M": "MA446", "V9N": "MA446", "V9P": "MA448", "V9Q": "MA448",
-    "V9R": "MA450", "V9S": "MA450", "V95": "MA450", "V96": "MA450",
-    "WUC": "MA450", "W9G": "MA664", "Y5N": "MB029", "YMU": "MB145",
+    "Y5N": "MB029", "YMU": "MB145",
     "YMV": "MB147", "YMX": "MB150", "2C5": "MB562", "2C7": "MB565",
     "9ZS": "MC293", "9ZU": "MC297",
 }
 UPDATER_GENERATIONS = {
-    13: "video-5g", 20: "video-5g", 25: "video-5.5g",
     24: "classic-6g", 33: "classic-6.5g", 35: "classic-7g", 38: "classic-7g",
 }
-USB_FAMILIES = {"1209": "video", "1261": "classic"}
+CLASSIC_USB_PRODUCT = "1261"
 DISPLAY_MODELS = {
-    "video-5g": "iPod Video 5G",
-    "video-5.5g": "iPod Video 5.5G",
     "classic-6g": "iPod Classic 6G",
     "classic-6.5g": "iPod Classic 6.5G",
     "classic-7g": "iPod Classic 7G",
-    "video": "iPod Video",
     "classic": "iPod Classic",
 }
 
 
 class StockLayoutError(RuntimeError):
     """An iPod path is unsafe for stock-firmware access."""
+
+
+class UnsupportedStockModel(RuntimeError):
+    """The detected stock iPod is outside the supported Classic family."""
+
+
+def _unsupported_model():
+    return UnsupportedStockModel("Unsupported stock iPod model. Only iPod Classic 6G, 6.5G and 7G are supported.")
 
 
 class StockProbeError(RuntimeError):
@@ -171,6 +166,24 @@ def _usb_disk(device):
     return None
 
 
+def mounted_apple_volumes():
+    """Return mount IDs and paths for mounted Apple USB filesystem roots."""
+    if not sys.platform.startswith("linux"):
+        return ()
+    volumes = []
+    for line in MOUNTINFO.read_text().splitlines():
+        before, _, after = line.partition(" - ")
+        mount_id, _, device, root, path, *_ = before.split()
+        if root != "/" or after.split()[0] not in ("vfat", "hfsplus"):
+            continue
+        major, minor = map(int, device.split(":"))
+        usb = _usb_disk(os.makedev(major, minor))
+        if usb and usb.vendor == "05ac":
+            path = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), path)
+            volumes.append((mount_id, Path(path)))
+    return tuple(volumes)
+
+
 def _guid(value):
     if type(value) is int and 0 < value < 2**64:
         return f"{value:016x}"
@@ -251,7 +264,7 @@ def _model_number(props):
         value = props.get(key)
         if isinstance(value, str):
             match = re.fullmatch(r"M?([ABC]\d{3})(?:[A-Z]+(?:/A)?)?", value.strip().upper())
-            if match and "M" + match[1] in _GENERATION_BY_MODEL:
+            if match:
                 return "M" + match[1]
     for key in ("serialnumber", "pszserialnumber"):
         value = props.get(key)
@@ -265,8 +278,12 @@ def _model_number(props):
 def _model_generation(model_number, props):
     updater = _number(props.get("updaterfamilyid", props.get("updaterfamily")))
     family = _number(props.get("familyid", props.get("ipodfamily")))
+    if ((model_number is not None and model_number not in _GENERATION_BY_MODEL)
+            or (updater is not None and updater not in UPDATER_GENERATIONS)
+            or (family is not None and family != 11)):
+        raise _unsupported_model()
     return (_GENERATION_BY_MODEL.get(model_number) or UPDATER_GENERATIONS.get(updater)
-            or {6: "video", 11: "classic"}.get(family))
+            or ("classic" if family == 11 else None))
 
 
 def _path_checksum(path):
@@ -324,7 +341,7 @@ try:
     if sysdev.name != Path(disk).name or not any(
         (parent / "idVendor").is_file()
         and (parent / "idVendor").read_text().strip() == "05ac"
-        and (parent / "idProduct").read_text().strip() in {"1209", "1261"}
+        and (parent / "idProduct").read_text().strip() == "1261"
         and not (parent / "manufacturer").read_text().strip().lower().startswith(("podbox", "rockbox"))
         and not re.fullmatch(r".AA0000000000360", (parent / "serial").read_text().strip(), re.I)
         for parent in sysdev.parents
@@ -371,7 +388,7 @@ def _probe_scsi(usb, authorize):
 
 
 def detect(volume_root, *, authorize=True):
-    """Return stock device metadata, or None if the selected layout is absent."""
+    """Identify a stock Classic, return None for other layouts, or reject an unsupported iPod."""
     try:
         root = Path(volume_root).resolve(strict=True)
         if not root.is_dir():
@@ -397,10 +414,13 @@ def detect(volume_root, *, authorize=True):
         return None
 
     usb = _usb_disk(root.stat().st_dev) if sys.platform.startswith("linux") else None
-    if usb and (usb.vendor != "05ac" or usb.product not in USB_FAMILIES
+    if usb and (usb.vendor != "05ac"
                 or usb.manufacturer.casefold().startswith(("podbox", "rockbox"))
                 or re.fullmatch(r".AA0000000000360", usb.serial, re.IGNORECASE)):
         return None
+
+    if usb and usb.product != CLASSIC_USB_PRODUCT:
+        raise _unsupported_model()
 
     metadata = basic | props
     model_number = _model_number(metadata)
@@ -425,24 +445,16 @@ def detect(volume_root, *, authorize=True):
                 model_number = _model_number(metadata) or model_number
                 generation = _model_generation(model_number, metadata) or generation
                 guid = _guid(metadata.get("firewireguid")) or guid
-        usb_family = USB_FAMILIES[usb.product]
-        if generation and not generation.startswith(usb_family):
-            return None
-        generation = generation or usb_family
+        generation = generation or "classic"
+    if generation is None:
+        raise _unsupported_model()
 
     db_version = _number(metadata.get("dbversion"))
     sqlite = (compressed is not None or metadata.get("sqlitedb") is True
               or str(metadata.get("sqlitedb", "")).lower() in {"true", "1"})
-    if header_checksum in {1, 2, 3}:
-        checksum = header_checksum
-    elif db_version is not None:
-        checksum = {0: 0, 1: 0, 2: 0, 3: 1, 4: 2, 5: 3}.get(db_version)
-    elif generation and generation.startswith("classic"):
-        checksum = 1
-    else:
-        checksum = 0 if generation and generation.startswith("video") else None
-
+    checksum = (header_checksum if header_checksum in {1, 2, 3}
+                else {4: 2, 5: 3}.get(db_version, 1))
     return StockDevice(root, control, tunes, compressed or database, device_dir,
-                       DISPLAY_MODELS.get(generation, "iPod (stock firmware)"),
+                       DISPLAY_MODELS[generation],
                        model_number, generation, guid, db_version, sqlite, checksum,
                        extended)

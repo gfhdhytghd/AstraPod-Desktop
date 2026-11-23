@@ -1,4 +1,4 @@
-"""Prepare local audio for the Video and Classic stock firmware.
+"""Prepare local audio for the iPod Classic stock firmware.
 
 `prepare_media(path, directory)` accepts an audio file. `prepare_track(source,
 track, directory)` downloads a Jellyfin track first. Both return the same

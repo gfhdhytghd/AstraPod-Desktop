@@ -1,10 +1,13 @@
-"""Stock iPod operations on a caller-selected, mounted Linux volume.
+"""Stock iPod Classic operations on a caller-selected, mounted Linux volume.
 
-detect(root) returns StockDevice or None. For passive discovery use
+detect(root) identifies an iPod Classic and raises UnsupportedStockModel for
+unsupported stock iPods. For passive discovery use
 detect(root, authorize=False). read_library(root) returns DeviceTrack rows and
 playlists whose track_ids refer to row.index (the persistent Apple database
 ID). Paths are absolute within the volume and ratings are 0–10. The managed
 field marks Jellyfin-owned copies and play_time_ms is unavailable (zero).
+random_artwork(root, previous=None) reads one random album cover from the
+stock artwork database, excluding the previous album key.
 
 preview(root, source, scope) returns an hrmediasync.Plan. inventory(root,
 identity, tracks=()) returns its device, owned and matched fields for callers
@@ -18,7 +21,7 @@ finishes or rolls back an interrupted write. Reads report a pending transaction
 and writes recover it before opening the database.
 """
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 import fcntl
 from hashlib import sha256
@@ -37,7 +40,8 @@ import hrmediasync
 import hrstockdb
 import hrstockmedia
 import hrstocktxn
-from hrstockdevice import MODEL_NUMBERS, assert_stock_layout, checked_path, detect
+from hrstockdevice import (MODEL_NUMBERS, UnsupportedStockModel, assert_stock_layout,
+                           checked_path, detect)
 
 _OWNERS = ".astrapod-jellyfin.json"
 _METADATA = ("iTunes", "Device", "Artwork")
@@ -109,7 +113,7 @@ def _volume(volume_root, *, write=False, authorize=True):
         unknown_compressed_model_info = (
             device.database.name.casefold() == "itunescdb" and device.sysinfo_extended is None)
         if write and authorize and (not device.model_number or unknown_compressed_model_info
-                                   or not device.firewire_guid and device.checksum != 0):
+                                   or not device.firewire_guid):
             device = _require_device(original, authorize=True)
         check()
         yield device, pinned, tunes, check
@@ -215,6 +219,24 @@ def _tags(track):
                                  track.length_ms, track.disc, track.track)
 
 
+def _stage_sysinfo(device, stage):
+    path = stage / "iPod_Control/Device/SysInfoExtended"
+    if device.sysinfo_extended is None:
+        path.unlink(missing_ok=True)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(device.sysinfo_extended)
+
+
+def _open_database(device, stage, *, artwork_only=False):
+    generation = device.generation
+    fallback = "classic-6g" if generation == "classic" else generation
+    model = device.model_number or MODEL_NUMBERS[fallback][0]
+    return hrstockdb.open_database(
+        stage, model_number=model, firewire_guid=device.firewire_guid,
+        checksum=device.checksum, sqlite=device.sqlite, artwork_only=artwork_only)
+
+
 class _Session:
     def __init__(self, device, root, tunes, check, stage):
         self.device = device
@@ -231,12 +253,7 @@ class _Session:
             dest = stage / relative
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, dest, follow_symlinks=False)
-        path = stage / "iPod_Control/Device/SysInfoExtended"
-        if device.sysinfo_extended is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(device.sysinfo_extended)
+        _stage_sysinfo(device, stage)
         self.primary = root / device.database.relative_to(device.root)
         self.validate_snapshot()
         fingerprint = sha256()
@@ -260,13 +277,7 @@ class _Session:
             raise RuntimeError("The iPod database changed during the operation")
 
     def open_database(self):
-        generation = self.device.generation
-        fallback = {"classic": "classic-6g", "video": "video-5g"}.get(generation, generation)
-        models = MODEL_NUMBERS.get(fallback, ())
-        model = self.device.model_number or next(iter(models), None)
-        return hrstockdb.open_database(
-            self.stage, model_number=model, firewire_guid=self.device.firewire_guid,
-            checksum=self.device.checksum, sqlite=self.device.sqlite)
+        return _open_database(self.device, self.stage)
 
     def ownership(self, tracks):
         by_id = {track.id: track for track in tracks}
@@ -363,10 +374,6 @@ class _Session:
 def _session(root, *, write=False):
     with (_volume(root, write=write) as (device, pinned, tunes, check),
           TemporaryDirectory(prefix="astrapod-stock-") as directory):
-        if write and device.generation not in {
-                "video-5g", "video-5.5g", "classic-6g", "classic-6.5g", "classic-7g",
-                "video", "classic"}:
-            raise RuntimeError("This iPod model has no supported stock database writer")
         session = _Session(device, pinned, tunes, check, Path(directory))
         with session.open_database() as database:
             yield session, database
@@ -389,6 +396,45 @@ def read_library(root):
         managed = {track_id for track_id, _ in session.ownership(tracks).values()}
         return StockLibrary(tuple(_device_row(track, track.id in managed) for track in tracks),
                             database.playlists)
+
+
+def random_artwork(root, previous=None):
+    with (_volume(root) as (device, pinned, _tunes, check),
+          TemporaryDirectory(prefix="astrapod-stock-art-") as directory,
+          ExitStack() as thumbnails):
+        artwork = checked_path(pinned, "iPod_Control", "Artwork", directory=True)
+        index = checked_path(artwork, "ArtworkDB") if artwork else None
+        if index is None:
+            return None
+
+        stage = Path(directory)
+        stage_art = stage / "iPod_Control/Artwork"
+        stage_art.mkdir(parents=True)
+        stage_db = stage / "iPod_Control/iTunes" / _STOCK_FILES[device.database.name.casefold()]
+        stage_db.parent.mkdir()
+        shutil.copyfile(pinned / device.database.relative_to(device.root), stage_db)
+        shutil.copyfile(index, stage_art / "ArtworkDB")
+        _stage_sysinfo(device, stage)
+        # ArtworkDB stores offsets into large .ithmb files. libgpod's thumbnail
+        # reader seeks to those offsets, so stage only the DBs and pin the blobs
+        # for the duration of this read. Writer sessions still own full copies.
+        volume_id = pinned.stat().st_dev
+        for path in artwork.iterdir():
+            if path.suffix.casefold() != ".ithmb":
+                continue
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            thumbnails.callback(os.close, fd)
+            info = os.fstat(fd)
+            if info.st_dev != volume_id or not stat.S_ISREG(info.st_mode):
+                raise RuntimeError(f"Unsafe iPod thumbnail file: {path.name}")
+            (stage_art / path.name).symlink_to(f"/proc/self/fd/{fd}")
+        check()
+        with _open_database(device, stage, artwork_only=True) as database:
+            result = database.random_artwork(previous, size=256)
+        check()
+        if result is not None:
+            album, thumbnail = result
+            return album, hrlibrary.Artwork(*thumbnail)
 
 
 def inventory(root, identity, tracks=()):

@@ -25,6 +25,7 @@ from astrapod_desktop import backends, contracts, fakes, models  # noqa: E402
 from astrapod_desktop.app import create_application, demo_services  # noqa: E402
 from astrapod_desktop.backends import ProbedFile  # noqa: E402
 from astrapod_desktop.jobs import JobRunner  # noqa: E402
+from astrapod_desktop.pages.device import ASSETS  # noqa: E402
 from astrapod_desktop.pages.extensions import normalize_schema  # noqa: E402
 from podlink_ui_theme import QtCore, QtWidgets  # noqa: E402
 from astrapod_desktop.qt import QtGui  # noqa: E402
@@ -122,6 +123,119 @@ class ThemeAndNavigationTests(GuiCase):
         self.window.daemon.state["link"] = {"connected": True, "mode": "podlink"}
         page.update_view()
         self.assertTrue(page.drawing.connected)
+
+    def _render_device_screen(self, drawing):
+        image = QtGui.QImage(320, 240, QtGui.QImage.Format.Format_RGB32)
+        with QtGui.QPainter(image) as painter:
+            drawing._paint_screen(painter, QtCore.QRectF(0, 0, 320, 240))
+        return image
+
+    def _mount_stock_classic(self):
+        root = self.root / "Classic"
+        control = root / "iPod_Control"
+        (control / "iTunes").mkdir(parents=True)
+        (control / "iTunes" / "iTunesDB").touch()
+        (control / "Device").mkdir()
+        (control / "Device" / "SysInfo").write_text("ModelNumStr: MC297\n")
+        mount = patch("hrstockdevice.mounted_apple_volumes", return_value=(("1", root),))
+        self.addCleanup(mount.stop)
+        mount.start()
+        self.window.daemon.demo = False
+        self.window.daemon.state["link"] = {"connected": False}
+        self.window.navigate("device")
+        self.window.show()
+        return root
+
+    def test_device_uses_stock_menu_only_for_detected_stock_classic(self) -> None:
+        page = self.window.pages["device"]
+        stock_png = QtGui.QImage(str(ASSETS / "stock-classic-home.png"))
+        podbox_png = QtGui.QImage(str(ASSETS / "home-screen.png"))
+        with patch("hrstock.random_artwork", return_value=None) as read:
+            root = self._mount_stock_classic()
+            wait_until(self.app, lambda: page.drawing.cover_panel.exhausted)
+            read.assert_called_once_with(root, None)
+            self.assertEqual(page.drawing.model, "ipod6g")
+            self.assertEqual(self._render_device_screen(page.drawing),
+                             stock_png.convertToFormat(QtGui.QImage.Format.Format_RGB32))
+        self.window.library_state.summary = contracts.DeviceSummary(
+            "ipodvideo", "PodBox", 1000, 500, 0, 1, True)
+        for mode in ("podlink", "disk", "unknown"):
+            with self.subTest(mode=mode):
+                self.window.daemon.state["link"] = {"connected": True, "mode": mode}
+                page.update_view()
+                self.assertEqual(page.drawing.model, "ipodvideo")
+                self.assertEqual(self._render_device_screen(page.drawing),
+                                 podbox_png.convertToFormat(QtGui.QImage.Format.Format_RGB32))
+
+    def test_stock_cover_panel_reads_album_covers_and_pauses(self) -> None:
+        page = self.window.pages["device"]
+        panel = page.drawing.cover_panel
+        self.window.set_motion(True)
+        covers = {
+            ("Artist", "Red"): contracts.Artwork(2, 2, bytes((255, 0, 0)) * 4),
+            ("Artist", "Blue"): contracts.Artwork(2, 2, bytes((0, 0, 255)) * 4),
+        }
+        calls = []
+
+        def load(root, previous):
+            calls.append((root, previous, threading.get_ident()))
+            return next((key, art) for key, art in covers.items() if key != previous)
+
+        with patch("hrstock.random_artwork", side_effect=load):
+            root = self._mount_stock_classic()
+            wait_until(self.app, lambda: panel.next is not None)
+            self.assertTrue(panel.timer.isActive())
+            self.assertEqual([(path, prev) for path, prev, _ in calls],
+                             [(root, None), (root, ("Artist", "Red"))])
+            self.assertTrue(all(thread != threading.get_ident() for _, _, thread in calls))
+            screen = self._render_device_screen(page.drawing)
+            self.assertEqual(screen.pixelColor(240, 140), QtGui.QColor("red"))
+            self.assertEqual(screen.pixelColor(240, 10),
+                             QtGui.QImage(str(ASSETS / "stock-classic-home.png")).pixelColor(240, 10))
+
+            panel.elapsed = panel.HOLD_MS + panel.FADE_MS // 2
+            blended = self._render_device_screen(page.drawing).pixelColor(240, 140)
+            self.assertGreater(blended.red(), 100)
+            self.assertGreater(blended.blue(), 100)
+            panel.elapsed = panel.HOLD_MS + panel.FADE_MS
+            panel._advance()
+            wait_until(self.app, lambda: panel.next is not None)
+            self.assertEqual(panel.current[0], ("Artist", "Blue"))
+            self.assertEqual(panel.next[0], ("Artist", "Red"))
+            self.assertEqual(calls[-1][1], ("Artist", "Blue"))
+
+            self.window.navigate("songs")
+            self.assertFalse(panel.timer.isActive())
+            self.window.navigate("device")
+            self.assertTrue(panel.timer.isActive())
+            self.window.showMinimized()
+            self.app.processEvents()
+            self.assertFalse(panel.timer.isActive())
+            self.window.showNormal()
+            wait_until(self.app, panel.timer.isActive)
+            self.window.set_motion(False)
+            self.assertFalse(panel.timer.isActive())
+            color = self._render_device_screen(page.drawing).pixelColor(240, 140)
+            self.assertEqual(color, QtGui.QColor("blue"))
+
+    def test_stock_cover_panel_falls_back_to_library_cache(self) -> None:
+        state = self.window.library_state
+        song = track(0, "Cached")
+        state.serial = self.services.library.serial
+        state.tracks = [song]
+        cached = self.services.library.art_path(state.serial, song, "coverflow")
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        image = QtGui.QImage(80, 80, QtGui.QImage.Format.Format_RGB32)
+        image.fill(QtGui.QColor("#173abc"))
+        self.assertTrue(image.save(str(cached)))
+        page = self.window.pages["device"]
+
+        with patch("hrstock.random_artwork", return_value=None):
+            self._mount_stock_classic()
+            wait_until(self.app, lambda: page.drawing.cover_panel.current is not None)
+            color = self._render_device_screen(page.drawing).pixelColor(240, 140)
+            self.assertEqual(color, image.pixelColor(0, 0))
+
 
     def shortcut(self, sequence: str):
         wanted = QtGui.QKeySequence(sequence)
