@@ -5,14 +5,15 @@ for the mounted-volume dispatch contract. The transport runs on Linux and
 uses `libgpod.so.4`, `ffmpeg`, and `ffprobe`. On Arch, the `libgpod` package
 also brings in `sg3_utils` for the read-only SCSI fallback.
 
-This checklist exercises the transport before the desktop dispatch is
-connected. The transport supports iPod Classic 6G, 6.5G, and 7G. Other stock
+This checklist exercises the transport directly. The transport supports iPod Classic 6G, 6.5G, and 7G. Other stock
 iPods raise `UnsupportedStockModel`. Repeat the checks on each supported
 generation. Use a FAT iPod with a stock iTunes library and an existing playlist.
 Disconnect any PodBox test iPod before starting.
 
 1. Connect the stock iPod. Mount its FAT volume in the desktop file manager.
-   Confirm the mount contains `iPod_Control/iTunes/iTunesDB`.
+   Confirm the mount contains `iPod_Control/iTunes/iTunesDB`. On the desktop
+   device page, check for the Classic main menu and the album cover slideshow.
+   With animation disabled in Settings, the cover stays still.
 2. Back up the entire `iPod_Control` directory to a fresh host directory.
 3. Prepare four short, tagged samples with different titles: MP3, AAC-LC in
    M4A, PCM WAV, and 96 kHz FLAC. Include an embedded cover in one sample.

@@ -141,6 +141,21 @@ def usb_descriptor(tmp_path, monkeypatch, *, serial=GUID, vendor="05ac", model="
     return disk
 
 
+def test_discovery_reads_mounted_apple_usb_roots(tmp_path, monkeypatch):
+    usb_descriptor(tmp_path, monkeypatch)
+    stat = tmp_path.stat().st_dev
+    number = f"{stock.os.major(stat)}:{stock.os.minor(stat)}"
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        f"10 1 {number} / /run/media/iPod\\040Classic rw - vfat /dev/sdb2 rw\n"
+        f"11 1 {number} /subdir /mnt/bind rw - vfat /dev/sdb2 rw\n"
+        f"12 1 999:999 / /mnt/not-apple rw - vfat /dev/sdc1 rw\n"
+        f"13 1 {number} / /mnt/non-ipod rw - ext4 /dev/sdb2 rw\n"
+    )
+    monkeypatch.setattr(stock, "MOUNTINFO", mountinfo)
+    assert stock.mounted_apple_volumes() == (("10", Path("/run/media/iPod Classic")),)
+
+
 def test_rejects_non_classic_apple_usb_before_raw_probe(tmp_path, monkeypatch):
     stock_volume(tmp_path)
     usb_descriptor(tmp_path, monkeypatch, model="1209")

@@ -23,6 +23,7 @@ from xml.parsers.expat import ExpatError
 
 
 SYS_DEV_BLOCK = Path("/sys/dev/block")
+MOUNTINFO = Path("/proc/self/mountinfo")
 MAX_SYSINFO = 256 * 1024
 MODEL_NUMBERS = {
     "classic-6g": ("MB029", "MB145", "MB147", "MB150"),
@@ -163,6 +164,24 @@ def _usb_disk(device):
                             _read_text(parent / "manufacturer"), _read_text(parent / "serial"),
                             disk / "device" / "vpd_pg80")
     return None
+
+
+def mounted_apple_volumes():
+    """Return mount IDs and paths for mounted Apple USB filesystem roots."""
+    if not sys.platform.startswith("linux"):
+        return ()
+    volumes = []
+    for line in MOUNTINFO.read_text().splitlines():
+        before, _, after = line.partition(" - ")
+        mount_id, _, device, root, path, *_ = before.split()
+        if root != "/" or after.split()[0] not in ("vfat", "hfsplus"):
+            continue
+        major, minor = map(int, device.split(":"))
+        usb = _usb_disk(os.makedev(major, minor))
+        if usb and usb.vendor == "05ac":
+            path = re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), path)
+            volumes.append((mount_id, Path(path)))
+    return tuple(volumes)
 
 
 def _guid(value):

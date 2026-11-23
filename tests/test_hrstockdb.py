@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdremote"))
 
+import hrstock
 import hrstockdb as stock
 
 
@@ -166,12 +167,22 @@ def test_bad_database_header_is_rejected_before_native_parse(tmp_path):
             pytest.fail("Opened a corrupted iTunesDB")
 
 
-def test_writes_and_preserves_artwork(tmp_path):
+@pytest.mark.parametrize("compressed", [False, True])
+def test_writes_and_preserves_artwork(tmp_path, compressed):
     def png_chunk(kind, payload):
         return (struct.pack(">I", len(payload)) + kind + payload
                 + struct.pack(">I", zlib.crc32(kind + payload)))
 
-    create_fixture(tmp_path)
+    if compressed:
+        create_fixture(tmp_path, "MC293", checksum=2, compressed=True)
+        sysinfo = tmp_path / DEVICE / "SysInfoExtended"
+        props = plistlib.loads(sysinfo.read_bytes())
+        # This is also a built-in Classic format when the plist is unavailable.
+        props["AlbumArt"] = [{"FormatId": 1055, "PixelFormat": "4C353635",
+                              "RenderWidth": 128, "RenderHeight": 128, "DisplayWidth": 128}]
+        sysinfo.write_bytes(plistlib.dumps(props))
+    else:
+        create_fixture(tmp_path)
     artwork = tmp_path / "cover.png"
     artwork.write_bytes(
         b"\x89PNG\r\n\x1a\n"
@@ -184,6 +195,19 @@ def test_writes_and_preserves_artwork(tmp_path):
         emitted = db.save()
     assert Path("iPod_Control/Artwork/ArtworkDB") in emitted
     assert any(path.suffix == ".ithmb" for path in emitted)
+    album, art = hrstock.random_artwork(tmp_path)
+    assert album == ("Album Artist", "Album")
+    assert art.width > 0 and art.height > 0
+    assert len(art.rgb888) == art.width * art.height * 3
+    assert any(art.rgb888[0::3])
+    assert hrstock.random_artwork(tmp_path, album) is None
+    if compressed:
+        formats = props.pop("AlbumArt")
+        sysinfo.write_bytes(plistlib.dumps(props))
+        assert hrstock.random_artwork(tmp_path)[1].rgb888 == art.rgb888
+        assert "AlbumArt" not in plistlib.loads(sysinfo.read_bytes())
+        props["AlbumArt"] = formats
+        sysinfo.write_bytes(plistlib.dumps(props))
     with stock.open_database(tmp_path) as db:
         assert db.tracks[0].has_artwork
         db.add_track(example_row(2), filetype="MPEG audio file", sample_rate=44100)

@@ -3,8 +3,10 @@
 Copy the iTunes, Device and Artwork directories into a private host directory
 before calling open_database(), including any iTunes Library.itlp, Play Counts,
 and OTGPlaylistInfo files. libgpod may modify metadata even while opening a
-database. Only pass staging paths here. save() returns changed files relative
-to that directory. removed_files lists paths consumed or removed by libgpod.
+database. Only pass staging paths here. A cover reader may stage references to
+pinned thumbnail blobs, provided it never calls save(). save() returns changed
+files relative to that directory. removed_files lists paths consumed or removed
+by libgpod.
 The caller publishes those changes and any media files as one transaction.
 
 The optional Linux runtime is libgpod.so.4 (Arch extra/libgpod). Its public
@@ -17,13 +19,14 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from ctypes import (
     CDLL, POINTER, Structure, byref, c_char_p, c_float, c_int, c_int16, c_int32,
-    c_int64, c_uint8, c_uint16, c_uint32, c_uint64, c_void_p, cast, sizeof,
+    c_int64, c_uint8, c_uint16, c_uint32, c_uint64, c_void_p, cast, sizeof, string_at,
 )
 from dataclasses import dataclass
 from functools import lru_cache
 import os
 from pathlib import Path
 import plistlib
+import random
 import re
 from threading import Lock
 import time
@@ -203,6 +206,54 @@ def _library() -> CDLL:
     return library
 
 
+@lru_cache(maxsize=1)
+def _thumbnail_library() -> CDLL:
+    library = _library()
+    try:
+        signatures = (
+            ("itdb_track_get_thumbnail", c_void_p, _TrackPointer, c_int, c_int),
+            ("gdk_pixbuf_get_pixels", c_void_p, c_void_p),
+            ("gdk_pixbuf_get_width", c_int, c_void_p),
+            ("gdk_pixbuf_get_height", c_int, c_void_p),
+            ("gdk_pixbuf_get_rowstride", c_int, c_void_p),
+            ("gdk_pixbuf_get_n_channels", c_int, c_void_p),
+            ("g_object_unref", None, c_void_p),
+        )
+        for name, result, *arguments in signatures:
+            function = getattr(library, name)
+            function.restype = result
+            function.argtypes = arguments
+    except AttributeError as exc:
+        raise StockDatabaseUnavailable("libgpod does not provide GdkPixbuf artwork support.") from exc
+    return library
+
+
+def _thumbnail(track, size):
+    library = _thumbnail_library()
+    pixbuf = library.itdb_track_get_thumbnail(track, size, size)
+    if not pixbuf:
+        return None
+    try:
+        width = library.gdk_pixbuf_get_width(pixbuf)
+        height = library.gdk_pixbuf_get_height(pixbuf)
+        stride = library.gdk_pixbuf_get_rowstride(pixbuf)
+        channels = library.gdk_pixbuf_get_n_channels(pixbuf)
+        pixels = library.gdk_pixbuf_get_pixels(pixbuf)
+        if not (0 < width <= 1024 and 0 < height <= 1024 and pixels
+                and channels in (3, 4) and stride >= width * channels):
+            return None
+        data = b"".join(string_at(pixels + row * stride, width * channels)
+                        for row in range(height))
+        if channels == 4:
+            rgb = bytearray(width * height * 3)
+            for channel in range(3):
+                rgb[channel::3] = data[channel::4]
+            data = bytes(rgb)
+        return width, height, data
+    finally:
+        library.g_object_unref(pixbuf)
+
+
 def _native_call(operation: str, function, *args):
     error = _ErrorPointer()
     # libgpod's SQLite writer and signature code share process-wide state.
@@ -299,7 +350,7 @@ def _library_files(root: Path) -> dict[Path, tuple[int, int, int, int]]:
 
 def _device_metadata(
     root: Path, model_number: str | None, firewire_guid: str | None, source_scheme: int,
-    source_compressed: bool, checksum: int | None, sqlite: bool | None,
+    source_compressed: bool, checksum: int | None, sqlite: bool | None, artwork_only: bool,
 ) -> tuple[int, bool, bool]:
     # Prefer the actual database scheme, then the capabilities in SysInfoExtended.
     # Use known model fallbacks when neither source supplies a signature variant.
@@ -349,6 +400,11 @@ def _device_metadata(
             "".join(f"{key}: {value}\n" for key, value in sysinfo.items()), encoding="utf-8"
         )
 
+    if artwork_only and not (extended.get("AlbumArt") or extended.get("AlbumArt2")):
+        # libgpod uses its Classic model table only when the plist is absent.
+        extended_path.unlink(missing_ok=True)
+        return scheme, compressed, False
+
     if extended or scheme != 1 or compressed:
         # libgpod handles format capabilities from this plist. Never let it run
         # SQL supplied by the mounted volume or override the verified model.
@@ -372,7 +428,7 @@ def _device_metadata(
         elif hash_info.name != _HASH_INFO.name:
             hash_info.rename(root / _HASH_INFO)
 
-    return scheme, compressed, valid_guid
+    return scheme, compressed, valid_guid and not artwork_only
 
 
 class StockDatabase:
@@ -415,6 +471,27 @@ class StockDatabase:
                 has_artwork=bool(_library().itdb_track_has_thumbnails(pointer)), **fields,
             ))
         return tuple(tracks)
+
+    def random_artwork(self, previous, size):
+        """Decode one random album thumbnail, excluding the previous album."""
+        library = _library()
+        albums = {}
+        for pointer in self._native_tracks():
+            track = pointer.contents
+            if track.mediatype not in (0, 1) or not library.itdb_track_has_thumbnails(pointer):
+                continue
+            album = (_text(track.albumartist or track.artist).strip(),
+                     _text(track.album).strip() or _text(track.title))
+            if album != previous:
+                albums.setdefault(album, []).append(pointer)
+        keys = list(albums)
+        random.shuffle(keys)
+        for album in keys:
+            for pointer in albums[album]:
+                thumbnail = _thumbnail(pointer, size)
+                if thumbnail is not None:
+                    return album, thumbnail
+        return None
 
     @property
     def playlists(self) -> tuple[DatabasePlaylist, ...]:
@@ -558,7 +635,7 @@ class StockDatabase:
 @contextmanager
 def open_database(
     stage_root: Path, *, model_number: str | None = None, firewire_guid: str | None = None,
-    checksum: int | None = None, sqlite: bool | None = None,
+    checksum: int | None = None, sqlite: bool | None = None, artwork_only: bool = False,
 ) -> Iterator[StockDatabase]:
     """Parse a stock library in staging and close its native handle on exit."""
     library = _library()
@@ -569,7 +646,7 @@ def open_database(
         source = _stage_path(root, _ITUNES_DB)
     source_scheme, _ = _signature(source)
     checksum, compressed, writable = _device_metadata(
-        root, model_number, firewire_guid, source_scheme, compressed, checksum, sqlite,
+        root, model_number, firewire_guid, source_scheme, compressed, checksum, sqlite, artwork_only,
     )
     if checksum == 2 and compressed and source.stat().st_size < 0xA0:
         raise StockDatabaseError("Truncated iTunes database hash72 header.")
