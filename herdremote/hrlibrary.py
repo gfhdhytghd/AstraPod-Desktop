@@ -145,6 +145,20 @@ def summary(link: podlink.Link) -> DeviceSummary:
         raise RuntimeError("Invalid iPod library summary") from error
 
 
+def match_cached_tracks(link, commit_id, cached_tracks):
+    """Validate a cached library for the USB identity already selected by the caller."""
+    if commit_id is None:
+        return None
+    try:
+        current = summary(link)
+    except (RuntimeError, TimeoutError):
+        return None
+    if (current.database_ready and current.commit_id == commit_id
+            and current.track_count == len(cached_tracks)):
+        return cached_tracks
+    return None
+
+
 def _append_data(reply, buffer, limit):
     if not reply.startswith((b"DATA + ", b"DATA . ")):
         raise ValueError("expected a data chunk")
@@ -590,9 +604,14 @@ class _UploadProgress:
         return message
 
 
-def import_tag_index(link):
+def import_tag_index(link, *, cached_snapshot=None):
+    rows = None
+    if cached_snapshot is not None:
+        rows = match_cached_tracks(link, *cached_snapshot)
+    if rows is None:
+        rows = tracks(link)
     matches = defaultdict(list)
-    for track in tracks(link):
+    for track in rows:
         tags = music_tags(track.title, track.artist.split(";"), track.album,
                           track.length_ms, track.disc, track.track)
         if tags:
@@ -766,7 +785,8 @@ def _profile_main():
         parser.exit(1, f"PodLink profile: {error}\n")
 
 
-def import_files(link: podlink.Link, paths, progress, skip_duplicates=True):
+def import_files(link: podlink.Link, paths, progress, skip_duplicates=True, *,
+                 cached_snapshot=None):
     changed = False
     stopped = False
 
@@ -788,7 +808,8 @@ def import_files(link: podlink.Link, paths, progress, skip_duplicates=True):
 
     try:
         return import_batch(paths, progress, skip_duplicates,
-                            lambda: import_tag_index(link), publish)
+                            lambda: import_tag_index(link, cached_snapshot=cached_snapshot),
+                            publish)
     finally:
         if changed and not stopped:
             podlink.refresh_media(link)

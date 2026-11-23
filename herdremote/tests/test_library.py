@@ -312,15 +312,39 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(events[4]["sent"], 3000)
         self.assertEqual(events[4]["total"], 3000)
 
+    def test_duplicate_index_reuses_current_cache_and_refreshes_stale_cache(self):
+        for snapshot, cache_hit in (((51, (TRACK,)), True),
+                                    ((50, (TRACK,)), False),
+                                    ((51, (TRACK, TRACK)), False)):
+            with self.subTest(snapshot=snapshot), TemporaryDirectory() as work, \
+                    patch.object(podlink, "media_command", probe):
+                link, events = FakeLink(), []
+                path = Path(work) / "device-copy.flac"
+                path.write_bytes(b"music")
+                stored = library.import_files(link, [path], events.append,
+                                              cached_snapshot=snapshot)
+                self.assertEqual(stored, [])
+                self.assertEqual([event["state"] for event in events], ["probe", "skip"])
+                self.assertIn(b"MS3 SUMMARY", link.requests)
+                self.assertEqual(b"MS3 DB" not in link.requests, cache_hit)
+
+    def test_duplicate_index_does_not_trust_snapshot_while_database_is_busy(self):
+        link = FakeLink()
+        busy_summary = library.DeviceSummary("ipod6g", "build", 0, 0, 1, 51, False)
+        with patch.object(library, "summary", return_value=busy_summary):
+            self.assertIsNone(library.match_cached_tracks(link, 51, [TRACK]))
+
     def test_duplicate_check_can_be_disabled(self):
         link, events = FakeLink(), []
         with TemporaryDirectory() as work, patch.object(podlink, "media_command", probe):
             path = Path(work) / "device-copy.flac"
             path.write_bytes(b"music")
-            library.import_files(link, [path], events.append, skip_duplicates=False)
+            library.import_files(link, [path], events.append, skip_duplicates=False,
+                                 cached_snapshot=(51, [TRACK]))
         self.assertEqual(link.stored, [b"music"])
         self.assertEqual(link.refreshes, 1)
         self.assertNotIn(b"MS3 DB", link.requests)
+        self.assertNotIn(b"MS3 SUMMARY", link.requests)
 
     def test_failed_upload_stops_transfer_and_reports_error(self):
         link, events = FakeLink(), []
