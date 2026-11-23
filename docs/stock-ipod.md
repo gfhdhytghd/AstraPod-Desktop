@@ -6,8 +6,9 @@ uses `libgpod.so.4`, `ffmpeg`, and `ffprobe`. On Arch, the `libgpod` package
 also brings in `sg3_utils` for the read-only SCSI fallback.
 
 This checklist exercises the transport before the desktop dispatch is
-connected. Repeat on stock Video 5G and 5.5G and stock Classic 6G, 6.5G, and
-7G. Use a FAT iPod with a stock iTunes library and an existing playlist.
+connected. The transport supports iPod Classic 6G, 6.5G, and 7G. Other stock
+iPods raise `UnsupportedStockModel`. Repeat the checks on each supported
+generation. Use a FAT iPod with a stock iTunes library and an existing playlist.
 Disconnect any PodBox test iPod before starting.
 
 1. Connect the stock iPod. Mount its FAT volume in the desktop file manager.

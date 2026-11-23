@@ -28,7 +28,7 @@ def audio(tmp_path):
 
 
 @pytest.mark.parametrize("model,checksum,compressed", [
-    ("MA002", 0, False), ("MC297", 1, False), ("MC293", 2, True),
+    ("MB029", 1, False), ("MC297", 1, False), ("MC293", 2, True),
 ])
 def test_import_adds_track_and_keeps_previous_database(tmp_path, audio, model, checksum, compressed):
     root = tmp_path / "volume"
@@ -75,7 +75,7 @@ class Source:
 
 def test_jellyfin_reconciliation_keeps_other_accounts_and_originals(tmp_path, audio):
     root = tmp_path / "volume"
-    create_fixture(root, "MA446")
+    create_fixture(root, "MB565")
     scope = hrmediasync.Scope("all", "fixture")
     alice = Source("a", audio, title="Different title")
     bob = Source("b", audio, title="Different title")

@@ -34,13 +34,13 @@ def libgpod():
         pytest.skip(str(exc))
 
 
-def create_fixture(root, model="MA002", checksum=0, compressed=False):
+def create_fixture(root, model="MB029", checksum=1, compressed=False):
     directory = root / DEVICE
     directory.mkdir(parents=True)
     (directory / "SysInfo").write_text(f"ModelNumStr: {model}\nFirewireGuid: {GUID}\n")
     if checksum == 2 or compressed:
         (directory / "SysInfoExtended").write_bytes(plistlib.dumps({
-            "DBVersion": {0: 0, 1: 3, 2: 4}[checksum],
+            "DBVersion": {1: 3, 2: 4}[checksum],
             "SQLiteDB": compressed,
             "FireWireGUID": GUID,
         }))
@@ -77,7 +77,7 @@ def add_playlist(library, database, name, track_ids):
         library.itdb_playlist_add_track(playlist, tracks[track_id], -1)
 
 
-@pytest.mark.parametrize("model,checksum", [("MA002", 0), ("MA446", 0), ("MB029", 1),
+@pytest.mark.parametrize("model,checksum", [("MB029", 1),
                                              ("MB565", 1), ("MC297", 1), ("MC293", 2)])
 def test_round_trip_with_track_and_playlist_removal(tmp_path, libgpod, model, checksum):
     create_fixture(tmp_path, model, checksum)

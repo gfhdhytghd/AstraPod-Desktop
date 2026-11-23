@@ -1,6 +1,7 @@
-"""Stock iPod operations on a caller-selected, mounted Linux volume.
+"""Stock iPod Classic operations on a caller-selected, mounted Linux volume.
 
-detect(root) returns StockDevice or None. For passive discovery use
+detect(root) identifies an iPod Classic and raises UnsupportedStockModel for
+unsupported stock iPods. For passive discovery use
 detect(root, authorize=False). read_library(root) returns DeviceTrack rows and
 playlists whose track_ids refer to row.index (the persistent Apple database
 ID). Paths are absolute within the volume and ratings are 0–10. The managed
@@ -37,7 +38,8 @@ import hrmediasync
 import hrstockdb
 import hrstockmedia
 import hrstocktxn
-from hrstockdevice import MODEL_NUMBERS, assert_stock_layout, checked_path, detect
+from hrstockdevice import (MODEL_NUMBERS, UnsupportedStockModel, assert_stock_layout,
+                           checked_path, detect)
 
 _OWNERS = ".astrapod-jellyfin.json"
 _METADATA = ("iTunes", "Device", "Artwork")
@@ -109,7 +111,7 @@ def _volume(volume_root, *, write=False, authorize=True):
         unknown_compressed_model_info = (
             device.database.name.casefold() == "itunescdb" and device.sysinfo_extended is None)
         if write and authorize and (not device.model_number or unknown_compressed_model_info
-                                   or not device.firewire_guid and device.checksum != 0):
+                                   or not device.firewire_guid):
             device = _require_device(original, authorize=True)
         check()
         yield device, pinned, tunes, check
@@ -261,9 +263,8 @@ class _Session:
 
     def open_database(self):
         generation = self.device.generation
-        fallback = {"classic": "classic-6g", "video": "video-5g"}.get(generation, generation)
-        models = MODEL_NUMBERS.get(fallback, ())
-        model = self.device.model_number or next(iter(models), None)
+        fallback = "classic-6g" if generation == "classic" else generation
+        model = self.device.model_number or MODEL_NUMBERS[fallback][0]
         return hrstockdb.open_database(
             self.stage, model_number=model, firewire_guid=self.device.firewire_guid,
             checksum=self.device.checksum, sqlite=self.device.sqlite)
@@ -363,10 +364,6 @@ class _Session:
 def _session(root, *, write=False):
     with (_volume(root, write=write) as (device, pinned, tunes, check),
           TemporaryDirectory(prefix="astrapod-stock-") as directory):
-        if write and device.generation not in {
-                "video-5g", "video-5.5g", "classic-6g", "classic-6.5g", "classic-7g",
-                "video", "classic"}:
-            raise RuntimeError("This iPod model has no supported stock database writer")
         session = _Session(device, pinned, tunes, check, Path(directory))
         with session.open_database() as database:
             yield session, database

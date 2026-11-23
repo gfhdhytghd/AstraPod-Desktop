@@ -40,8 +40,6 @@ def no_host_probe(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(("number", "generation", "scheme"), [
-    ("MA147LL/A", "video-5g", 0),
-    ("A450", "video-5.5g", 0),
     ("MB029", "classic-6g", 1),
     ("MB565", "classic-6.5g", 1),
     ("MC297LL/A", "classic-7g", 1),
@@ -52,6 +50,13 @@ def test_reads_stock_model_from_sysinfo(tmp_path, number, generation, scheme):
     assert info.generation == generation
     assert info.firewire_guid == GUID
     assert info.checksum == scheme
+
+
+@pytest.mark.parametrize("model", ["MA147LL/A", "A450", "MB999", None])
+def test_rejects_unsupported_stock_model(tmp_path, model):
+    stock_volume(tmp_path, model=model)
+    with pytest.raises(stock.UnsupportedStockModel, match="Only iPod Classic"):
+        stock.detect(tmp_path)
 
 
 def test_cdb_and_sqlite_capabilities(tmp_path):
@@ -81,14 +86,14 @@ def test_early_ipod_irregular_xml_is_normalized(tmp_path):
     data = b"""<?xml version="1.0" encoding="UTF-8"?>
     <plist version="1.0"><dict>
     <key>ImageSpecifications</key><array><key>1019</key><dict/></array>
-    <key>SerialNumber</key><string>00000000TXM</string>
-    <key>UpdaterFamilyID</key><integer>13</integer>
+    <key>SerialNumber</key><string>00000000Y5N</string>
+    <key>UpdaterFamilyID</key><integer>24</integer>
     </dict></plist>"""
     _, _, device = stock_volume(tmp_path, extended=data)
     info = stock.detect(tmp_path)
-    assert info.generation == "video-5g"
-    assert info.model_number == "MA146"
-    assert plistlib.loads(info.sysinfo_extended)["UpdaterFamilyID"] == 13
+    assert info.generation == "classic-6g"
+    assert info.model_number == "MB029"
+    assert plistlib.loads(info.sysinfo_extended)["UpdaterFamilyID"] == 24
     assert (device / "SysInfoExtended").read_bytes() == data
 
 
@@ -134,6 +139,14 @@ def usb_descriptor(tmp_path, monkeypatch, *, serial=GUID, vendor="05ac", model="
     (stock.SYS_DEV_BLOCK / f"{stock.os.major(stat)}:{stock.os.minor(stat)}").symlink_to(partition)
     monkeypatch.setattr(stock, "_probe_scsi", lambda *_args: b"")
     return disk
+
+
+def test_rejects_non_classic_apple_usb_before_raw_probe(tmp_path, monkeypatch):
+    stock_volume(tmp_path)
+    usb_descriptor(tmp_path, monkeypatch, model="1209")
+    monkeypatch.setattr(stock, "_probe_scsi", lambda *_args: pytest.fail("Unexpected raw probe"))
+    with pytest.raises(stock.UnsupportedStockModel, match="Only iPod Classic"):
+        stock.detect(tmp_path)
 
 
 def test_sysfs_usb_serial_without_raw_access(tmp_path, monkeypatch):

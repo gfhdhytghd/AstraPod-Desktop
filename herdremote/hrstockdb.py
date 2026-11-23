@@ -44,8 +44,7 @@ _SQLITE_FILES = (
 )
 _SUPPORTED_TRACK_PATH = re.compile(r":iPod_Control:Music:F[0-9]{2}:[^:/\\\x00]+", re.I)
 _CLASSIC_NUMBERS = frozenset(("B029", "B147", "B145", "B150", "B562", "B565", "C293", "C297"))
-_VIDEO_NUMBERS = frozenset(("A002", "A146", "A003", "A147", "A452", "A444", "A446", "A664", "A448", "A450"))
-_DB_VERSIONS = {0: 0, 1: 3, 2: 4}
+_DB_VERSIONS = {1: 3, 2: 4}
 _SQL_COMMANDS = "com.apple.mobile.iTunes.SQLMusicLibraryPostProcessCommands"
 _NATIVE_IO_LOCK = Lock()
 
@@ -323,21 +322,17 @@ def _device_metadata(
                 if separator:
                     sysinfo[key.strip()] = value.strip()
     model_number = model_number or sysinfo.get("ModelNumStr", "")
-    model_key = re.match(r"^[A-Z]?([ABC][0-9]{3})", model_number.upper())
+    model_key = re.match(r"^[A-Z]?([BC][0-9]{3})", model_number.upper())
     model_code = model_key[1] if model_key else ""
-    known_model = model_code in _CLASSIC_NUMBERS | _VIDEO_NUMBERS
-    fallback_scheme = int(model_code in _CLASSIC_NUMBERS)
+    if model_code not in _CLASSIC_NUMBERS:
+        raise StockDatabaseError("Expected an iPod Classic model (6G, 6.5G or 7G).")
     device_version = extended.get("DBVersion", 0)
-    if type(device_version) is not int or device_version not in (0, 1, 2, 3, 4):
+    if type(device_version) is not int or device_version not in (0, 3, 4):
         raise StockDatabaseError(f"Unsupported SysInfoExtended DBVersion {device_version!r}.")
-    scheme = source_scheme or checksum or {3: 1, 4: 2}.get(device_version, fallback_scheme)
+    scheme = source_scheme or checksum or (2 if device_version == 4 else 1)
     if scheme not in _DB_VERSIONS:
         raise StockDatabaseError(f"Unsupported iTunes database checksum scheme {scheme}.")
     compressed = source_compressed or bool(sqlite) or extended.get("SQLiteDB") is True
-    if not known_model:
-        # Parsing can still expose tracks on an unidentified iPod. Saving requires
-        # a concrete model so libgpod cannot fall back to another device family.
-        return scheme, compressed, False
 
     raw_guid = firewire_guid or extended.get("FireWireGUID") or sysinfo.get("FirewireGuid")
     guid = str(raw_guid or "").lower().removeprefix("0x")
@@ -354,7 +349,7 @@ def _device_metadata(
             "".join(f"{key}: {value}\n" for key, value in sysinfo.items()), encoding="utf-8"
         )
 
-    if extended or scheme != fallback_scheme or compressed:
+    if extended or scheme != 1 or compressed:
         # libgpod handles format capabilities from this plist. Never let it run
         # SQL supplied by the mounted volume or override the verified model.
         extended.pop(_SQL_COMMANDS, None)
@@ -377,7 +372,7 @@ def _device_metadata(
         elif hash_info.name != _HASH_INFO.name:
             hash_info.rename(root / _HASH_INFO)
 
-    return scheme, compressed, (valid_guid or not (scheme or compressed))
+    return scheme, compressed, valid_guid
 
 
 class StockDatabase:
