@@ -97,7 +97,9 @@ class Rufin(BaseHTTPRequestHandler):
             return self.reply(401, {'error': 'A valid Bearer token is required'})
         if self.command == 'POST':
             s.posts.append((path, json.loads(body) if body else None))
-            if path == '/api/playback/play':
+            if path == '/api/lyrics' and hasattr(s, 'lyrics_load'):
+                s.lyrics_load()
+            elif path == '/api/playback/play':
                 s.state['state'] = 'playing'
             elif path == '/api/playback/pause':
                 s.state['state'] = 'paused'
@@ -426,6 +428,48 @@ class Mapping(unittest.TestCase):
         self.server.lyrics.update(state='ready', document={'lines': [dict(text='New track', start_millis=1500)]})
         self.assertEqual(self.library.page(q+'&nonce=5', 0, 50)['items'][0]['title'], '[00:01.50]New track')
         self.assertEqual(self.server.posts, [])
+
+    def test_timed_lyrics_starts_rufin_lookup_before_caching_empty(self):
+        self.lyrics_fixture([dict(text='星光', start_millis=1500)])
+        current = self.server.state['current']
+        current['track'].update(title='Forever Young', artist='朴树', album='猎户星座',
+                                duration_ms=319000)
+        ready = self.server.lyrics
+        empty = dict(state='empty', media_uri=ready['media_uri'], run=ready['run'])
+        self.server.lyrics_load = lambda: setattr(self.server, 'lyrics', dict(empty, state='loading'))
+        key = hrrufin.rufin_id(current['media_uri'])
+        query = f'now/lyrics?lrc=1&duet=1&track={key}'
+        cache = self.library.lyrics
+        cache.select(key, current['run'])
+
+        # Cleared and stale empty replies cannot settle the new track.
+        for reply in (dict(state='empty'), dict(empty, run=16)):
+            self.server.lyrics = reply
+            self.assertFalse(cache.prefetch(key, self.library.timed_lyrics))
+        self.assertEqual(self.server.posts, [])
+
+        self.server.lyrics = empty
+        self.assertFalse(cache.prefetch(key, self.library.timed_lyrics))
+        self.assertEqual(self.library.page(query+'&nonce=1', 0, 50)['items'][0]['id'], 'lyric-wait')
+        self.assertEqual(self.server.posts, [('/api/lyrics', {})])
+
+        self.server.lyrics = ready
+        self.assertTrue(cache.prefetch(key, self.library.timed_lyrics))
+        rows = self.library.page(query+'&nonce=2', 0, 50)['items']
+        self.assertEqual([(row['id'], row['title']) for row in rows], [('lrc1', '[00:01.50]星光')])
+        self.assertEqual(self.server.posts, [('/api/lyrics', {})])
+
+    def test_timed_lyrics_keeps_completed_miss(self):
+        query = self.lyrics_fixture([])
+        self.server.lyrics['state'] = 'empty'
+        key = hrrufin.rufin_id(self.server.lyrics['media_uri'])
+        self.library.lyrics.select(key, self.server.lyrics['run'])
+
+        # An already completed lookup leaves the snapshot empty after POST.
+        for nonce in (1, 2):
+            rows = self.library.page(f'{query}&nonce={nonce}', 0, 50)['items']
+            self.assertEqual([row['title'] for row in rows], ['No lyrics'])
+        self.assertEqual(self.server.posts, [('/api/lyrics', {})])
 
     def test_snapshot(self):
         s = self.client.snapshot()

@@ -898,19 +898,29 @@ class RufinLibrary:
         uri, run, duration = playing()
         if not isinstance(uri, str) or rufin_id(uri) != track:
             return None
-        reply = self.client.get('/api/lyrics')
-        if playing()[:2] != (uri, run):
-            return None
+
+        def current_lyrics():
+            reply = self.client.get('/api/lyrics')
+            if playing()[:2] != (uri, run):
+                return None
+            if isinstance(reply, dict) and (reply.get('media_uri') != uri or
+                                           (run is not None and reply.get('run') != run)):
+                return None
+            return reply
+
+        reply = current_lyrics()
+        if isinstance(reply, dict) and reply.get('state') == 'empty':
+            # GET is a snapshot. Rufin uses "empty" both before a lookup
+            # and after a miss. POST starts the lookup once for the current
+            # media; Rufin leaves an already attempted lookup alone.
+            self.client.post('/api/lyrics')
+            reply = current_lyrics()
         if isinstance(reply, str):
             return source_rows(reply, 0, duration, menu_row)
-        if not isinstance(reply, dict):
-            return lyrics_rows([], 0, duration, menu_row)
-        if reply.get('state') == 'loading':
+        if not isinstance(reply, dict) or reply.get('state') == 'loading':
             return None
         if reply.get('state') != 'ready':
             return lyrics_rows([], 0, duration, menu_row)
-        if reply.get('media_uri') != uri or (run is not None and reply.get('run') != run):
-            return None
         document = reply.get('document') or {}
         offset = document.get('offset_millis') if isinstance(document, dict) else 0
         offset = offset if type(offset) is int else 0
