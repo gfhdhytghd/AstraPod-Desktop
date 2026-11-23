@@ -1,4 +1,6 @@
 """Read-only Jellyfin library for the Rufin remote. Rufin owns playback."""
+from collections import OrderedDict
+from contextlib import contextmanager
 import hashlib
 import http.client
 import json
@@ -7,6 +9,8 @@ import os
 import re
 import stat
 import socket
+import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -15,7 +19,7 @@ from dataclasses import dataclass, field
 
 from hrcider_cache import art_id
 from hrcider_library import ROOT, route, row
-from hrrufin import RufinLibrary, config_home
+from hrrufin import RufinLibrary, config_home, library_generation
 
 log = logging.getLogger('herdremote.jellyfin')
 
@@ -23,6 +27,11 @@ MAX_REPLY = 2 * 1024 * 1024
 ITEM_FIELDS = 'Genres,ItemCounts,ChildCount'
 GUID = re.compile(r'(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})')
 TOKEN = re.compile(r'[A-Za-z0-9._~-]{1,512}')
+PROBE_INTERVAL = 15
+PROBE_FAILURES = 3
+CATALOG_BATCH = 200
+CATALOG_QUERIES = 8
+FILTERED_CATALOG_TTL = 60
 
 
 class JellyfinError(OSError):
@@ -120,8 +129,55 @@ class Session:
 class JellyfinClient:
     def __init__(self, env=None, opener=None, timeout=1.5):
         self.env = os.environ if env is None else env
-        self.opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        self.opener = opener
         self.timeout = timeout
+        self.pool_lock = threading.Lock()
+        self.idle = {}
+
+    def close(self):
+        with self.pool_lock:
+            for connection in self.idle.values():
+                connection.close()
+            self.idle.clear()
+
+    @contextmanager
+    def open_reply(self, req):
+        if self.opener is not None:
+            with self.opener.open(req, timeout=self.timeout) as response:
+                yield response
+            return
+        target = urllib.parse.urlsplit(req.full_url)
+        https_base(urllib.parse.urlunsplit(target._replace(query='')))
+        path = urllib.parse.urlunsplit(('', '', target.path, target.query, ''))
+        origin = (target.hostname, target.port or 443)
+        with self.pool_lock:
+            connection = self.idle.pop(origin, None)
+        reused = connection is not None
+        if not reused:
+            connection = http.client.HTTPSConnection(*origin, timeout=self.timeout)
+        try:
+            try:
+                connection.request(req.get_method(), path, req.data, dict(req.header_items()))
+                response = connection.getresponse()
+            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError):
+                if not reused or req.get_method() != 'GET':
+                    raise
+                connection.close()
+                connection.request(req.get_method(), path, req.data, dict(req.header_items()))
+                response = connection.getresponse()
+            with response:
+                if not 200 <= response.status < 300:
+                    # Never follow a redirect or return a server-supplied reason.
+                    raise JellyfinError(f'HTTP {response.status}', response.status)
+                yield response
+                if response.isclosed() and connection.sock is not None:
+                    with self.pool_lock:
+                        if origin not in self.idle and len(self.idle) < 4:
+                            self.idle[origin] = connection
+                            connection = None
+        finally:
+            if connection is not None:
+                connection.close()
 
     def request(self, session, path, image=False, **params):
         query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
@@ -150,7 +206,7 @@ class JellyfinClient:
         deadline = time.monotonic() + 2 * self.timeout
         body = bytearray()
         try:
-            with self.opener.open(req, timeout=self.timeout) as response:
+            with self.open_reply(req) as response:
                 while time.monotonic() < deadline:
                     chunk = response.read1(min(65536, MAX_REPLY + 1 - len(body)))
                     if not chunk:
@@ -209,8 +265,6 @@ class JellyfinClient:
                     raise
                 user = None
         session = Session(base, source, folder or None, token, user)
-        self.page(session, 'Items', 0, 1, IncludeItemTypes='MusicAlbum',
-                  Recursive='true', ParentId=session.folder, EnableImages='false')
         return previous if session == previous else session
 
     def page(self, session, endpoint, offset, limit, **params):
@@ -228,63 +282,158 @@ class JellyfinClient:
 class JellyfinLibrary(RufinLibrary):
     """Use Jellyfin for supported lists, keeping Rufin's other native routes."""
 
-    def __init__(self, client, jellyfin):
+    def __init__(self, client, jellyfin, cache=None):
         super().__init__(client)
         self.jellyfin = jellyfin
+        self.cache = cache
         self.session = None
         self.art_origin = None
         self.online = None
         self.retry_at = 0.
         self.composers = None
+        self.probe_lock = threading.Lock()
+        self.probe_failures = 0
+        self.album_cache = OrderedDict()
+        self.fallback_albums = None
+        self.art_aliases = {}
+
+    @staticmethod
+    def album_params(session):
+        return dict(ParentId=session.folder, SortBy='SortName', SortOrder='Ascending',
+                    Recursive='true', Fields=ITEM_FIELDS, EnableImageTypes='Primary',
+                    ImageTypeLimit=1, EnableUserData='true', IncludeItemTypes='MusicAlbum')
+
+    def catalog(self, session, params):
+        items, ids = [], set()
+        expected = None
+        while True:
+            values, total = self.jellyfin.page(session, 'Items', len(items), CATALOG_BATCH, **params)
+            if expected is not None and total != expected:
+                raise JellyfinError('library changed during catalogue scan')
+            expected = total
+            for value in values:
+                ident = id_or_none(value.get('Id'))
+                if not ident or value.get('Type') != 'MusicAlbum' or not isinstance(value.get('Name'), str):
+                    raise JellyfinError('malformed library item')
+                if ident in ids:
+                    raise JellyfinError('library changed during catalogue scan')
+                ids.add(ident)
+            items.extend(values)
+            if len(items) == total:
+                return tuple(items)
 
     def refresh(self):
-        with self.lock:
-            now = time.monotonic()
-            if now < self.retry_at:
-                return self.session
+        # Cold readers join the first probe. Warm readers keep slicing the last
+        # complete snapshot while the inventory worker checks for changes.
+        with self.probe_lock:
+            if time.monotonic() < self.retry_at:
+                return
             previous = self.session
-            self.retry_at = now + 15
-        try:
-            session = self.jellyfin.connect(self.client, previous)
-        except JellyfinError as error:
-            self.failed(previous, error)
-        else:
-            with self.lock:
-                # An overlapping page failure may have invalidated this probe.
-                if self.session is previous and self.retry_at == now + 15:
-                    if session is not previous:
-                        self.generation += 1
+            try:
+                session = self.jellyfin.connect(self.client, previous)
+                params = self.album_params(session)
+                albums = self.catalog(session, params)
+                # Exclude per-user playback history, which changes on every play.
+                signature = [{k: v for k, v in value.items() if k != 'UserData'} for value in albums]
+                revision = library_generation('jellyfin-v1', session.art_scope, session.folder,
+                                              session.user, signature)
+            except JellyfinError as error:
+                self.probe_failures += 1
+                if previous is not None and self.probe_failures < PROBE_FAILURES:
+                    self.retry_at = time.monotonic() + PROBE_INTERVAL
+                    return
+                self.refresh_fallback(error)
+            else:
+                changed = revision != self.generation or session is not previous
+                if changed:
+                    aliases = {}
+                    for value in albums:
+                        tags = value.get('ImageTags')
+                        tag = tags.get('Primary') if isinstance(tags, dict) else None
+                        if isinstance(tag, str) and tag:
+                            ident = value['Id']
+                            aliases[rufin_uri(session.source, 'album', ident)] = self.art_template(
+                                session, 'album', ident, tag)
+                    if self.cache is not None:
+                        try:
+                            self.cache.remember_rufin_album_art(session.source, session.art_scope, aliases)
+                        except sqlite3.Error:
+                            log.warning('Could not persist Rufin artwork aliases')
+                with self.lock:
+                    if changed:
+                        self.album_cache.clear()
                         self.composers = None
+                        self.art_aliases = aliases
+                        for template in aliases.values():
+                            self.register_art(template)
                     self.session = session
+                    self.generation = revision
                     self.art_origin = (session.art_scope, session.source)
+                    key = tuple(sorted(params.items()))
+                    self.album_cache[key] = (float('inf'), albums)
+                    self.album_cache.move_to_end(key)
+                    self.fallback_albums = None
                     if self.online is not True:
                         log.info('Rufin library source=Jellyfin')
                     self.online = True
-        return self.session
+                self.probe_failures = 0
+            self.retry_at = time.monotonic() + PROBE_INTERVAL
 
-    def failed(self, session, error):
-        with self.lock:
-            if self.session is not session:
+    def refresh_fallback(self, error):
+        try:
+            scope = self.scope(fresh=True)
+            source = scope.get('source')
+            if self.cache is not None and source and (not self.art_origin or source != self.art_origin[1]):
+                try:
+                    saved = self.cache.rufin_album_art(source)
+                except (sqlite3.Error, ValueError):
+                    saved = None
+                if saved is not None:
+                    art_scope, aliases = saved
+                    with self.lock:
+                        self.art_origin = (art_scope, source)
+                        self.art_aliases = aliases
+            scope, rows = self.native_album_catalogue(scope)
+            revision = library_generation('rufin-v1', scope, rows)
+        except (OSError, ValueError, TypeError):
+            # Only publish a fallback revision after its catalogue is complete.
+            if self.online is not None:
                 return
-            if session is not None:
-                self.generation += 1
+            rows, revision = None, self.generation
+        with self.lock:
             self.session = None
+            self.album_cache.clear()
             self.composers = None
-            self.retry_at = time.monotonic() + 10
+            if rows is not None or self.online is not False:
+                self.fallback_albums = rows
+            self.generation = revision
             if self.online is not False:
                 log.info('Rufin library source=Rufin reason=%s', error)
             self.online = False
 
-    def jellyfin_art(self, session, kind, item, tag):
-        tag_key = hashlib.sha256(tag.encode()).hexdigest()[:24]
-        template = f'jellyfin:{session.art_scope}:{kind}:{item}:{tag_key}'
-        key = art_id(template)
+    def album_inventory(self):
         with self.lock:
-            self.templates[key] = template
-            self.templates.move_to_end(key)
-            while len(self.templates) > 20000:
-                self.templates.popitem(last=False)
-        return key
+            if self.session is not None:
+                key = tuple(sorted(self.album_params(self.session).items()))
+                return self.generation, len(self.album_cache[key][1]), {art_id(template) for template in self.art_aliases.values()}
+            if self.fallback_albums is not None:
+                rows = self.fallback_albums
+                return self.generation, len(rows), self.album_art_keys(rows)
+            return None
+
+    def art(self, uri):
+        # Rufin uses the same URI as Jellyfin for a known album or track.
+        with self.lock:
+            template = self.art_aliases.get(uri)
+        return self.register_art(template) if template else super().art(uri)
+
+    @staticmethod
+    def art_template(session, kind, item, tag):
+        tag_key = hashlib.sha256(tag.encode()).hexdigest()[:24]
+        return f'jellyfin:{session.art_scope}:{kind}:{item}:{tag_key}'
+
+    def jellyfin_art(self, session, kind, item, tag):
+        return self.register_art(self.art_template(session, kind, item, tag))
 
     def artwork(self, template, size):
         """Bytes and whether they are the primary image named by the cache key."""
@@ -304,19 +453,18 @@ class JellyfinLibrary(RufinLibrary):
                         raise ValueError('No album for artist artwork')
                     return self.jellyfin.request(
                         session, f'Items/{album}/Images/Primary', image=True,
-                        MaxWidth=size, MaxHeight=size, Format='Jpg'), False
+                        MaxWidth=size, MaxHeight=size, Format='Jpg'), True
                 raw = self.jellyfin.request(session, f'Items/{item}/Images/Primary',
                                            image=True, MaxWidth=size, MaxHeight=size, Format='Jpg')
                 return raw, True
-            except JellyfinError as error:
-                if error.status != 404:
-                    self.failed(session, error)
+            except JellyfinError:
+                pass
         origin = self.art_origin
         if origin is None or origin[0] != scope:
             raise ValueError('Unknown Jellyfin artwork')
-        return self.client.artwork(rufin_uri(origin[1], kind, item)), False
+        return self.client.artwork(rufin_uri(origin[1], kind, item), size=size), False
 
-    def item_row(self, session, value, album_tracks=False, display=None):
+    def item_row(self, session, value, album_tracks=False, display=None, generation=None):
         ident = id_or_none(value.get('Id'))
         title = value.get('Name')
         if not ident or not isinstance(title, str):
@@ -369,16 +517,16 @@ class JellyfinLibrary(RufinLibrary):
             return dict(row(title, 'play/library-songs/' + key, 'song', id=key),
                         art=artwork, subtitle=subtitle, duration=ms, year=year)
         if kind == 'MusicArtist':
-            return self.artist_row(session, value, 'artistid')
+            return self.artist_row(session, value, 'artistid', generation)
         raise JellyfinError('unexpected library item type')
 
-    def artist_row(self, session, value, arg):
+    def artist_row(self, session, value, arg, generation):
         ident, title = value['Id'], value['Name']
         tags = value.get('ImageTags')
         tag = tags.get('Primary') if isinstance(tags, dict) else None
         role = 'albumartist' if arg == 'albumartistid' else 'artist'
         art = self.jellyfin_art(session, 'artist', ident, tag) if tag else self.jellyfin_art(
-            session, 'album-for-' + role, ident, session.art_scope)
+            session, 'album-for-' + role, ident, str(generation))
         return dict(row(title, route('albums', **{arg: ident}), 'artist', id=ident), art=art)
 
     def album_id(self, session, name):
@@ -401,22 +549,25 @@ class JellyfinLibrary(RufinLibrary):
         name, args = parsed.path, dict(urllib.parse.parse_qsl(parsed.query))
         if name.startswith('root/'):
             name = ROOT.get(urllib.parse.unquote(name[5:]), 'empty')
-        if name not in ('albums', 'artists', 'albumartists', 'genres', 'years', 'composers',
-                        'ratings', 'songs', 'recent', 'search') and not name.startswith('album/t'):
-            return super().page(query, offset, limit, stale)
-        session = self.refresh()
-        if session:
-            try:
-                value = self.read_page(session, name, args, offset, limit, stale)
-                if value is not None and self.session is session:
-                    return value
-            except JellyfinError as error:
-                self.failed(session, error)
-        return super().page(query, offset, limit, stale)
+        supported = (name in ('albums', 'artists', 'albumartists', 'genres', 'years', 'composers',
+                              'ratings', 'songs', 'recent', 'search') or name.startswith('album/t'))
+        if supported and self.online is None:
+            self.refresh()
+        with self.lock:
+            session, generation = self.session, self.generation
+            fallback = self.fallback_albums
+        if session and supported:
+            value = self.read_page(session, generation, name, args, offset, limit, stale)
+            if value is not None:
+                return value
+        elif fallback is not None and name == 'albums' and set(args) <= {'format'}:
+            return dict(generation=generation, offset=offset, total=len(fallback),
+                        stale=bool(stale), items=fallback[offset:offset + limit])
+        return dict(super().page(query, offset, limit, stale), generation=generation)
 
-    def read_page(self, session, name, args, offset, limit, stale):
+    def read_page(self, session, generation, name, args, offset, limit, stale):
         def result(items, total):
-            return dict(generation=self.generation, offset=offset, total=total, stale=bool(stale), items=items)
+            return dict(generation=generation, offset=offset, total=total, stale=bool(stale), items=items)
 
         if name == 'ratings':
             if not session.user:
@@ -428,7 +579,6 @@ class JellyfinLibrary(RufinLibrary):
             return result(items[offset:offset + limit], len(items))
         if name == 'composers':
             cached = self.composers
-            generation = self.generation
             if cached is None or cached[0] != generation or time.monotonic() > cached[1]:
                 # 10.10's Persons endpoint has no StartIndex. Keep a bounded vocabulary.
                 data = self.jellyfin.request(session, 'Persons', PersonTypes='Composer',
@@ -442,19 +592,20 @@ class JellyfinLibrary(RufinLibrary):
                 items.sort(key=lambda r: (r['title'].casefold(), r['route']))
                 cached = (generation, time.monotonic() + 60, items)
                 with self.lock:
-                    if self.session is session:
+                    if self.session is session and self.generation == generation:
                         self.composers = cached
             items = cached[2]
             return result(items[offset:offset + limit], len(items))
 
-        params = dict(ParentId=session.folder, SortBy='SortName', SortOrder='Ascending')
+        params = self.album_params(session)
         album_id = self.album_id(session, name)
         if name.startswith('album/') and not album_id:
             return None
         if name in ('artists', 'albumartists', 'genres', 'years'):
             endpoint = {'artists': 'Artists', 'albumartists': 'Artists/AlbumArtists',
                         'genres': 'MusicGenres', 'years': 'Years'}[name]
-            params.update(IncludeItemTypes='MusicAlbum' if name == 'years' else 'Audio,MusicAlbum',
+            params = dict(ParentId=session.folder, SortBy='SortName', SortOrder='Ascending',
+                          IncludeItemTypes='MusicAlbum' if name == 'years' else 'Audio,MusicAlbum',
                           EnableImages='true' if name in ('artists', 'albumartists') else 'false')
             term = args.get('artist~' if name == 'artists' else 'albumartist~')
             if term:
@@ -472,18 +623,17 @@ class JellyfinLibrary(RufinLibrary):
                         raise JellyfinError('malformed library item')
                     arg = {'artists': 'artistid', 'albumartists': 'albumartistid', 'genres': 'genreid'}[name]
                     items.append(row(title, route('albums', **{arg: ident})) if name == 'genres'
-                                 else self.artist_row(session, v, arg))
+                                 else self.artist_row(session, v, arg, generation))
             return result(items, total)
 
-        params.update(Recursive='true', Fields=ITEM_FIELDS,
-                      EnableImageTypes='Primary', ImageTypeLimit=1, EnableUserData='true')
         if name == 'search':
+            params['SortBy'] = 'SortName'
             term = args.get('q')
             if not term:
                 return result([], 0)
             params.update(IncludeItemTypes='Audio,MusicAlbum,MusicArtist', SearchTerm=term)
         elif name == 'songs' or album_id:
-            params['IncludeItemTypes'] = 'Audio'
+            params.update(IncludeItemTypes='Audio', SortBy='SortName')
             if album_id:
                 params.update(ParentId=album_id, SortBy='ParentIndexNumber,IndexNumber,SortName')
             if args.get('title~'):
@@ -518,5 +668,28 @@ class JellyfinLibrary(RufinLibrary):
         if set(args) - {'album~', 'title~', 'format', 'q', 'artistid', 'albumartistid',
                         'genreid', 'composerid', 'year', 'favorite', 'rating'}:
             return None
-        values, total = self.jellyfin.page(session, 'Items', offset, limit, **params)
-        return result([self.item_row(session, v, bool(album_id), args.get('format')) for v in values], total)
+        if params['IncludeItemTypes'] == 'MusicAlbum':
+            key = tuple(sorted(params.items()))
+            with self.lock:
+                cached = None
+                if self.session is session and self.generation == generation:
+                    cached = self.album_cache.get(key)
+                    if cached and cached[0] > time.monotonic():
+                        self.album_cache.move_to_end(key)
+            if cached and cached[0] > time.monotonic():
+                values = cached[1]
+            else:
+                values = self.catalog(session, params)
+                with self.lock:
+                    if self.session is session and self.generation == generation:
+                        self.album_cache[key] = (time.monotonic() + FILTERED_CATALOG_TTL, values)
+                        self.album_cache.move_to_end(key)
+                        base = tuple(sorted(self.album_params(session).items()))
+                        self.album_cache.move_to_end(base)
+                        if len(self.album_cache) > CATALOG_QUERIES:
+                            self.album_cache.popitem(last=False)
+            total = len(values)
+            values = values[offset:offset + limit]
+        else:
+            values, total = self.jellyfin.page(session, 'Items', offset, limit, **params)
+        return result([self.item_row(session, v, bool(album_id), args.get('format'), generation) for v in values], total)

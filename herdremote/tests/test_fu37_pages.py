@@ -20,8 +20,8 @@ def client_error(message):
 @pytest.mark.parametrize('query,kind',[('album/private-id','album'),('playlist/private-id','playlist'),('root/Recently%20Added','recent'),('history/tracks','history'),('search?q=SECRET','search')])
 def test_actual_http_error_reaches_warning_for_each_page(cache,caplog,query,kind):
  client,stream=client_error('Network connection unavailable')
- bridge=hrcider.Bridge(client=client,cache=cache,volume=Mock());bridge.opened=True;bridge.generation=7;bridge.available=True;bridge.index.initial=False;bridge.page_token=1
- bridge.pages.put((7,11,0,50,query,1));worker=threading.Thread(target=bridge._pages);worker.start();bridge.threads.append(worker)
+ bridge=hrcider.Bridge(client=client,cache=cache,volume=Mock());bridge.opened=True;bridge.generation=7;bridge.available=True;bridge.index.initial=False
+ bridge.command(f'cq\t7\t11\t0\t50\t{query}'.encode());worker=threading.Thread(target=bridge._pages);worker.start();bridge.threads.append(worker)
  try:
   deadline=time.monotonic()+2
   while not bridge.scheduler.heap and time.monotonic()<deadline:time.sleep(.005)

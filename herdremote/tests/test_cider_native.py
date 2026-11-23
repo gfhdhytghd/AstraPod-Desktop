@@ -127,12 +127,13 @@ class NativeWorkers(unittest.TestCase):
             self.assertEqual([r['title'] for r in lib.page('tracks',0,50)['items']],['Filename','Title','Title (with track duration)'])
             self.assertFalse(any(r['title'] in ('Filename','Score','Comment') for r in lib.page('searchby',0,50)['items']))
             c.close()
-    def test_latest_page_request_discards_superseded_work(self):
+    def test_latest_two_waiting_pages_survive_queue_overflow(self):
         import hrcider
         with tempfile.TemporaryDirectory() as d:
             c=Cache(d);b=hrcider.Bridge(client=Mock(),cache=c,volume=Mock());b.command(b'ci\t1\t131072')
             for i in range(50):self.assertTrue(b.command(f'cq\t{b.generation}\t{i+1}\t{i}\t50\tsongs'.encode()))
-            self.assertEqual(b.pages.qsize(),1);self.assertEqual(b.pages.get_nowait()[1],50);c.close()
+            self.assertEqual(b.pages.qsize(),2)
+            self.assertEqual([b.pages.get_nowait()[1] for _ in range(2)],[49,50]);b.close()
     def test_feature_parser_native_marker_boundaries(self):
         from hrcider_cache import featured_guests
         for text,want in [('Defeat',[]),('Feather',[]),('Song with a Broken Heart',[]),('Song (feat. X) (Live)',[]),('Song featuring X & Y',[]),('Song w/o X',[]),('Song (duet with X)',[])]:

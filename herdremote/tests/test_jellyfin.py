@@ -1,9 +1,11 @@
 """Offline Jellyfin 10.10 REST and Rufin playback integration."""
 import contextlib
+import http.client
 import io
 import json
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,7 +18,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from hrcider import AAT, Bridge, SIZES, native_page_frame
 from hrcider_cache import Cache
-from hrjellyfin import JellyfinClient, MAX_REPLY, NoRedirect, token_from
+from hrjellyfin import JellyfinClient, JellyfinError, JellyfinLibrary, MAX_REPLY, NoRedirect, Session, token_from
 from hrrufin import RufinClient, rufin_id
 
 KEY = 'fixture-jellyfin-secret'
@@ -53,8 +55,9 @@ class Loopback:
 
 
 @contextlib.contextmanager
-def server(respond):
+def server(respond, protocol="HTTP/1.0"):
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = protocol
         def request(self):
             target = urllib.parse.urlsplit(self.path)
             length = int(self.headers.get('Content-Length', '0'))
@@ -62,6 +65,7 @@ def server(respond):
             call = (self.command, target.path, dict(urllib.parse.parse_qsl(target.query)),
                     self.headers.get('Authorization'), body)
             self.server.calls.append(call)
+            self.server.peers.append(self.client_address)
             status, reply, headers = respond(call)
             raw = reply if isinstance(reply, bytes) else json.dumps(reply).encode()
             self.send_response(status)
@@ -81,6 +85,7 @@ def server(respond):
 
     with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as httpd:
         httpd.calls = []
+        httpd.peers = []
         thread = threading.Thread(target=httpd.serve_forever, kwargs={'poll_interval': .02})
         thread.start()
         try:
@@ -101,7 +106,7 @@ def setup(tmp_path):
     track = {'Type': 'Audio', 'Id': TRACK, 'Name': 'Track', 'RunTimeTicks': 1210000000,
              'Artists': ['Artist'], 'ParentIndexNumber': 2, 'IndexNumber': 3,
              'AlbumId': ALBUM, 'AlbumPrimaryImageTag': 'cover-v1', 'UserData': {'Rating': 8.5}}
-    state = {'failure': 0, 'user': False, 'size': None, 'selected': SOURCE}
+    state = {'failure': 0, 'user': False, 'size': None, 'selected': SOURCE, 'albums': albums}
     env = {'XDG_CONFIG_HOME': str(tmp_path)}
     rufin_home = tmp_path / 'rufin'
     rufin_home.mkdir()
@@ -152,7 +157,7 @@ def setup(tmp_path):
                          'sources': [{'id': SOURCE, 'kind': 'jellyfin'},
                                      {'id': 'other', 'kind': 'local'}]}, {}
         if path == '/api/albums':
-            return 200, {'albums': [{'kind': 'album', 'id': 7, 'title': 'Rufin fallback'}], 'total': 1}, {}
+            return 200, {'albums': [{'kind': 'album', 'id': 7, 'title': 'Rufin fallback', 'uri': ALBUM_URI}], 'total': 1}, {}
         if path == '/api/page':
             return 200, {'tracks': [{'kind': 'track', 'uri': TRACK_URI, 'title': 'Rufin track'}],
                          'total': 1}, {}
@@ -190,9 +195,10 @@ def test_metadata_paging_and_rufin_queue(setup):
     first, = page['items']
     assert (first['title'], first['subtitle'], first['year'], first['duration'], first['count']) == (
         'First', 'Album Artist · Jazz', 2024, 241000, 2)
+    calls = len(jf.calls)
     later = library.page('albums', 1, 2)
     assert later['offset'] == 1 and [r['title'] for r in later['items']] == ['Second', 'Third']
-    assert jf.calls[-1][2]['StartIndex'] == '1' and jf.calls[-1][2]['Limit'] == '2'
+    assert len(jf.calls) == calls and jf.calls[-1][2]['StartIndex'] == '0'
     assert jf.calls[-1][2]['ParentId'] == FOLDER
     album_page = library.page(first['route'], 0, 50)
     song, = album_page['items']
@@ -244,23 +250,21 @@ def test_categories_favorites_and_ratings(setup):
 def test_art_geometry_cache_and_fallback(setup):
     bridge, jf, rf, state, _ = setup
     key = bridge.library.page('albums', 0, 1)['items'][0]['art']
-    for tier, dimension in SIZES.items():
-        prior = len(jf.calls)
+    prior = len(jf.calls)
+    for tier in ('XS', 'S', 'M', 'L'):
+        dimension = SIZES[tier]
         raw = bridge.artwork(key, tier)
-        if tier=='XS':
-            assert len(jf.calls) == prior  # Warm M can supply a preview.
-        else:
-            call = jf.calls[-1]
-            assert call[1] == f'/music/Items/{ALBUM}/Images/Primary'
-            assert call[2]['MaxWidth'] == call[2]['MaxHeight'] == str(dimension)
         assert raw[:12] == AAT.pack(0x5441, 8, dimension, dimension, int(tier == 'M'), 0)
         assert len(raw) == 12 + 2 * dimension ** 2
-        count = len(jf.calls)
         assert bridge.artwork(key, tier) == raw
-        assert len(jf.calls) == count
+    assert len(jf.calls) == prior + 1
+    call = jf.calls[-1]
+    assert call[1] == f'/music/Items/{ALBUM}/Images/Primary'
+    assert call[2]['MaxWidth'] == call[2]['MaxHeight'] == '240'
+    assert bridge.cache.get_art(key, 'original')
     state['failure'] = 404
     with bridge.cache.db:
-        bridge.cache.db.execute('DELETE FROM art WHERE key=? AND tier=?', (key, 'M'))
+        bridge.cache.db.execute("DELETE FROM art WHERE key=? AND tier IN ('M','original')", (key,))
     assert len(bridge.artwork(key, 'M')) == 12 + 2 * 128 ** 2
     assert rf.calls[-1][1] == '/api/artwork' and rf.calls[-1][2]['uri'] == ALBUM_URI
     assert bridge.cache.get_art(key, 'M') is None and bridge.library.online
@@ -276,14 +280,19 @@ def test_missing_key_then_recovery_and_401_fallback(setup, caplog, tmp_path):
         assert not jf.calls
         token.write_text(KEY)
         token.chmod(0o600)
-        library.retry_at = 0
+        probe(library)
         album = library.page('albums', 0, 1)
         assert album['items'][0]['title'] == 'First'
         assert library.page('ratings', 0, 3)['items'] == []  # app key has no user
         state['failure'] = 401
+        for _ in range(2):
+            probe(library)
+            assert library.page('albums', 0, 1) == album
+        probe(library)
         fallback = library.page('albums', 0, 1)
         assert fallback['items'][0]['title'] == 'Rufin fallback'
-        assert fallback['generation'] > album['generation']
+        assert fallback['items'][0]['art'] == album['items'][0]['art']
+        assert fallback['generation'] != album['generation']
         assert library.page(album['items'][0]['route'], 0, 1)['items'][0]['title'] == 'Rufin track'
     assert [record.message for record in caplog.records] == [
         'Rufin library source=Rufin reason=token missing',
@@ -322,11 +331,154 @@ def test_unreachable_server_recovers_without_switching_playback(setup):
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(library.jellyfin, 'opener',
                       Mock(open=Mock(side_effect=ConnectionRefusedError(KEY))))
-        assert library.page('albums', 0, 1)['items'][0]['title'] == 'Rufin fallback'
+        probe(library)
+        assert library.page('albums', 0, 1)['items'][0]['title'] == 'First'
         assert bridge.client is bridge.rufin
     assert library.jellyfin.opener is opener
-    library.retry_at = 0
+    original = library.generation
+    probe(library)
+    assert library.generation == original
+    assert library.probe_failures == 0
     assert library.page('albums', 0, 1)['items'][0]['title'] == 'First'
+
+
+def probe(library):
+    library.retry_at = 0
+    library.refresh()
+
+
+def test_whole_catalogue_shared_by_inventory_and_page_formats(setup, monkeypatch):
+    bridge, jf, _, _, _ = setup
+    monkeypatch.setattr('hrjellyfin.CATALOG_BATCH', 2)
+    library = bridge.library
+    later = library.page('albums?format=panel', 1, 2)
+    assert [row['title'] for row in later['items']] == ['Second', 'Third']
+    assert [call[2]['StartIndex'] for call in jf.calls if call[1].endswith('/Items')] == ['0', '2']
+    calls = len(jf.calls)
+    page = library.page('root/Album', 0, 2)
+    assert page['items'][0]['subtitle'] == 'Album Artist · Jazz'
+    assert library.page('albums', 9, 2)['items'] == []
+    generation, count, keys = library.album_inventory()
+    assert generation == page['generation'] and count == len(keys) == 3
+    assert len(jf.calls) == calls
+    library.page('albums?year=2024', 0, 1)
+    assert len(jf.calls) == calls + 2
+    library.page('albums?format=panel&year=2024', 2, 1)
+    assert len(jf.calls) == calls + 2
+
+
+def test_catalogue_content_generation_survives_restart_and_recovers(setup):
+    bridge, _, _, state, _ = setup
+    library = bridge.library
+    original = library.page('albums', 0, 1)
+    restarted = JellyfinLibrary(bridge.rufin, library.jellyfin)
+    assert restarted.page('albums', 0, 1) == original
+    state['albums'][0]['UserData'] = {'PlayCount': 37}
+    probe(restarted)
+    assert restarted.generation == original['generation']
+    state['albums'][0]['Name'] = 'Changed'
+    probe(restarted)
+    updated = restarted.page('albums', 0, 1)
+    assert updated['generation'] != original['generation']
+    assert updated['items'][0]['title'] == 'Changed'
+    assert JellyfinLibrary(bridge.rufin, library.jellyfin).page('albums', 0, 1) == updated
+    state['failure'] = 503
+    for _ in range(3):
+        probe(restarted)
+    assert restarted.generation != updated['generation']
+    state['failure'] = 0
+    probe(restarted)
+    assert restarted.page('albums', 0, 1) == updated
+
+
+def test_fallback_album_art_and_revision_survive_daemon_restart(setup):
+    bridge, _, _, state, _ = setup
+    library = bridge.library
+    original = library.page('albums', 0, 1)
+    key = original['items'][0]['art']
+    state['failure'] = 503
+    for _ in range(3):
+        probe(library)
+    fallback = library.page('albums', 0, 1)
+    assert fallback['items'][0]['art'] == key
+    reopened_cache = Cache(bridge.cache.root)
+    try:
+        reopened = JellyfinLibrary(bridge.rufin, library.jellyfin, reopened_cache)
+        assert reopened.page('albums', 0, 1) == fallback
+        assert reopened.template(key) == library.template(key)
+        assert reopened.artwork(reopened.template(key), 240)[1] is False
+    finally:
+        reopened_cache.close()
+
+
+def test_https_connection_reuse_and_no_redirect(monkeypatch):
+    def respond(call):
+        if call[1] == '/redirect':
+            return 302, {}, {'Location': '/sink'}
+        return 200, {'ok': True}, {}
+
+    with server(respond, 'HTTP/1.1') as (httpd, endpoint):
+        # Substitute only the TLS constructor so we can test actual HTTP/1.1
+        # socket reuse on a local server without relaxing production TLS.
+        monkeypatch.setattr('hrjellyfin.http.client.HTTPSConnection', http.client.HTTPConnection)
+        client = JellyfinClient()
+        session = Session(endpoint.replace('http://', 'https://'), SOURCE, None, KEY)
+        try:
+            assert client.request(session, 'one') == {'ok': True}
+            assert client.request(session, 'two') == {'ok': True}
+            assert httpd.peers[0] == httpd.peers[1]
+            with pytest.raises(JellyfinError, match='HTTP 302'):
+                client.request(session, 'redirect')
+            assert client.request(session, 'three') == {'ok': True}
+            assert httpd.peers[3] != httpd.peers[1]
+            assert [call[1] for call in httpd.calls] == ['/one', '/two', '/redirect', '/three']
+        finally:
+            client.close()
+
+
+def test_old_generation_pages_dropped_before_lower_cg(setup, monkeypatch):
+    bridge, _, _, _, _ = setup
+    library = bridge.library
+    original = library.page('albums', 0, 1)
+    assert original['generation'] > 7
+    bridge.command(b'ci\t1\t65535')
+    bridge.available = True
+    blocked, resume = threading.Event(), threading.Event()
+    page = library.page
+
+    def slow(query, offset, limit, stale):
+        if offset == 1:
+            blocked.set()
+            assert resume.wait(2)
+            return dict(original, offset=offset)
+        return page(query, offset, limit, stale)
+
+    monkeypatch.setattr(library, 'page', slow)
+    worker = threading.Thread(target=bridge._pages)
+    bridge.threads.append(worker)
+    worker.start()
+    frames = []
+    send = lambda _, raw: frames.append(raw)
+    gen = bridge.generation
+    try:
+        bridge.poll(send)
+        assert bridge.command(f'cq\t{gen}\t10\t0\t1\talbums'.encode())
+        assert bridge.command(f'cq\t{gen}\t11\t1\t1\talbums'.encode())
+        assert blocked.wait(2)  # 10 is queued with zero credit; 11 is still computing.
+        assert any(frame[5].startswith(f'CL\t{gen}\t10\t'.encode()) for frame in bridge.scheduler.heap)
+        library.generation = 7
+        bridge.poll(send)
+        assert frames[-1] == f'CG\t{gen}\t7'.encode()
+        assert bridge.command(f'cq\t{gen}\t12\t0\t1\talbums'.encode())
+    finally:
+        resume.set()
+    deadline = time.monotonic() + 2
+    while not frames[-1].startswith(f'CL\t{gen}\t12\t7\t'.encode()) and time.monotonic() < deadline:
+        bridge.scheduler.grant(65535)
+        bridge.poll(send)
+        time.sleep(.002)
+    assert [raw.split(b'\t')[:4] for raw in frames if raw.startswith(b'CL\t')] == [
+        [b'CL', str(gen).encode(), b'12', b'7']]
 
 
 def test_token_permissions_and_env_precedence(setup):

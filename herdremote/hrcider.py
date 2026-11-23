@@ -65,10 +65,14 @@ def item_id(value):
     return str(value) if isinstance(value,(str,int)) and not isinstance(value,bool) else ''
 
 
+class ArtworkVariantUnavailable(ValueError):
+    pass
+
+
 def capped_url(template):
     url=canonical_art_url(template)
     if not re.search(r'240x240(?=(?:bb|cc|sr)?[.])',url):
-        raise ValueError('Artwork URL has no capped size variant')
+        raise ArtworkVariantUnavailable('Artwork URL has no capped size variant')
     parts=urllib.parse.urlsplit(url)
     if parts.scheme!='https' and not (parts.scheme=='http' and parts.hostname in ('127.0.0.1','localhost','::1')):
         raise ValueError('Artwork needs HTTPS')
@@ -834,12 +838,12 @@ class Bridge:
                 self.rufin_library=RufinLibrary(rufin)
             else:
                 from hrjellyfin import JellyfinLibrary
-                self.rufin_library=JellyfinLibrary(rufin,jellyfin)
+                self.rufin_library=JellyfinLibrary(rufin,jellyfin,self.cache)
             rufin.rpc_observer=self._rpc_event
         self.jellyfin_library=self.rufin_library if jellyfin is not None else None
         self.volume_delta=0;self.volume_set=None;self.volume_wake=threading.Event()
         self.volume_refresh=False
-        self.pages=queue.Queue(1);self.page_token=0
+        self.pages=queue.Queue(2)
         self.art_locks=WeakValueDictionary()
         self.art_locks_mutex=threading.Lock()
         self.prefetch=queue.Queue(10)
@@ -878,7 +882,10 @@ class Bridge:
         closer = getattr(self.client, 'close', None)
         if closer: closer()
         for t in self.threads:t.join(timeout=3)
-        if not any(t.is_alive() for t in self.threads):self.cache.close()
+        if not any(t.is_alive() for t in self.threads):
+            if self.jellyfin_library is not None:
+                self.jellyfin_library.jellyfin.close()
+            self.cache.close()
     def disconnect(self):
         self.handoff.disconnect()
         with self.lock:
@@ -889,7 +896,7 @@ class Bridge:
             self.live_pending=None;self.live_next=0.;self.reopen_reason=None
             self.library.lyrics.select('')
             self.seek_refresh=None
-            self.opened=False;self.generation=0;self.requests.clear();self._drop_jobs();self.scheduler.reset(0);self.volume_delta=0;self.volume_set=None
+            self.opened=False;self.generation=0;self.requests.clear();self._clear_pages();self._drop_jobs();self.scheduler.reset(0);self.volume_delta=0;self.volume_set=None
     def command(self,payload):
         if self.handoff.command(payload):
             return True
@@ -914,7 +921,7 @@ class Bridge:
                     self.seek_refresh=None
                     self.warm_window.clear();self.warm_queue.clear();self.warm_jobs.clear();self.neighbors=None
                     self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
-                    self.requests.clear();self._drop_jobs();self.opened=True;self.library_sent=0;self.last_state=0;self._state(True)
+                    self.requests.clear();self._clear_pages();self._drop_jobs();self.opened=True;self.library_sent=0;self.last_state=0;self._state(True)
                     self.art_times.clear();self.inventory_pages=0;self.progress_at=0
                     self.live_pending=None;self.live_next=0.;self.reopen_reason=None
                     log.info('capabilities gen=%d advertised=%s negotiated=%s localstore=%s',self.generation,','.join(advertised),','.join(sorted(self.capabilities)),'localstore' in self.capabilities)
@@ -1012,13 +1019,18 @@ class Bridge:
                     log.info('art batch gen=%d req=%d tier=XS count=%d',self.generation,req,len(keys))
                 elif name=='cp' and len(fields)==7:
                     req=int(fields[2]);page=self.cache.page(fields[3],int(fields[4]),int(fields[5]),stale=not self.available or self.index.initial or self.index.force)
-                    self.scheduler.push(2,2,page_frame(self.generation,req,page),req,bulk=True)
+                    page=dict(page,generation=self.wire_library_generation(page['generation']))
+                    self.scheduler.push(2,2,page_frame(self.generation,req,page),bulk=True)
                 elif name=='cq' and len(fields)==6:
-                    self.page_token+=1
-                    try:self.pages.get_nowait()
-                    except queue.Empty:pass
-                    self.scheduler.heap=[v for v in self.scheduler.heap if v[5][:3]!=b'CL\t'];heapq.heapify(self.scheduler.heap)
-                    self.pages.put_nowait((self.generation,int(fields[2]),int(fields[3]),int(fields[4]),fields[5],self.page_token))
+                    request=(self.generation,int(fields[2]),int(fields[3]),int(fields[4]),fields[5],self.remote_epoch)
+                    try:
+                        self.pages.put_nowait(request)
+                    except queue.Full:
+                        # Replace the oldest waiting request. The in-flight page
+                        # and already queued replies retain their own request IDs.
+                        try:self.pages.get_nowait()
+                        except queue.Empty:pass
+                        self.pages.put_nowait(request)
                 elif name=='cw' and len(fields)==4:
                     if 'warm' not in self.capabilities:raise ValueError('Unadvertised art window')
                     tier=fields[2];keys=fields[3].split(',') if fields[3] else []
@@ -1096,11 +1108,18 @@ class Bridge:
         if self.opened and 'remote-name' in self.capabilities:
             self.scheduler.push(1,2,f'CF\t{self.generation}\tremote\t{self.remote_name()}'.encode())
     def wire_library_generation(self,raw=None):
-        """Library generation on the wire; every backend switch changes it."""
-        if raw is None:
-            raw=self.rufin_library.generation if self.remote_name()=='Rufin' else self.cache.generation
+        """Preserve Rufin's content revision across daemon and backend switches."""
+        if self._rufin_active():
+            return self.rufin_library.generation if raw is None else raw
+        if raw is None:raw=self.cache.generation
         if not self.remote_epoch:return raw
         return ((raw+(self.remote_epoch<<24))&0xffffffff) or 1
+
+    def _clear_pages(self):
+        while True:
+            try:self.pages.get_nowait()
+            except queue.Empty:return
+
     def _switch_remote(self,client,library,reason):
         # Caller holds self.lock. Availability is not dropped here: the next
         # poll publishes the new backend's state (no CA 0/1 blip).
@@ -1113,9 +1132,7 @@ class Bridge:
         self.seek_refresh=None
         self.switch_deferred=False;self.failures=0;self.neighbors=None;self.warm_queue.clear()
         self.loading.cancel();self.fill_cancel.set()
-        self.page_token+=1
-        try:self.pages.get_nowait()
-        except queue.Empty:pass
+        self._clear_pages()
         self.scheduler.heap=[v for v in self.scheduler.heap if v[5][:3] not in (b'CL\t',b'CO\t',b'CB\t')];heapq.heapify(self.scheduler.heap)
         log.info('remote switch from=%s to=%s reason=%s epoch=%d',before,self.remote_name(),clean(reason,80),self.remote_epoch)
         self._announce_remote();self.wake.set()
@@ -1172,44 +1189,25 @@ class Bridge:
 
     @survive()
     def _rufin_inventory(self):
-        """Enumerate artwork from the same Rufin album route that the iPod sees."""
-        scan=None
-        offset=0
-        keys=set()
+        """Refresh Rufin's catalogue and publish its artwork inventory."""
         while not self.stop.wait(.25):
             with self.lock:
-                if not self.opened or not self.available or not self._rufin_active() or 'localstore' not in self.capabilities:
-                    continue
+                if not self._rufin_active():continue
                 library=self.rufin_library
-                identity=(self.remote_epoch, library.generation)
-                if self.rufin_catalog is not None and self.rufin_catalog[0]==identity[1]:
+                epoch=self.remote_epoch
+            library.refresh()
+            with self.lock:
+                if (epoch!=self.remote_epoch or not self.opened or not self.available
+                        or 'localstore' not in self.capabilities):
                     continue
-            if identity!=scan:
-                scan=identity
-                offset=0
-                keys.clear()
-            try:
-                page=library.page('albums',offset,50)
-            except (OSError, ValueError, TimeoutError):
-                self.stop.wait(2)
-                continue
-            if page['generation']!=identity[1] or page['stale'] or page['offset']!=offset:
-                scan=None
-                continue
-            rows=page['items']
-            if not rows and offset<page['total']:
-                scan=None
-                self.stop.wait(2)
-                continue
-            keys.update(row['art'] for row in rows if row.get('art') not in (None,'-'))
-            offset+=len(rows)
-            if offset>=page['total']:
-                with self.lock:
-                    if self._rufin_active() and identity==(self.remote_epoch, library.generation):
-                        self.rufin_catalog=(identity[1],tuple(sorted(keys)))
-                        self.planner.reset();self.progress_at=0
-                        log.info('Rufin localstore catalog albums=%d artwork=%d',offset,len(keys))
-                scan=None
+                if self.rufin_catalog is not None and self.rufin_catalog[0]==library.generation:
+                    continue
+                inventory=library.album_inventory()
+                if inventory is not None:
+                    revision,count,keys=inventory
+                    self.rufin_catalog=(revision,tuple(sorted(keys)))
+                    self.planner.reset();self.progress_at=0
+                    log.info('Rufin localstore catalog albums=%d artwork=%d',count,len(keys))
     def _state(self,force=False):
         self.state_dirty=True
         if not self.opened:return
@@ -1389,8 +1387,6 @@ class Bridge:
     def _index(self):
         while not self.stop.is_set():
             self.index.step()
-            if self.jellyfin_library is not None and self._rufin_active():
-                self.jellyfin_library.refresh()
             self.stop.wait(.25)
     @survive()
     def _lyrics_prefetch(self):
@@ -1414,17 +1410,18 @@ class Bridge:
     def _pages(self):
         while not self.stop.is_set():
             try:
-                generation,req,offset,limit,query,token=self.pages.get(timeout=.1)
+                generation,req,offset,limit,query,epoch=self.pages.get(timeout=.1)
             except queue.Empty:continue
             with self.lock:
-                if generation!=self.generation or not self.opened:continue
+                if generation!=self.generation or not self.opened or epoch!=self.remote_epoch:continue
+                library=self.library
+                rufin=self._rufin_active()
+                raw=self.rufin_library.generation if rufin else self.cache.generation
             started=time.monotonic()
-            with self.lock:library=self.library;rufin=self._rufin_active()
             try:page=library.page(query,offset,limit,stale=not self.available or (not rufin and self.index.initial))
             except Exception as error:
                 if not isinstance(error,(ValueError,OSError,TimeoutError)):self.worker_errors.note('_pages',error)
-                raw=self.rufin_library.generation if rufin else self.cache.generation
-                page=dict(generation=raw,offset=offset,total=0,stale=True,items=[],_error=page_error(error))
+                page=dict(generation=raw,offset=offset,total=offset,stale=True,items=[],_error=page_error(error))
             parsed=urllib.parse.urlsplit(query);path=parsed.path
             lyric_args=dict(urllib.parse.parse_qsl(parsed.query)) if path=='now/lyrics' else {}
             kind=ROOT.get(urllib.parse.unquote(path[5:]),'unknown') if path.startswith('root/') else path.split('/',1)[0]
@@ -1432,11 +1429,14 @@ class Bridge:
             if page.get('_error'):
                 log.warning('page failed gen=%d req=%d kind=%s offset=%d reason=%s',generation,req,kind,offset,page['_error'])
             with self.lock:
-                if generation==self.generation and self.opened and token==self.page_token and library is self.library:
-                    page=dict(page,generation=self.wire_library_generation(page['generation']))
+                if generation==self.generation and self.opened and epoch==self.remote_epoch:
+                    current=self.rufin_library.generation if rufin else self.cache.generation
+                    if page['generation']!=current or (not rufin and raw!=current):
+                        continue
+                    page=dict(page,generation=self.wire_library_generation(current))
                     if lyric_args.get('lrc')=='1' and self.state and self.state['id']!=lyric_args.get('track'):
                         page.update(total=offset+1,items=[{'id':'lyric-wait'}])
-                    self.scheduler.push(2,2,native_page_frame(generation,req,page),req,bulk=True)
+                    self.scheduler.push(2,2,native_page_frame(generation,req,page),bulk=True)
                     log.info('page ready gen=%d req=%d kind=%s offset=%d rows=%d stale=%s ms=%.1f',generation,req,kind,offset,len(page['items']),bool(page['stale']),1000*(time.monotonic()-started))
     @survive()
     def _volume_worker(self):
@@ -1584,9 +1584,13 @@ class Bridge:
                 return pixels
             if template and template.startswith('jellyfin:'):
                 if self.jellyfin_library is None:raise ValueError('Jellyfin artwork source unavailable')
-                artwork,cacheable=self.jellyfin_library.artwork(
-                    template, PALETTE_SOURCE_LIMIT if tier=='P' else dim)
-                pixels=render(artwork,tier)
+                if raw is None:
+                    raw,cacheable=self.jellyfin_library.artwork(template,SIZES['L'])
+                    pixels=render(raw,tier)
+                    if cacheable:self.cache.put_art(key,'original',raw)
+                else:
+                    pixels=render(raw,tier)
+                    cacheable=True
                 if cacheable:self.cache.put_art(key,cache_tier,pixels)
                 return pixels
             if template:
@@ -1658,6 +1662,8 @@ class Bridge:
         except Exception as error:
             if not isinstance(error,(OSError,ValueError,TimeoutError)):self.worker_errors.note('_warm',error)
             with self.lock:
+                if isinstance(error,ArtworkVariantUnavailable):
+                    self.planner.failed(key,tier,all_tiers=True)
                 if self.warm_jobs.get(pair)==generation:self.warm_jobs.pop(pair,None)
     @survive()
     def _neighbors(self):
@@ -1738,6 +1744,9 @@ class Bridge:
                         try:self.scheduler.push(0,2,f'CK\t{generation}\t{req}\t0\tArtwork unavailable'.encode())
                         except ValueError:self.reopen_reason='Cider artwork response queue full'
                         self.requests.pop(req,None)
+                        if priority==4 and expected:
+                            self.planner.failed(key,tier,all_tiers=isinstance(error,ArtworkVariantUnavailable))
+                            self.offer_pairs.discard((key,tier))
                         reason=clean(error,120) if expected else 'Unexpected artwork worker failure'
                         log.info('art failed gen=%d req=%d tier=%s fill=%s reason=%s',generation,req,tier,priority==4,reason)
                 continue
@@ -1787,7 +1796,15 @@ class Bridge:
                 log.info('localstore build progress gen=%d library=%d done=%d total=%d state=%d inventory_pages=%d',self.generation,revision,done,total,status,self.inventory_pages)
             library=self.wire_library_generation()
             if library!=self.library_sent:
-                self.scheduler.push(1,2,f'CG\t{self.generation}\t{library}'.encode());self.library_sent=library
+                # Firmware accepts a lower signature in CG. Delete every CL
+                # from the old revision before the ordered serial send.
+                with self.scheduler.lock:
+                    self.scheduler.heap=[frame for frame in self.scheduler.heap
+                                         if not frame[5].startswith(b'CL\t')
+                                         or int(frame[5].split(b'\t',4)[3])==library]
+                    heapq.heapify(self.scheduler.heap)
+                    self.scheduler.push(1,2,f'CG\t{self.generation}\t{library}'.encode())
+                self.library_sent=library
             sent = False
             for _ in range(4):
                 frame=self.scheduler.next_frame()
