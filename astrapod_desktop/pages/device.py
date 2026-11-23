@@ -11,7 +11,7 @@ from ..qt import QtCore, QtGui, QtSvg, QtWidgets, Qt
 from ..widgets import (CapacityBar, PageHeader, button, label, make_badge,
                        make_card, set_badge)
 from . import Page
-from .stock_screen import StockCoverPanel, TITLE_HEIGHT, render_stock_home
+from .stock_screen import PANEL_X, StockCoverPanel, TITLE_HEIGHT, render_stock_home
 
 R = QtCore.QRectF
 P = QtCore.QPointF
@@ -122,8 +122,9 @@ class IPodDrawing(QtWidgets.QWidget):
             self._stock_home = render_stock_home(_home_screen(True))
         painter.drawImage(screen, self._stock_home)
         title = screen.height() * TITLE_HEIGHT / self._stock_home.height()
-        panel = R(screen.center().x(), screen.top() + title,
-                  screen.width() / 2, screen.height() - title)
+        split = screen.width() * PANEL_X / self._stock_home.width()
+        panel = R(screen.left() + split, screen.top() + title,
+                  screen.width() - split, screen.height() - title)
         self.cover_panel.paint(painter, panel)
 
 

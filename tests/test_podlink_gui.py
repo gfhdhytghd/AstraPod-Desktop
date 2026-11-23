@@ -28,6 +28,7 @@ from astrapod_desktop.app import create_application, demo_services  # noqa: E402
 from astrapod_desktop.backends import ProbedFile  # noqa: E402
 from astrapod_desktop.jobs import JobRunner  # noqa: E402
 from astrapod_desktop.pages.device import ASSETS  # noqa: E402
+from astrapod_desktop.pages.stock_screen import MENU_ITEMS, MENU_TOP, ROW_PITCH  # noqa: E402
 from astrapod_desktop.pages.extensions import normalize_schema  # noqa: E402
 from podlink_ui_theme import QtCore, QtWidgets  # noqa: E402
 from astrapod_desktop.qt import QtGui  # noqa: E402
@@ -169,10 +170,11 @@ class ThemeAndNavigationTests(GuiCase):
             read.assert_called_once_with(root, None)
             self.assertEqual(page.drawing.model, "ipod6g")
             screen = self._render_device_screen(page.drawing)
-            for rect in [QtCore.QRect(135, 0, 50, 26)] + [
-                    QtCore.QRect(5, 27 + row * 28, 130, 28) for row in range(7)]:
+            for rect in [QtCore.QRect(135, 0, 50, 24)] + [
+                    QtCore.QRect(5, MENU_TOP + row * ROW_PITCH, 130, ROW_PITCH)
+                    for row in range(len(MENU_ITEMS))]:
                 self.assertNotEqual(screen.copy(rect), stock_png.copy(rect))
-            panel = QtCore.QRect(160, 27, 160, 213)
+            panel = QtCore.QRect(160, 24, 160, 216)
             self.assertEqual(screen.copy(panel), stock_png.copy(panel))
         self.window.device = None
         self.window.library_state.summary = contracts.DeviceSummary(
@@ -184,6 +186,26 @@ class ThemeAndNavigationTests(GuiCase):
                 self.assertEqual(page.drawing.model, "ipodvideo")
                 self.assertEqual(self._render_device_screen(page.drawing),
                                  podbox_png.convertToFormat(QtGui.QImage.Format.Format_RGB32))
+
+    def test_stock_home_lcd_geometry(self) -> None:
+        with patch("hrstock.random_artwork", return_value=None):
+            self._mount_stock_classic()
+            drawing = self.window.pages["device"].drawing
+            wait_until(self.app, lambda: drawing.cover_panel.exhausted)
+            with patch.object(drawing.cover_panel, "paint") as paint_cover:
+                screen = self._render_device_screen(drawing)
+
+        self.assertEqual(screen.size(), QtCore.QSize(320, 240))
+        self.assertEqual(ROW_PITCH, 25)
+        self.assertEqual(paint_cover.call_args.args[1], QtCore.QRectF(160, 24, 160, 216))
+        self.assertEqual(screen.pixelColor(80, 23), QtGui.QColor("#8e969f"))
+        self.assertEqual(screen.pixelColor(80, 24), QtGui.QColor("white"))
+        self.assertEqual(screen.pixelColor(80, 25), QtGui.QColor("#225a9d"))
+        self.assertEqual(screen.pixelColor(80, 48), QtGui.QColor("white"))
+        self.assertEqual(screen.pixelColor(159, 120), QtGui.QColor("#78889b"))
+        self.assertNotEqual(screen.pixelColor(159, 120), screen.pixelColor(160, 120))
+        for y in range(5, 20):
+            self.assertEqual(screen.pixelColor(12, y), screen.pixelColor(80, y))
 
     def test_stock_cover_panel_reads_album_covers_and_pauses(self) -> None:
         page = self.window.pages["device"]

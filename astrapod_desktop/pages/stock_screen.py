@@ -3,15 +3,20 @@ from __future__ import annotations
 
 import random
 
-import hrstockdevice
-
 from ..artwork import artwork_to_image
 from ..contracts import album_key
 from ..qt import QtCore, QtGui, Qt
 from ..stock_font import font_path, is_stock_font
 
+import hrstockdevice
 
-TITLE_HEIGHT = 27
+
+LCD_WIDTH = 320
+LCD_HEIGHT = 240
+TITLE_HEIGHT = 24
+ROW_PITCH = 25
+PANEL_X = 160
+MENU_TOP = TITLE_HEIGHT
 MENU_ITEMS = ("Music", "Videos", "Photos", "Podcasts", "Extras", "Settings", "Shuffle Songs")
 FALLBACK_FAMILY = "Liberation Sans"
 
@@ -61,10 +66,10 @@ def render_stock_home(background: QtGui.QImage) -> QtGui.QImage:
     with QtGui.QPainter(image) as painter:
         painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
         painter.setPen(QtGui.QColor("#21252a"))
-        _draw_label(painter, title, "iPod", 160, 0, TITLE_HEIGHT - 1, center=True)
+        _draw_label(painter, title, "iPod", LCD_WIDTH / 2, 0, TITLE_HEIGHT - 1, center=True)
         for index, label in enumerate(MENU_ITEMS):
             painter.setPen(QtGui.QColor("#ffffff" if index == 0 else "#25292f"))
-            _draw_label(painter, menu, label, 9, TITLE_HEIGHT + index * 28, 28)
+            _draw_label(painter, menu, label, 12, MENU_TOP + index * ROW_PITCH, ROW_PITCH)
     return image
 
 
