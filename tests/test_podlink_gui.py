@@ -28,7 +28,7 @@ from astrapod_desktop.app import create_application, demo_services  # noqa: E402
 from astrapod_desktop.backends import ProbedFile  # noqa: E402
 from astrapod_desktop.jobs import JobRunner  # noqa: E402
 from astrapod_desktop.pages.device import ASSETS  # noqa: E402
-from astrapod_desktop.pages.stock_screen import MENU_ITEMS, MENU_TOP, ROW_PITCH  # noqa: E402
+from astrapod_desktop.pages.stock_screen import MENU_ITEMS, MENU_TOP, PANEL_X, ROW_PITCH  # noqa: E402
 from astrapod_desktop.pages.extensions import normalize_schema  # noqa: E402
 from podlink_ui_theme import QtCore, QtWidgets  # noqa: E402
 from astrapod_desktop.qt import QtGui  # noqa: E402
@@ -170,11 +170,11 @@ class ThemeAndNavigationTests(GuiCase):
             read.assert_called_once_with(root, None)
             self.assertEqual(page.drawing.model, "ipod6g")
             screen = self._render_device_screen(page.drawing)
-            for rect in [QtCore.QRect(135, 0, 50, 24)] + [
+            for rect in [QtCore.QRect(0, 0, 40, 20)] + [
                     QtCore.QRect(5, MENU_TOP + row * ROW_PITCH, 130, ROW_PITCH)
                     for row in range(len(MENU_ITEMS))]:
                 self.assertNotEqual(screen.copy(rect), stock_png.copy(rect))
-            panel = QtCore.QRect(160, 24, 160, 216)
+            panel = QtCore.QRect(160, 0, 160, 240)
             self.assertEqual(screen.copy(panel), stock_png.copy(panel))
         self.window.device = None
         self.window.library_state.summary = contracts.DeviceSummary(
@@ -196,16 +196,29 @@ class ThemeAndNavigationTests(GuiCase):
                 screen = self._render_device_screen(drawing)
 
         self.assertEqual(screen.size(), QtCore.QSize(320, 240))
-        self.assertEqual(ROW_PITCH, 25)
-        self.assertEqual(paint_cover.call_args.args[1], QtCore.QRectF(160, 24, 160, 216))
-        self.assertEqual(screen.pixelColor(80, 23), QtGui.QColor("#8e969f"))
-        self.assertEqual(screen.pixelColor(80, 24), QtGui.QColor("white"))
-        self.assertEqual(screen.pixelColor(80, 25), QtGui.QColor("#225a9d"))
-        self.assertEqual(screen.pixelColor(80, 48), QtGui.QColor("white"))
-        self.assertEqual(screen.pixelColor(159, 120), QtGui.QColor("#78889b"))
-        self.assertNotEqual(screen.pixelColor(159, 120), screen.pixelColor(160, 120))
-        for y in range(5, 20):
-            self.assertEqual(screen.pixelColor(12, y), screen.pixelColor(80, y))
+        self.assertEqual(paint_cover.call_args.args[1], QtCore.QRectF(160, 0, 160, 240))
+        color = screen.pixelColor
+        # A 19-row title gradient and a dark rule end at the selection's top.
+        self.assertEqual(color(80, 0), QtGui.QColor("white"))
+        self.assertLess(color(80, 18).lightness(), color(80, 9).lightness())
+        self.assertEqual(color(80, 19), QtGui.QColor("#5a595a"))
+        for y in range(19):
+            self.assertEqual(color(60, y), color(120, y))
+        # The selection spans the menu column from MENU_TOP for ROW_PITCH rows.
+        self.assertEqual(color(80, MENU_TOP), QtGui.QColor("#94c7de"))
+        self.assertEqual(color(80, MENU_TOP + ROW_PITCH - 1), QtGui.QColor("#004184"))
+        self.assertEqual(color(80, MENU_TOP + ROW_PITCH), QtGui.QColor("white"))
+        self.assertEqual(color(0, 30), color(159, 30))
+        self.assertGreater(color(80, 30).blue(), 200)
+        self.assertEqual(color(149, 32), QtGui.QColor("white"))
+        # The battery sits left of the split, with a green fill and a charge bolt.
+        fill = color(147, 6)
+        self.assertGreater(fill.green(), max(fill.red(), fill.blue()))
+        self.assertLess(color(140, 9).lightness(), fill.lightness())
+        self.assertEqual(color(157, 5), color(60, 5))
+        # The panel starts at PANEL_X with a shadow that fades to the right.
+        self.assertEqual(color(PANEL_X - 1, 120), QtGui.QColor("white"))
+        self.assertLess(color(PANEL_X, 120).lightness(), color(PANEL_X + 21, 120).lightness())
 
     def test_stock_cover_panel_reads_album_covers_and_pauses(self) -> None:
         page = self.window.pages["device"]
@@ -230,8 +243,10 @@ class ThemeAndNavigationTests(GuiCase):
             self.assertTrue(all(thread != threading.get_ident() for _, _, thread in calls))
             screen = self._render_device_screen(page.drawing)
             self.assertEqual(screen.pixelColor(240, 140), QtGui.QColor("red"))
-            self.assertEqual(screen.pixelColor(240, 10),
-                             QtGui.QImage(str(ASSETS / "stock-classic-home.png")).pixelColor(240, 10))
+            self.assertEqual(screen.pixelColor(240, 10), QtGui.QColor("red"))
+            self.assertLess(screen.pixelColor(160, 140).red(), screen.pixelColor(181, 140).red())
+            self.assertEqual(screen.pixelColor(80, 10),
+                             QtGui.QImage(str(ASSETS / "stock-classic-home.png")).pixelColor(80, 10))
 
             panel.elapsed = panel.HOLD_MS + panel.FADE_MS // 2
             blended = self._render_device_screen(page.drawing).pixelColor(240, 140)

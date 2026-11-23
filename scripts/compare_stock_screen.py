@@ -23,12 +23,9 @@ SIZE = (320, 240)
 PANEL_CONTENT = (190, 54, 279, 188)
 REGIONS = {
     "Overall": (0, 0, 320, 240),
-    "Title bar (menu side)": (0, 0, 160, 20),
-    "Title (reference position)": (0, 0, 38, 20),
-    "Title (preview position)": (135, 0, 185, 20),
-    "Old play indicator": (7, 5, 21, 20),
-    "Battery (reference)": (126, 0, 158, 18),
-    "Battery (preview)": (282, 4, 316, 22),
+    "Title bar": (0, 0, 160, 20),
+    "Title text": (0, 0, 40, 20),
+    "Battery": (126, 0, 158, 18),
     "Music": (0, 20, 160, 45),
     "Videos": (0, 45, 160, 69),
     "Photos": (0, 69, 160, 94),
@@ -36,10 +33,12 @@ REGIONS = {
     "Extras": (0, 118, 160, 143),
     "Settings": (0, 143, 160, 167),
     "Shuffle Songs": (0, 167, 160, 192),
-    "Selection fill (between label and arrow)": (56, 20, 138, 55),
-    "Arrow": (138, 20, 158, 55),
-    "Split and adjacent edges": (157, 20, 177, 240),
-    "Right panel backing": (177, 20, 320, 240),
+    "Menu below the rows": (0, 192, 160, 240),
+    "Selection fill (between label and chevron)": (56, 20, 140, 45),
+    "Chevron": (140, 20, 160, 45),
+    "Split and adjacent edges": (157, 0, 182, 240),
+    "Panel beside the title bar": (182, 0, 320, 20),
+    "Right panel backing": (182, 20, 320, 240),
 }
 
 
@@ -143,7 +142,6 @@ def main() -> None:
         "Region boxes use half-open LCD coordinates (left, top, right, bottom).",
         f"Masked reference panel content: {PANEL_CONTENT}. Mask appears grey in heatmaps.",
         "The preview uses an empty cover panel to measure its backing.",
-        "Menu row boxes follow the reference. Selection and arrow boxes span both layouts.",
         "",
         f"{'Region':43} {'Box':23} {'Pixels':>7} {'Before':>8} {'After':>8} {'Delta':>8}",
     ]

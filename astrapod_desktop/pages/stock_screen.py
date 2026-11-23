@@ -13,42 +13,61 @@ import hrstockdevice
 
 LCD_WIDTH = 320
 LCD_HEIGHT = 240
-TITLE_HEIGHT = 24
-ROW_PITCH = 25
+# Geometry and text placement measured from a Classic 1.1.2 LCD capture.
+TITLE_HEIGHT = 20
 PANEL_X = 160
 MENU_TOP = TITLE_HEIGHT
+ROW_PITCH = 25
 MENU_ITEMS = ("Music", "Videos", "Photos", "Podcasts", "Extras", "Settings", "Shuffle Songs")
+# The firmware places rows 24 or 25 pixels apart, so each baseline is
+# listed rather than derived from ROW_PITCH.
+MENU_BASELINES = (38, 63, 88, 113, 137, 161, 185)
+MENU_X = 5
+MENU_SIZE = 16.28
+TITLE_X = 6
+TITLE_BASELINE = 14
+TITLE_SIZE = 13.14
+# A black shadow along the panel's left edge, as (offset, alpha) pairs.
+SPLIT_SHADOW = ((0, 0.47), (4, 0.32), (8, 0.21), (12, 0.105), (16, 0.04), (21, 0.0))
 FALLBACK_FAMILY = "Liberation Sans"
 
 
-def _preview_font(data: bytes, size: int) -> QtGui.QRawFont:
+def _preview_font(data: bytes, size: float) -> QtGui.QRawFont:
     if data:
-        font = QtGui.QRawFont(data, size, QtGui.QFont.HintingPreference.PreferVerticalHinting)
+        # The firmware's glyphs match unhinted outlines on whole-pixel advances.
+        font = QtGui.QRawFont(data, size, QtGui.QFont.HintingPreference.PreferNoHinting)
         if font.isValid():
             return font
     fallback = QtGui.QFont(FALLBACK_FAMILY)
-    fallback.setPixelSize(size)
+    fallback.setPixelSize(round(size))
     fallback.setBold(True)
     return QtGui.QRawFont.fromFont(fallback)
 
 
-def _draw_label(painter, font, label, x, y, height, center=False):
+def _draw_label(painter, font, label, x, baseline):
     # These are fixed English labels. Lay them out directly from the face so
     # an installed font with the same family name cannot replace the IPSW face.
     glyphs = font.glyphIndexesForString(label)
     positions = []
-    width = 0.0
+    width = 0
     for advance in font.advancesForGlyphIndexes(glyphs):
         positions.append(QtCore.QPointF(width, 0))
-        width += advance.x()
+        width += round(advance.x())
     run = QtGui.QGlyphRun()
     run.setRawFont(font)
     run.setGlyphIndexes(glyphs)
     run.setPositions(positions)
-    if center:
-        x -= width / 2
-    baseline = y + (height + font.ascent() - font.descent()) / 2
     painter.drawGlyphRun(QtCore.QPointF(x, baseline), run)
+
+
+def paint_split_shadow(painter, rect: QtCore.QRectF) -> None:
+    """Shade the left edge of the panel, scaled from the 160-pixel LCD panel."""
+    scale = rect.width() / (LCD_WIDTH - PANEL_X)
+    width = SPLIT_SHADOW[-1][0] * scale
+    shade = QtGui.QLinearGradient(rect.left(), 0, rect.left() + width, 0)
+    for offset, alpha in SPLIT_SHADOW:
+        shade.setColorAt(offset / SPLIT_SHADOW[-1][0], QtGui.QColor(0, 0, 0, round(alpha * 255)))
+    painter.fillRect(QtCore.QRectF(rect.left(), rect.top(), width, rect.height()), shade)
 
 
 def render_stock_home(background: QtGui.QImage) -> QtGui.QImage:
@@ -60,16 +79,18 @@ def render_stock_home(background: QtGui.QImage) -> QtGui.QImage:
     if not is_stock_font(data):
         data = b""
 
-    title = _preview_font(data, 14)
-    menu = _preview_font(data, 16)
+    title = _preview_font(data, TITLE_SIZE)
+    menu = _preview_font(data, MENU_SIZE)
     image = background.copy()
     with QtGui.QPainter(image) as painter:
         painter.setRenderHint(QtGui.QPainter.RenderHint.TextAntialiasing)
-        painter.setPen(QtGui.QColor("#21252a"))
-        _draw_label(painter, title, "iPod", LCD_WIDTH / 2, 0, TITLE_HEIGHT - 1, center=True)
-        for index, label in enumerate(MENU_ITEMS):
-            painter.setPen(QtGui.QColor("#ffffff" if index == 0 else "#25292f"))
-            _draw_label(painter, menu, label, 12, MENU_TOP + index * ROW_PITCH, ROW_PITCH)
+        painter.setPen(QtGui.QColor(255, 255, 255, 128))
+        _draw_label(painter, title, "iPod", TITLE_X, TITLE_BASELINE + 1)
+        painter.setPen(QtGui.QColor("black"))
+        _draw_label(painter, title, "iPod", TITLE_X, TITLE_BASELINE)
+        for index, (label, baseline) in enumerate(zip(MENU_ITEMS, MENU_BASELINES)):
+            painter.setPen(QtGui.QColor("white" if index == 0 else "black"))
+            _draw_label(painter, menu, label, MENU_X, baseline)
     return image
 
 
@@ -230,6 +251,8 @@ class StockCoverPanel(QtCore.QObject):
                 self._draw_cover(painter, rect, self.next[1], 0, -self.direction)
         else:
             self._draw_cover(painter, rect, self.current[1], 0.5, 0)
+        painter.setOpacity(1)
+        paint_split_shadow(painter, rect)
         painter.restore()
 
     @staticmethod
