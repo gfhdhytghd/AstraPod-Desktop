@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -11,6 +12,7 @@ TOOLS = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(TOOLS), str(TOOLS / "herdremote")]
 
 import hrmediasync as sync
+import hrlibrary
 import podlink
 
 USER = "a" * 32
@@ -69,10 +71,14 @@ class SourceTests(unittest.TestCase):
         all_music, library, playlist = source.scopes()
         self.assertEqual([all_music.kind, library.kind, playlist.kind],
                          ["all", "library", "playlist"])
+        source.browsed_tracks = ()
         all_tracks = source.tracks(all_music)
+        self.assertEqual(source.browsed_tracks, all_tracks)
+        self.assertEqual(source.tracks_from_items(all_music, [song]), all_tracks)
         self.assertEqual(source.tracks(library), all_tracks)
         self.assertEqual(source.tracks(playlist), all_tracks)
         self.assertNotEqual(source.tracks(library), all_tracks)
+        self.assertEqual(source.browsed_tracks, all_tracks)
         calls = client.page.call_args_list
         self.assertIsNone(calls[1].kwargs["ParentId"])
         self.assertEqual(calls[2].kwargs["ParentId"], LIBRARY)
@@ -114,6 +120,79 @@ class OriginalMatchingTests(unittest.TestCase):
                 b"MS2 DBDONE")]
         self.assertEqual(sync.original_matches(link, tracks), frozenset())
         self.assertIsNone(sync.music_tags("Title", ["Artist"], "<Untagged>", 180000, 1, 5))
+
+    def test_device_tracks_use_same_matcher_and_check_paths(self):
+        tags = sync.music_tags("Title", ["Artist A", "Artist B"], "Album", 180000, 1, 5)
+        tracks = (sync.Track("a", "Title", ".flac", "original", tags),)
+        device_track = dict(path="/<HDD0>/Music/Real.flac", title="Title",
+                            artist="Artist B;Artist A", album="Album",
+                            length_ms=180000, disc=1, track=5)
+        check = Mock(side_effect=lambda path: path != "/Music/Missing.flac")
+        for change in ({"path": "/Music/PodLink/Jellyfin/Sync.flac"},
+                       {"path": "/Music/Missing.flac"}, {"length_ms": 0},
+                       {"album": ""}, {"artist": ""}, {"title": ""}):
+            with self.subTest(change=change):
+                row = SimpleNamespace(**(device_track | change))
+                self.assertEqual(sync.device_track_matches(tracks, [row], file_exists=check),
+                                 frozenset())
+        self.assertEqual(sync.device_track_matches(tracks, [SimpleNamespace(**device_track)],
+                                                   file_exists=check), {"original"})
+        self.assertEqual([call.args[0] for call in check.call_args_list],
+                         ["/Music/Missing.flac", "/Music/Real.flac"])
+
+
+class PreviewCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.source = Mock(identity="owner")
+        self.scope = sync.Scope("all", "All")
+        tags = sync.music_tags("Title", ["Artist"], "Album", 180000, 1, 5)
+        self.tracks = (sync.Track("a", "Title", ".flac", "original", tags),)
+        self.source.tracks.return_value = self.tracks
+        self.link = Mock(timeout=1)
+        self.device_track = SimpleNamespace(path="/Music/Real.flac", title="Title",
+                                            artist="Artist", album="Album",
+                                            length_ms=180000, disc=1, track=5)
+
+    @contextmanager
+    def connection(self, port):
+        yield self.link, "usb-unit-1"
+
+    def replies(self, *responses):
+        self.link.receive.side_effect = [podlink.Frame(podlink.TEXT, 0, data)
+                                         for data in responses]
+
+    def test_preview_reuses_both_libraries_after_live_summary(self):
+        self.replies(b"MS2 DONE", b"MS3 MORE",
+                     b"MS3 SUMMARY iPod\tfirmware\t10\t5\t1\t44\t1\t0")
+        with patch.object(sync, "connect_device", self.connection):
+            plan = sync.preview(self.source, self.scope, None, source_tracks=self.tracks,
+                                cached_library=("usb-unit-1", 44, (self.device_track,)))
+        self.assertEqual(plan.originals, self.tracks)
+        self.source.tracks.assert_not_called()
+        self.assertEqual([call.args[1] for call in self.link.send.call_args_list],
+                         [b"MS2 LIST", b"MS3 SUMMARY", b"MS3 NEXT"])
+
+    def test_preview_falls_back_to_ms2_for_stale_or_unavailable_cache(self):
+        baseline_summary = hrlibrary.DeviceSummary("iPod", "firmware", 10, 5, 1, 44, True)
+        cases = (("usb-unit-2", 44, baseline_summary),
+                 ("usb-unit-1", None, baseline_summary),
+                 ("usb-unit-1", 43, baseline_summary),
+                 ("usb-unit-1", 44,
+                  hrlibrary.DeviceSummary("iPod", "firmware", 10, 5, 2, 44, True)),
+                 ("usb-unit-1", 44,
+                  hrlibrary.DeviceSummary("iPod", "firmware", 10, 5, 1, 44, False)),
+                 ("usb-unit-1", 44, RuntimeError("unsupported")))
+        for serial, commit, summary in cases:
+            with self.subTest(serial=serial, commit=commit, summary=summary):
+                self.link.reset_mock()
+                self.replies(b"MS2 DONE", b"MS2 DBREADY", b"MS2 DBDONE")
+                with patch.object(sync, "connect_device", self.connection), \
+                        patch.object(hrlibrary, "summary", side_effect=[summary]) as read:
+                    plan = sync.preview(self.source, self.scope, None,
+                                        cached_library=(serial, commit, (self.device_track,)))
+                self.assertEqual(plan.additions, self.tracks)
+                self.link.send.assert_any_call(podlink.TEXT, b"MS2 DB")
+                self.assertEqual(read.call_count, int(serial == "usb-unit-1" and commit is not None))
 
 
 class ApplyTests(unittest.TestCase):

@@ -110,6 +110,7 @@ class Plan:
 class JellyfinSource:
     def __init__(self, url, token="", client=None):
         self.client = client or JellyfinClient(timeout=10)
+        self.browsed_tracks = None
         base = https_base(url.strip())
         if token:
             token = token_from({"JELLYFIN_API_KEY": token})
@@ -173,6 +174,13 @@ class JellyfinSource:
         else:
             rows = self.pages("Items", ParentId=scope.item_id, IncludeItemTypes="Audio",
                               Recursive="true", SortBy="SortName", Fields="Path,MediaSources")
+        tracks = self.tracks_from_items(scope, rows)
+        if scope.kind == "all" and self.browsed_tracks is not None:
+            self.browsed_tracks = tracks
+        return tracks
+
+    def tracks_from_items(self, scope, rows):
+        """Build sync records from a complete enumeration of this scope."""
         tracks = {}
         for row in rows:
             if row.get("Type") != "Audio":
@@ -290,7 +298,7 @@ def inventory(link, identity):
             owned.add(name)
 
 
-def original_matches(link, tracks):
+def _match_originals(tracks, original_tags):
     candidates = defaultdict(list)
     for track in tracks:
         if track.tags:
@@ -298,6 +306,16 @@ def original_matches(link, tracks):
     if not candidates:
         return frozenset()
 
+    matched = set()
+    for tags in original_tags:
+        if tags:
+            matches = [track for track in candidates.get(tags.key, ()) if track.tags.matches(tags)]
+            if len(matches) == 1:
+                matched.add(matches[0].name)
+    return frozenset(matched)
+
+
+def _walk_original_tags(link):
     link.send(podlink.TEXT, b"MS2 DB")
     reply = podlink.media_reply(link)
     if reply != b"MS2 DBREADY":
@@ -305,33 +323,77 @@ def original_matches(link, tracks):
             raise RuntimeError("The iPod music database must be ready before checking for duplicates.")
         raise RuntimeError("The iPod cannot read existing music for matching. Update its firmware.")
 
-    matched = set()
     while True:
         link.send(podlink.TEXT, b"MS2 DBNEXT")
         reply = podlink.media_reply(link)
         if reply == b"MS2 DBDONE":
-            return frozenset(matched)
+            return
         if reply == b"MS2 DBMORE":
             continue
         if not reply.startswith(b"MS2 TRACK "):
             raise RuntimeError("The iPod music database changed or could not be read. Preview again.")
         try:
             duration, disc, number, title, artists, album = reply[10:].decode("utf-8").split("\t")
-            tags = music_tags(title, artists.split(";"), album, int(duration),
-                              int(disc), int(number))
+            yield music_tags(title, artists.split(";"), album, int(duration),
+                             int(disc), int(number))
         except ValueError as error:
             raise RuntimeError("The iPod returned an invalid music database record.") from error
-        if tags:
-            matches = [track for track in candidates.get(tags.key, ()) if track.tags.matches(tags)]
-            if len(matches) == 1:
-                matched.add(matches[0].name)
 
 
-def preview(source, scope, port, *, serial_access=nullcontext):
-    tracks = source.tracks(scope)
+def original_matches(link, tracks):
+    return _match_originals(tracks, _walk_original_tags(link))
+
+
+def _device_original_tags(device_tracks, file_exists, requested=None):
+    for track in device_tracks:
+        path = track.path
+        if len(path.encode("utf-8", "surrogateescape")) >= 259:
+            continue
+        if path.startswith("/<HDD0>/"):
+            path = path[7:]
+        if not path.startswith("/") or "/music/podlink/jellyfin/" in path.casefold():
+            continue
+        title, artist, album = track.title, track.artist, track.album
+        record = (f"MS2 TRACK {track.length_ms}\t{track.disc}\t{track.track}"
+                  f"\t{title}\t{artist}\t{album}")
+        if (any(any(c in value for c in "\t\r\n") for value in (title, artist, album))
+                or len(record.encode("utf-8", "surrogateescape")) >= 500):
+            continue
+        tags = music_tags(title, artist.split(";"), album, track.length_ms,
+                          track.disc, track.track)
+        if tags and (file_exists is None or (tags.key in requested and file_exists(path))):
+            yield tags
+
+
+def device_track_matches(tracks, device_tracks, *, file_exists=None):
+    """Match tagcache rows and optionally check each path on the mounted volume."""
+    requested = None
+    if file_exists is not None:
+        tracks = tuple(tracks)
+        requested = {track.tags.key for track in tracks if track.tags}
+    return _match_originals(tracks, _device_original_tags(device_tracks, file_exists, requested))
+
+
+def _preview_matches(link, device, tracks, cached_library):
+    if cached_library is not None and any(track.tags for track in tracks):
+        serial, commit, cached_tracks = cached_library
+        if serial == device and commit is not None:
+            # hrlibrary imports music_tags from this module.
+            import hrlibrary
+
+            current = hrlibrary.match_cached_tracks(link, commit, cached_tracks)
+            if current is not None:
+                return device_track_matches(tracks, current)
+    return original_matches(link, tracks)
+
+
+def preview(source, scope, port, *, serial_access=nullcontext,
+            cached_library=None, source_tracks=None):
+    tracks = source.tracks(scope) if source_tracks is None else tuple(source_tracks)
     with serial_access(), connect_device(port) as (link, device):
         owned = inventory(link, source.identity)
-        return Plan(source.identity, scope, device, tracks, owned, original_matches(link, tracks))
+        matched = _preview_matches(link, device, tracks, cached_library)
+        return Plan(source.identity, scope, device, tracks, owned, matched)
 
 
 def prepare_track(source, track, directory):
