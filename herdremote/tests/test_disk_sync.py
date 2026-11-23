@@ -1,8 +1,10 @@
 """Exercise Disk Mode without a real tty, block device or UDisks."""
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import sys
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -53,6 +55,7 @@ def device(monkeypatch, tmp_path):
     st_dev = root.stat().st_dev
     volume = Mock(spec=disk.Volume)
     volume.mount.return_value = mount
+    volume.mounted.return_value = mount
     volume.mounts.return_value = [mount]
     volume.number = f"{os.major(st_dev)}:{os.minor(st_dev)}"
     volume.present.return_value = False
@@ -231,11 +234,13 @@ def test_volume_discovery_matches_uuid_vid_pid_serial_and_usb_port(tmp_path, mon
     sys_block = tmp_path / "sys_block"
     sys_block.mkdir()
 
-    def add(uuid, path, serial, block_name, product="1261"):
+    def add(uuid, path, serial, block_name, product="1261", manufacturer="PodBox"):
         usb = tmp_path / path
         sys_dev = usb / "target" / block_name
         sys_dev.mkdir(parents=True)
-        for key, value in {"idVendor": "05ac", "idProduct": product, "serial": serial}.items():
+        attributes = {"idVendor": "05ac", "idProduct": product, "serial": serial,
+                      "manufacturer": manufacturer}
+        for key, value in attributes.items():
             (usb / key).write_text(value)
         (sys_dev / "dev").write_text("8:17\n")
         node = tmp_path / block_name
@@ -245,7 +250,7 @@ def test_volume_discovery_matches_uuid_vid_pid_serial_and_usb_port(tmp_path, mon
 
     add("ABC0-9090", "1-5", "1" + SERIAL[1:], "sdb1")
     add("ABC0-9091", "1-6", "1" + SERIAL[1:], "sdc1")
-    add("ABC0-9092", "1-7", "199999999", "sdd1")
+    add("ABC0-9092", "1-7", "199999999", "sdd1", manufacturer="Apple Inc.")
     add("ABC0-9093", "1-8", "1" + SERIAL[1:], "sde1", "9999")
     monkeypatch.setattr(disk, "UUIDS", uuids)
     monkeypatch.setattr(disk, "SYS_BLOCK", sys_block)
@@ -254,8 +259,20 @@ def test_volume_discovery_matches_uuid_vid_pid_serial_and_usb_port(tmp_path, mon
     assert volume.uuid_path.name == "ABC0-9090"
     assert volume.block.name == "sdb1"
     assert volume.present()
+    assert disk.disk_player(volume) == (tmp_path / "1-5", SERIAL)
     assert disk.find_volume((tmp_path / "1-7", SERIAL)) is None
     assert disk.find_volume((tmp_path / "1-8", SERIAL)) is None
+    with pytest.raises(RuntimeError, match="多个 FAT 卷"):
+        disk.current_volume()
+    with pytest.raises(RuntimeError, match="多个 FAT 卷"):
+        disk.current_volume(SERIAL)
+    (uuids / "ABC0-9091").unlink()
+    assert disk.current_volume(SERIAL) == volume
+    (uuids / "ABC0-9090").unlink()
+    assert disk.current_volume(SERIAL) is None
+    stock = disk.current_volume()
+    assert stock.block.name == "sdd1"
+    assert disk.disk_player(stock) is None
 
 
 def test_busy_unmount_never_ejects(monkeypatch, tmp_path):
@@ -329,6 +346,156 @@ def test_mount_discovery_and_orderly_eject(monkeypatch, tmp_path):
     ]
 
 
+def test_mount_authorization_retry_stays_accessible_to_desktop(monkeypatch, tmp_path):
+    monkeypatch.setattr(disk, "mount_directory", lambda: tmp_path)
+    monkeypatch.setattr(disk.Volume, "present", lambda _: True)
+    tmp_path.chmod(0o700)
+    volume = disk.Volume(tmp_path / "uuid", tmp_path / "sdb1", "8:17", ())
+    mounts = []
+    commands = []
+    monkeypatch.setattr(disk.Volume, "mounts", lambda _: mounts)
+
+    def run_host(*command, **_options):
+        commands.append(command)
+        if command[0] == "udisksctl":
+            if command[1] == "mount":
+                raise disk.HostAuthorizationError("NotAuthorizedCanObtain")
+            raise RuntimeError("NotMounted")
+        assert command[0] == "pkexec"
+        if command[1] == "mount":
+            mounts.append(("55", Path(command[-1]), "/", "vfat"))
+        else:
+            assert command[1:] == ("umount", str(mounts[0][1]))
+            mounts.clear()
+
+    monkeypatch.setattr(disk, "run_host", run_host)
+    eject = Mock(return_value=True)
+    monkeypatch.setattr(disk, "eject_drive", eject)
+    mounted = volume.mount(read_only=True)[1]
+    assert mounted.parent == tmp_path
+    assert mounted.name.startswith(disk.MOUNT_PREFIX)
+    assert commands[0][-2:] == ("--options", "ro")
+    assert commands[1][:5] == ("pkexec", "mount", "-t", "vfat", "-o")
+    assert f"uid={os.getuid()}" in commands[1][5].split(",")
+    assert "ro" in commands[1][5].split(",")
+    assert commands[1][-2] == str(volume.uuid_path)
+    volume.eject()
+    assert not mounted.exists()
+    assert commands[2][:2] == ("udisksctl", "unmount")
+    eject.assert_called_once()
+
+
+@pytest.fixture
+def mounted_player(device, monkeypatch):
+    root, player, volume, link, refresh = device
+    volume.usb = (player[1][0], "1" + SERIAL[1:])
+    volume.manufacturer = "PodBox"
+    volume.present.return_value = True
+    no_serial = Mock(side_effect=AssertionError("Disk Mode must not use PodLink"))
+    monkeypatch.setattr(disk, "selected_player", no_serial)
+    monkeypatch.setattr(sync, "connect_device", no_serial)
+    database = root / ".rockbox/library/database"
+    shutil.copytree(Path(__file__).parent / "fixtures/tagcache", database)
+    yield root, volume
+    volume.mount.assert_not_called()
+    volume.eject.assert_not_called()
+    link.send.assert_not_called()
+    refresh.assert_not_called()
+    no_serial.assert_not_called()
+
+
+def test_mounted_preview_uses_real_tagcache_and_existing_local_files(mounted_player):
+    root, volume = mounted_player
+    folder = root / "Music/PodLink/Jellyfin"
+    folder.mkdir(parents=True)
+    (folder / name("1")).write_bytes(b"owned")
+    (folder / name("2", "b" * 24)).write_bytes(b"other account")
+    (folder.parent / "音楽.flac").touch()
+    tracks = (sync.Track("a", "a", ".flac", name("3"),
+                         sync.music_tags("東京", ["Artist", "Guest"], "Fixture Album", 250, 2, 1)),
+              sync.Track("b", "b", ".flac", name("4"),
+                         sync.music_tags("Pilot", ["Artist", "Guest"], "Fixture Album", 250, 2, 2)))
+    source = SimpleNamespace(identity=IDENTITY, tracks=Mock(side_effect=AssertionError))
+    plan = disk.preview_mounted(source, sync.Scope("all", "All"), volume, source_tracks=tracks)
+    assert plan.device == SERIAL
+    assert plan.owned == {name("1")}
+    assert plan.matched == {name("3")}
+    assert plan.additions == (tracks[1],)
+    source.tracks.assert_not_called()
+
+
+def test_mounted_apply_rechecks_target_and_inventory(mounted_player, tmp_path, monkeypatch):
+    root, volume = mounted_player
+    folder, source, plan = jellyfin_plan(tmp_path, monkeypatch, root)
+    written = Mock()
+    with pytest.raises(RuntimeError, match="changed after preview"):
+        disk.apply_mounted(source, replace(plan, device="299999"), volume, on_write=written)
+    other = folder / name("5")
+    other.touch()
+    with pytest.raises(RuntimeError, match="changed after preview"):
+        disk.apply_mounted(source, plan, volume, on_write=written)
+    written.assert_not_called()
+    other.unlink()
+    assert disk.apply_mounted(source, plan, volume, on_write=written) == (1, 1)
+    written.assert_called_once_with()
+    assert (folder / name("4")).read_bytes() == b"sample audio"
+    assert not (folder / name("1")).exists()
+
+
+def test_mounted_import_uses_disk_duplicate_index(mounted_player, tmp_path, monkeypatch):
+    root, volume = mounted_player
+    folder = root / "Music/Local"
+    folder.mkdir(parents=True)
+    (folder / "2.flac").touch()
+    prepared = media(tmp_path)
+    duplicate = tmp_path / "duplicate.flac"
+    duplicate.touch()
+    monkeypatch.setattr(podlink, "prepare_media", lambda *_: [prepared])
+
+    def tags(path):
+        title, number = ("Pilot", 2) if path == duplicate else ("Track 3", 3)
+        return sync.music_tags(title, ["Artist", "Guest"], "Fixture Album", 250, 2, number)
+
+    monkeypatch.setattr(hrlibrary, "_probe_tags", tags)
+    events = []
+    written = Mock()
+    result = disk.import_mounted(volume, [duplicate, prepared.source], events.append, True,
+                                 on_write=written)
+    assert [item["source"] for item in result] == [str(prepared.source)]
+    assert [event["state"] for event in events if event["file"] == str(duplicate)] == ["probe", "skip"]
+    assert (root / result[0]["device"].lstrip("/")).read_bytes() == b"sample audio"
+    written.assert_called_once_with()
+
+
+def test_mounted_import_records_write_even_when_fsync_fails(mounted_player, tmp_path, monkeypatch):
+    root, volume = mounted_player
+    folder = root / "Music/PodLink"
+    folder.mkdir(parents=True)
+    prepared = media(tmp_path)
+    monkeypatch.setattr(podlink, "prepare_media", lambda *_: [prepared])
+    monkeypatch.setattr(hrlibrary, "_probe_tags", lambda _: None)
+    monkeypatch.setattr(disk.os, "fsync", Mock(side_effect=OSError("sync failed")))
+    written = Mock()
+    with pytest.raises(OSError, match="sync failed"):
+        disk.import_mounted(volume, [prepared.source], None, False, on_write=written)
+    written.assert_called_once_with()
+    assert list(folder.iterdir()) == []
+
+
+def test_stock_firmware_refuses_media_before_a_mount_or_write(mounted_player):
+    root, volume = mounted_player
+    volume.manufacturer = "Apple Inc."
+    assert disk.disk_player(volume) is None
+    with pytest.raises(RuntimeError, match="Apple 原厂固件"):
+        disk.preview_mounted(None, None, volume)
+    with pytest.raises(RuntimeError, match="Apple 原厂固件"):
+        disk.apply_mounted(None, None, volume)
+    with pytest.raises(RuntimeError, match="Apple 原厂固件"):
+        disk.import_mounted(volume, [], None, False)
+    volume.mounted.assert_not_called()
+    assert not (root / "Music").exists()
+
+
 def test_refresh_targets_reconnected_player_on_renumbered_tty(monkeypatch):
     from serial.tools import list_ports
 
@@ -345,3 +512,20 @@ def test_refresh_targets_reconnected_player_on_renumbered_tty(monkeypatch):
     serial.assert_called_once_with("/dev/ttyACM2")
     link.send.assert_called_once_with(podlink.TEXT, b"MS1 REFRESH")
     podlink.expect_media.assert_called_once_with(link, b"MS1 QUEUED")
+
+
+def test_mounted_apply_revalidates_local_matches(mounted_player):
+    root, volume = mounted_player
+    local = root / "Music/PodLink/音楽.flac"
+    local.parent.mkdir(parents=True)
+    local.touch()
+    match = sync.music_tags("東京", ["Artist", "Guest"], "Fixture Album", 250, 2, 1)
+    source_track = sync.Track("a", "a", ".flac", name("3"), match)
+    source = SimpleNamespace(identity=IDENTITY, tracks=lambda _: (source_track,))
+    plan = disk.preview_mounted(source, sync.Scope("all", "All"), volume)
+    assert plan.matched == {source_track.name}
+    local.unlink()
+    written = Mock()
+    with pytest.raises(RuntimeError, match="changed after preview"):
+        disk.apply_mounted(source, plan, volume, on_write=written)
+    written.assert_not_called()
