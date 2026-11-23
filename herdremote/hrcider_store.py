@@ -109,6 +109,7 @@ class Planner:
     def __init__(self, cache, ledger, recent=60):
         self.cache, self.ledger, self.recent = cache, ledger, recent
         self.lock = threading.Lock()
+        self.failures = {}
         self.reset()
 
     def reset(self):
@@ -116,6 +117,26 @@ class Planner:
         self.after = ''
         self.offered = {}
         self.done_at = None
+
+    def failed(self, key, tier, all_tiers=False, now=None):
+        now = time.monotonic() if now is None else now
+        pair = (key, None if all_tiers else tier)
+        with self.lock:
+            count, deadline = self.failures.pop(pair, (0, 0))
+            if deadline > now:
+                self.failures[pair] = (count, deadline)
+                return
+            count = min(count + 1, 8)
+            base = 1800 if all_tiers else self.recent
+            self.failures[pair] = (count, now + min(21600, base * 2 ** (count - 1)))
+            if len(self.failures) > 20000:
+                self.failures.pop(next(iter(self.failures)))
+
+    def eligible(self, key, tier, now):
+        return ((key, tier) not in self.offered
+                and self.failures.get((key, tier), (0, 0))[1] <= now
+                and self.failures.get((key, None), (0, 0))[1] <= now
+                and self.wanted(key, tier))
 
     def wanted(self, key, tier):
         if not key or key == '-':
@@ -137,7 +158,7 @@ class Planner:
                 if self.done_at is None:self.done_at = now
                 if now - self.done_at >= self.recent:self.tier, self.after, self.done_at = 0, '', None
             for key in priority:
-                if len(out) < n and (key, 'L') not in self.offered and self.wanted(key, 'L'):
+                if len(out) < n and self.eligible(key, 'L', now):
                     out.append((key, 'L'))
             while len(out) < n and self.tier < len(FILL_ORDER):
                 tier = FILL_ORDER[self.tier]
@@ -152,7 +173,7 @@ class Planner:
                     continue
                 for key in page:
                     self.after = key
-                    if (key, tier) not in self.offered and self.wanted(key, tier):
+                    if self.eligible(key, tier, now):
                         out.append((key, tier))
                         if len(out) == n:
                             break

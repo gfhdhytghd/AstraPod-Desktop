@@ -51,6 +51,8 @@ class Cache:
                 CREATE INDEX IF NOT EXISTS items_art ON items(art);
                 CREATE INDEX IF NOT EXISTS items_name ON items(kind,json_extract(value,'$.title') COLLATE NOCASE,id);
                 CREATE TABLE IF NOT EXISTS templates (art TEXT PRIMARY KEY,url TEXT);
+                CREATE TABLE IF NOT EXISTS rufin_album_art (
+                    source TEXT PRIMARY KEY, scope TEXT NOT NULL, aliases TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS album_tracks (id TEXT PRIMARY KEY, signature TEXT, value TEXT);
                 CREATE TABLE IF NOT EXISTS catalog (song TEXT, id TEXT, PRIMARY KEY(song,id));
                 CREATE INDEX IF NOT EXISTS catalog_id ON catalog(id);
@@ -209,6 +211,19 @@ class Cache:
             for item in items:
                 template=item.get('attributes',{}).get('artwork',{}).get('url','')
                 if template:self.db.execute('INSERT OR REPLACE INTO templates VALUES (?,?)',(art_id(template),template))
+
+    def rufin_album_art(self, source):
+        with self.lock:
+            row = self.db.execute('SELECT scope,aliases FROM rufin_album_art WHERE source=?',
+                                  (source,)).fetchone()
+        return (row[0], json.loads(row[1])) if row else None
+
+    def remember_rufin_album_art(self, source, scope, aliases):
+        raw = json.dumps(aliases, sort_keys=True, separators=(',', ':'))
+        with self.lock, self.db:
+            self.db.execute('''INSERT INTO rufin_album_art VALUES (?,?,?)
+                ON CONFLICT(source) DO UPDATE SET scope=excluded.scope, aliases=excluded.aliases
+                WHERE scope!=excluded.scope OR aliases!=excluded.aliases''', (source, scope, raw))
 
     def get_art(self, key, tier):
         with self.lock:

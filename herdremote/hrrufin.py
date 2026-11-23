@@ -611,6 +611,11 @@ def jarg(value):
     return json.dumps(value, separators=(',', ':'))
 
 
+def library_generation(*parts):
+    digest = hashlib.sha256(json.dumps(parts, sort_keys=True, separators=(',', ':')).encode())
+    return int.from_bytes(digest.digest()[:4], 'big') or 1
+
+
 class RufinLibrary:
     """Native Music tree routes over Rufin's own library lists."""
     COLLECTIONS = {'album': ('/api/albums/tracks', '/api/queue/album', {}),
@@ -624,7 +629,9 @@ class RufinLibrary:
         self.client = client
         self.state = {}
         self.context = None
-        self.generation = 1
+        self.generation = library_generation("rufin-pending-v1")
+        self.native_albums = None
+        self.native_refresh_at = 0.
         self.lock = threading.RLock()
         self.templates = collections.OrderedDict()   # art id -> template
         self.tokens = collections.OrderedDict()      # route hash -> page token JSON
@@ -660,10 +667,10 @@ class RufinLibrary:
                 self.tokens.popitem(last=False)
         return prefix + '/' + key
 
-    def scope(self):
+    def scope(self, *, fresh=False):
         """The source and music folder Rufin has selected (30 s cache)."""
         stamp, value = self.sources
-        if time.monotonic() - stamp < 30 and value:
+        if not fresh and time.monotonic() - stamp < 30 and value:
             return dict(value)
         data = self.client.get('/api/sources')
         value = {}
@@ -769,6 +776,46 @@ class RufinLibrary:
         first = data.get('offset')
         return rows, total, int(first) if isinstance(first, int) else offset
 
+    def refresh(self):
+        if time.monotonic() < self.native_refresh_at:
+            return
+        self.native_refresh_at = time.monotonic() + 15
+        try:
+            scope, rows = self.native_album_catalogue()
+        except (OSError, ValueError, TypeError):
+            return
+        revision = library_generation('rufin-v1', scope, rows)
+        with self.lock:
+            self.native_albums = rows
+            self.generation = revision
+
+    def album_inventory(self):
+        with self.lock:
+            if self.native_albums is None:
+                return None
+            return self.generation, len(self.native_albums), self.album_art_keys(self.native_albums)
+
+    @staticmethod
+    def album_art_keys(rows):
+        return {row['art'] for row in rows if row.get('art') not in (None, '-')}
+
+    def native_album_catalogue(self, scope=None):
+        """Read the same album rows exposed by the unfiltered native route."""
+        if scope is None:
+            scope = self.scope(fresh=True)
+        rows = []
+        expected = None
+        while True:
+            items, total, first = self._list('/api/albums', dict(scope, q=None), len(rows), 50)
+            if (first != len(rows) or not first <= total <= 1000000
+                    or (expected is not None and total != expected)
+                    or (not items and first < total)):
+                raise ValueError('Incomplete Rufin album catalogue')
+            rows.extend(items)
+            if len(rows) >= total:
+                return scope, tuple(rows)
+            expected = total
+
     def collection(self, name):
         """(read endpoint, queue endpoint, params) of a list route, or None."""
         if '/' not in name:
@@ -824,8 +871,12 @@ class RufinLibrary:
         name, args = parsed.path, dict(urllib.parse.parse_qsl(parsed.query))
         if name.startswith('root/'):
             name = ROOT.get(urllib.parse.unquote(name[5:]), 'empty')
-        result = lambda items, total, first=offset: dict(generation=self.generation, offset=first, total=total,
+        with self.lock:
+            generation, albums = self.generation, self.native_albums
+        result = lambda items, total, first=offset: dict(generation=generation, offset=first, total=total,
                                                          stale=bool(stale), items=items)
+        if albums is not None and name == 'albums' and set(args) <= {'format'}:
+            return result(albums[offset:offset + limit], len(albums))
         if name == 'now/lyrics' and args.get('lrc') == '1':
             items = self.lyrics.get(query, args.get('track', ''), offset, self.timed_lyrics, menu_row, duet=args.get('duet') == '1')
             return dict(result(items[offset:offset + limit], len(items)), _lyrics_v1=True)

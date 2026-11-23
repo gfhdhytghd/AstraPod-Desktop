@@ -20,6 +20,7 @@ class LibraryState(QtCore.QObject):
         self.serial = None
         self.summary = None
         self.stock_info = None
+        self.absent_stock = None
         self.stock = False
         self.playlists = ()
         self.tracks: list = []
@@ -52,6 +53,8 @@ class LibraryState(QtCore.QObject):
                                    (device.kind == "podbox-podlink" and device.serial == self.serial))
 
     def device_changed(self, device):
+        if device != self.absent_stock:
+            self.absent_stock = None
         mode = "stock" if self.stock else "podbox-podlink"
         if self.source == "device" and (device.serial != self.serial or device.kind != mode):
             self.source = "cache"
@@ -69,21 +72,30 @@ class LibraryState(QtCore.QObject):
         """Summary first; tracks come from the cache unless the commit moved."""
         if self.loading:
             return
-        self.loading = True
-        self.error = ""
         library = self.library
         device = getattr(library, "device", None)
+        if device is not None and (device.kind == "none" or device == self.absent_stock):
+            return
+        self.loading = True
+        self.error = ""
         session_for_device = getattr(library, "session_for_device", None)
         open_session = session_for_device(authorize=full) if session_for_device else library.session
         self.changed.emit()
 
         def work(job):
+            if device is not None and device.kind == "stock":
+                from hrstockdevice import StockDeviceDisconnected
+
+                try:
+                    with open_session() as session:
+                        job.progress(None, "正在读取 iPod 信息…")
+                        summary, tracks, playlists, info = session.snapshot(library, full=full)
+                        library.remember(session.identity, summary, stock=True)
+                        return session.identity, summary, tracks, playlists, info
+                except StockDeviceDisconnected:
+                    return None
             with open_session() as session:
                 job.progress(None, "正在读取 iPod 信息…")
-                if device is not None and device.kind == "stock":
-                    summary, tracks, playlists, info = session.snapshot(library, full=full)
-                    library.remember(session.identity, summary, stock=True)
-                    return session.identity, summary, tracks, playlists, info
                 summary = session.summary()
                 serial = session.identity
                 tracks = None if full else library.cache.load(serial, summary.commit_id)
@@ -110,7 +122,8 @@ class LibraryState(QtCore.QObject):
                 self.changed.emit()
 
         self.runner.run("正在读取 iPod 资料库…", work,
-                        lambda result: completed(self._loaded, result),
+                        lambda result: completed(self._loaded if result is not None else self._stock_disconnected,
+                                                 result),
                         lambda error: completed(self._failed, error))
 
     def _loaded(self, result) -> None:
@@ -121,6 +134,15 @@ class LibraryState(QtCore.QObject):
         self.art.set_serial(self.art_identity)
         self.art.enabled = True
         self.art.reset_misses()
+        self.changed.emit()
+
+    def _stock_disconnected(self, _result) -> None:
+        self.loading = False
+        self.absent_stock = self.library.device
+        if self.source == "device":
+            self.source = "cache"
+        self.stock_info = None
+        self.art.enabled = False
         self.changed.emit()
 
     def _failed(self, error) -> None:

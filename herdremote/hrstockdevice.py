@@ -193,6 +193,10 @@ def _udisks_filesystem(operation, block, *, authorize, read_only=False):
     hrdisksync.run_host(*command, timeout=60 if authorize else 10)
 
 
+class StockDeviceDisconnected(RuntimeError):
+    """The selected stock iPod disappeared before the volume could be read."""
+
+
 @contextmanager
 def stock_mount(state, *, write=False, authorize=False):
     """Borrow the selected stock volume, mounting it for the operation if needed."""
@@ -203,7 +207,7 @@ def stock_mount(state, *, write=False, authorize=False):
         raise RuntimeError("No Apple stock iPod is selected")
     with _mount_lock:
         if not volume.present() or _recently_ejected(volume):
-            raise RuntimeError("The selected iPod is no longer connected")
+            raise StockDeviceDisconnected("The selected iPod is no longer connected")
         attachment = _attachment(volume)
         if write and volume.filesystem != "vfat":
             raise RuntimeError("Stock iPod writes require a FAT-formatted iPod")
@@ -218,7 +222,9 @@ def stock_mount(state, *, write=False, authorize=False):
             root = volume.mounted()[1]
             info = root.stat()
             number = f"{os.major(info.st_dev)}:{os.minor(info.st_dev)}"
-            if not volume.present() or number != volume.number:
+            if not volume.present():
+                raise StockDeviceDisconnected("The selected iPod is no longer connected")
+            if number != volume.number:
                 raise RuntimeError("The selected iPod mount changed")
             read_only = bool(os.statvfs(root).f_flag & os.ST_RDONLY)
             if (owned or write) and read_only != (not write):

@@ -93,6 +93,20 @@ class PlannerTests(Base):
         led.cache.db.execute('DELETE FROM ipod_art');                     # player lost everything
         self.assertEqual(pl.next(5,now=3),[]);self.assertTrue(pl.next(5,now=200))
 
+    def test_failed_capped_variant_backs_off_all_tiers_across_planner_reset(self):
+        _, planner = self.planner()
+        key = self.ids[0]
+        planner.failed(key, 'XS', all_tiers=True, now=1)
+        planner.reset()
+        self.assertEqual(planner.next(4, priority=[key], keys=[key], now=1800), [])
+        planner.reset()
+        self.assertEqual(len(planner.next(4, priority=[key], keys=[key], now=1801)), 4)
+        planner.failed(key, 'M', all_tiers=True, now=1802)
+        planner.reset()
+        self.assertEqual(planner.next(4, priority=[key], keys=[key], now=5401), [])
+        planner.reset()
+        self.assertEqual(len(planner.next(4, priority=[key], keys=[key], now=5402)), 4)
+
     def test_fu30_completion_requires_rendered_crc_and_device_inventory(self):
         led,pl=self.planner()
         self.assertEqual(pl.progress(),(0,36,0))

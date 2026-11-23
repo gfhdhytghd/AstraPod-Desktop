@@ -172,17 +172,43 @@ def test_index_worker_retries_after_fault_and_stops_interruptibly(bridge,caplog)
 
 
 def test_page_worker_sends_failed_page_then_handles_next_job(bridge,caplog):
-    bridge.pages=queue.Queue(2)
-    for req in (1,2):bridge.pages.put((1,req,0,10,'recent',bridge.page_token))
+    for req in (1,2):bridge.command(f'cq\t1\t{req}\t0\t10\trecent'.encode())
     def page(*args,**kwargs):
         if bridge.pages.qsize():raise RuntimeError('private')
-        bridge.stop.set();return dict(generation=0,offset=0,total=0,stale=False,items=[])
+        bridge.stop.set();return dict(generation=bridge.cache.generation,offset=0,total=0,stale=False,items=[])
     bridge.library.page=page
     run_thread(bridge,'_pages')
     frames=[entry[5] for entry in bridge.scheduler.heap]
     assert any(f.startswith(b'CL\t1\t1\t') for f in frames)
     assert any(f.startswith(b'CL\t1\t2\t') for f in frames)
     assert caplog.text.count('Cider worker exception')==1
+
+
+def test_page_worker_keeps_inflight_and_other_request_replies(bridge):
+    blocked, resume = threading.Event(), threading.Event()
+
+    def page(query, offset, limit, stale):
+        if offset == 0:
+            blocked.set()
+            assert resume.wait(2)
+        if offset == 2:
+            bridge.stop.set()
+        return dict(generation=bridge.cache.generation, offset=offset, total=3,
+                    stale=False, items=[])
+
+    bridge.library.page = page
+    bridge.command(b'cq\t1\t11\t0\t1\talbums')
+    worker = threading.Thread(target=bridge._pages)
+    worker.start()
+    try:
+        assert blocked.wait(2)
+        bridge.command(b'cq\t1\t12\t1\t1\talbums')
+        bridge.command(b'cq\t1\t13\t2\t1\talbums')
+    finally:
+        resume.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert [frame[5].split(b'\t')[2] for frame in sorted(bridge.scheduler.heap)] == [b'11', b'12', b'13']
 
 
 def test_control_worker_never_replays_unexpected_failure_and_sends_failure_ack(bridge,caplog):
