@@ -3,8 +3,10 @@
 import argparse
 from dataclasses import dataclass
 import errno
+import json
 from pathlib import Path
 import re
+import secrets
 import shlex
 import struct
 import sys
@@ -16,6 +18,12 @@ import usb.core
 
 COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4, "open-bench": 5}
 REQUEST, INDEX = 0x5D, 0x4951
+SETTINGS_INDEX = 0x4953
+SETTINGS_REQUESTS = {"settings-tree": 1, "settings-get": 2,
+                     "settings-set": 3, "settings-action": 4}
+SETTINGS_OUT_SIZE = 704
+SETTINGS_PAGE_SIZE = 128
+SETTINGS_HEADER = struct.Struct("<IH")
 IPOD_VENDOR, IPOD_PRODUCT = 0x05AC, 0x1261
 EP0_STALL_DELAYS = (.05, .10, .20, .25, .25, .25, .25, .25)
 RECORD_START = {"line-in": 6, "mic": 7}
@@ -230,7 +238,165 @@ def debug_names(player):
         yield index, name.decode("utf-8", errors="replace")
 
 
-def execute(serial, action, argument=None):
+def settings_exchange(player, command, body):
+    cookie = secrets.randbelow(0xFFFFFFFF) + 1
+    payload = struct.pack("<I", cookie) + body
+    if len(payload) > SETTINGS_OUT_SIZE:
+        raise ValueError(f"Settings request exceeds {SETTINGS_OUT_SIZE} bytes including the header")
+    try:
+        written = ep0_transfer(player, 0x40, REQUEST,
+                               SETTINGS_REQUESTS[command], SETTINGS_INDEX, payload)
+    except usb.core.USBError as error:
+        if error.errno == errno.EPIPE:
+            raise RuntimeError("Player rejected the Settings request (busy or unsupported)") from error
+        raise
+    if written != len(payload):
+        raise RuntimeError("Short PodLink Shell Settings write")
+
+    def read_page(page):
+        data = bytes(ep0_transfer(player, 0xC0, REQUEST, page,
+                                  SETTINGS_INDEX, SETTINGS_PAGE_SIZE))
+        if len(data) != SETTINGS_PAGE_SIZE:
+            raise RuntimeError("Short PodLink Shell Settings page")
+        return SETTINGS_HEADER.unpack_from(data), data[SETTINGS_HEADER.size:]
+
+    deadline = time.monotonic() + 35
+    while time.monotonic() < deadline:
+        header, chunk = read_page(0)
+        if header[0] == cookie:
+            break
+        time.sleep(.01)
+    else:
+        raise RuntimeError("Timed out waiting for Settings reply")
+
+    length = header[1]
+    if not length:
+        raise RuntimeError("Empty PodLink Shell Settings reply")
+    page_length = len(chunk)
+    reply = bytearray(chunk)
+    for page, _ in enumerate(range(page_length, length, page_length), 1):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Timed out reading Settings reply")
+        next_header, chunk = read_page(page)
+        if next_header != header:
+            raise RuntimeError("Settings reply changed during transfer")
+        reply.extend(chunk)
+    try:
+        result = json.loads(reply[:length].decode("utf-8"))
+    except ValueError as error:
+        raise RuntimeError("Invalid PodLink Shell Settings JSON") from error
+    if isinstance(result, dict) and "error" in result:
+        raise RuntimeError(f"{command}: {result['error']}")
+    return result
+
+
+def settings_row(result):
+    if (not isinstance(result, dict)
+            or result.get("kind") not in ("menu", "setting", "action")
+            or not isinstance(result.get("id"), str) or not result["id"]
+            or not isinstance(result.get("label"), str)
+            or not isinstance(result.get("path"), list)
+            or not result["path"]
+            or not all(isinstance(part, str) for part in result["path"])):
+        raise RuntimeError("Invalid PodLink Shell Settings row")
+    return result
+
+
+def settings_rows(player):
+    for ordinal in range(65536):
+        result = settings_exchange(player, "settings-tree", struct.pack("<H", ordinal))
+        if result is None:
+            return
+        yield settings_row(result)
+    raise RuntimeError("Settings tree did not terminate")
+
+
+def settings_action_id(rows, selector):
+    actions = [row for row in rows if row["kind"] == "action"]
+    folded = selector.casefold()
+    matches = [row for row in actions if row["id"] == selector]
+    if not matches:
+        matches = [row for row in actions if " / ".join(row["path"]).casefold() == folded]
+    if not matches:
+        matches = [row for row in actions if row["label"].casefold() == folded]
+    if not matches:
+        raise RuntimeError("Unknown Settings action")
+    if len(matches) != 1:
+        paths = ", ".join(f"{' / '.join(row['path'])} [{row['id']}]" for row in matches)
+        raise RuntimeError(f"Ambiguous Settings action. Use a full path or ID. Matches: {paths}")
+    return matches[0]["id"]
+
+
+def print_settings_row(row, indent=0):
+    name = row["label"]
+    if row.get("cfg") is not None:
+        value = json.dumps(row.get("value"), ensure_ascii=False)
+        name += f" ({row['cfg']}) = {value}"
+        fields = ("type", "allowed", "values", "min", "max", "step", "unit",
+                  "decimals", "max_bytes", "format", "writable")
+        details = [f"{field}={row[field]}" for field in fields if row.get(field) is not None]
+        if details:
+            name += f" [{', '.join(details)}]"
+    if row["kind"] == "action":
+        name += f" [action ID: {row['id']}]"
+    if row.get("visible") is False:
+        name += " [hidden]"
+    if row.get("available") is False:
+        name += " [unavailable]"
+    print("  " * indent + name)
+
+
+def execute_settings(serial, command, argument, value, yes, json_output):
+    if command == "settings-action" and not yes:
+        raise ValueError("settings-action requires --yes")
+    if command != "settings-action" and yes:
+        raise ValueError("--yes applies to settings-action")
+    if command == "settings-tree":
+        if argument is not None or value is not None:
+            raise ValueError("settings-tree takes no arguments")
+    elif not argument:
+        raise ValueError(f"{command} requires a Settings selector")
+    if command == "settings-set":
+        if value is None:
+            raise ValueError("settings-set requires a cfg name and value")
+        if ":" in argument or any(char in argument + value for char in "\0\r\n"):
+            raise ValueError("Provide one cfg name and one single-line value")
+    elif value is not None:
+        raise ValueError(f"{command} takes at most one argument")
+
+    player = find_player(serial)
+    if command == "settings-tree":
+        rows = list(settings_rows(player))
+        if json_output:
+            print(json.dumps(rows, ensure_ascii=False))
+        else:
+            for row in rows:
+                print_settings_row(row, len(row["path"]) - 1)
+        return
+    if command == "settings-action":
+        action_id = settings_action_id(settings_rows(player), argument)
+        result = settings_exchange(player, command, b"\1" + action_id.encode("utf-8"))
+        if result != {"status": "opened"}:
+            raise RuntimeError("Invalid PodLink Shell Settings action reply")
+        print(json.dumps(result) if json_output else "Settings action opened on the player")
+        return
+
+    body = f"{argument}: {value}" if command == "settings-set" else argument
+    row = settings_row(settings_exchange(player, command, body.encode("utf-8")))
+    if not isinstance(row.get("cfg"), str) or not row["cfg"]:
+        raise RuntimeError("Unexpected PodLink Shell setting result")
+    if json_output:
+        print(json.dumps(row, ensure_ascii=False))
+    else:
+        print_settings_row(row)
+
+
+def execute(serial, action, argument=None, *, value=None, yes=False, json_output=False):
+    if action in SETTINGS_REQUESTS:
+        execute_settings(serial, action, argument, value, yes, json_output)
+        return
+    if value is not None or yes or json_output:
+        raise ValueError("Extra value, --yes and --json apply to Settings commands")
     player = find_player(serial)
     if action == "plugin-status":
         print(plugin_status(player))
@@ -318,21 +484,30 @@ def execute(serial, action, argument=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--serial", required=True, help="USB serial number of the iPod")
     actions = ("status", "debug-list", "debug", *COMMANDS,
                "record-info", "record-start", "record-stop", "record-fetch",
-               "plugin-launch", "plugin-status", "plugin-exit", "screenshot")
+               "plugin-launch", "plugin-status", "plugin-exit", "screenshot",
+               *SETTINGS_REQUESTS)
     parser.add_argument("command", nargs="?", choices=actions)
     parser.add_argument("name", nargs="?",
-                        help="Debug label, plugin name, recording source or output file")
+                        help="Debug label, Settings selector, plugin name, recording source or output file")
+    parser.add_argument("value", nargs="?", help="settings-set value in config.cfg syntax")
     parser.add_argument("--format", choices=("wav",), default="wav",
                         help="record-start format (default: wav)")
-    args = parser.parse_args()
+    parser.add_argument("--yes", action="store_true", help="Confirm a Settings action")
+    parser.add_argument("--json", action="store_true", help="Print Settings results as JSON")
+    args = parser.parse_intermixed_args()
     failures = (RuntimeError, OSError, ValueError, struct.error)
+
+    def execute_args(parsed):
+        execute(parsed.serial, parsed.command, parsed.name, value=parsed.value,
+                yes=parsed.yes, json_output=parsed.json)
+
     if args.command:
         try:
-            execute(args.serial, args.command, args.name)
+            execute_args(args)
         except failures as error:
             parser.exit(1, f"{error}\n")
         return
@@ -347,7 +522,13 @@ def main():
             if words[0] not in actions:
                 print("Unknown command")
                 continue
-            execute(args.serial, words[0], " ".join(words[1:]) or None)
+            if words[0] in SETTINGS_REQUESTS:
+                try:
+                    execute_args(parser.parse_intermixed_args(["--serial", args.serial, *words]))
+                except SystemExit:
+                    continue
+            else:
+                execute(args.serial, words[0], " ".join(words[1:]) or None)
         except (EOFError, KeyboardInterrupt):
             print()
             return
