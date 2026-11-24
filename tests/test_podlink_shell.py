@@ -283,3 +283,68 @@ def test_settings_cli_requires_full_confirmation_option(settings_player, monkeyp
         shell.main()
     assert error.value.code == 2
     assert not settings_player.commands
+
+
+class PlaybackPlayer(Player):
+    def __init__(self):
+        super().__init__(1)
+        self.operation = 0
+        self.error = 0
+        self.path = "/Music/世界.m4a".encode()
+
+    def ctrl_transfer(self, direction, request, value, index, data, *, timeout):
+        if index != 0x4954:
+            return super().ctrl_transfer(direction, request, value, index, data, timeout=timeout)
+        assert (request, timeout) == (0x5D, 1000)
+        if direction == 0x40:
+            self.commands.append((value, data))
+            self.operation = value
+            return len(data)
+        assert (direction, value, data) == (0xC0, 0, 328)
+        return struct.pack("<IIIi6Ii24s260s", 1, len(self.commands), self.operation,
+                           self.error, 1, 6237, 50000, 21, 48000, 24, 0, b"ALAC",
+                           self.path)
+
+
+def test_playback_commands_and_status(monkeypatch, capsys):
+    player = PlaybackPlayer()
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    shell.execute("serial", "play", player.path.decode(), start_ms=1000)
+    shell.execute("serial", "open-lyrics")
+    shell.execute("serial", "seek", "6237")
+    shell.execute("serial", "next")
+    shell.execute("serial", "prev")
+    assert player.commands == [
+        (1, struct.pack("<I", 1000) + player.path),
+        (5, b""), (2, struct.pack("<I", 6237)), (3, b""), (4, b""),
+    ]
+    capsys.readouterr()
+    shell.execute("serial", "playback-status", json_output=True)
+    status = json.loads(capsys.readouterr().out)
+    assert (status["state"], status["path"], status["codec"]) == (
+        "playing", player.path.decode(), "ALAC"
+    )
+    assert (status["elapsed_ms"], status["length_ms"], status["frequency_hz"],
+            status["bits_per_sample"], status["playback_error"]) == (6237, 50000, 48000, 24, 0)
+
+
+def test_playback_validation_and_firmware_error(monkeypatch):
+    player = PlaybackPlayer()
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    with pytest.raises(ValueError, match="absolute iPod path"):
+        shell.execute("serial", "play", "Music/track.m4a")
+    with pytest.raises(ValueError, match="Playback position"):
+        shell.execute("serial", "seek", "-1")
+    assert not player.commands
+    player.error = 2
+    with pytest.raises(RuntimeError, match="play: file not found"):
+        shell.execute("serial", "play", "/Music/absent.m4a")
+
+
+def test_log_fetch_borrows_existing_download(monkeypatch):
+    calls = []
+    monkeypatch.setattr(shell, "record_fetch", lambda *args: calls.append(args))
+    shell.execute("serial", "log-fetch", "/.rockbox/crumbs-last.txt", value="crumbs.txt")
+    assert calls == [("serial", "/.rockbox/crumbs-last.txt", "crumbs.txt")]

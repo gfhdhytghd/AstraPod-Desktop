@@ -18,6 +18,11 @@ import usb.core
 
 COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4, "open-bench": 5}
 REQUEST, INDEX = 0x5D, 0x4951
+PLAYBACK_INDEX = 0x4954
+PLAYBACK_COMMANDS = {"play": 1, "seek": 2, "next": 3, "prev": 4, "open-lyrics": 5}
+PLAYBACK_STATUS = struct.Struct("<IIIi6Ii24s260s")
+PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playlist",
+                           34: "seek outside track", 61: "no active playback"}
 SETTINGS_INDEX = 0x4953
 SETTINGS_REQUESTS = {"settings-tree": 1, "settings-get": 2,
                      "settings-set": 3, "settings-action": 4}
@@ -97,6 +102,48 @@ def read_control(player, value, length):
 def write_control(player, value, data=b""):
     if ep0_transfer(player, 0x40, REQUEST, value, INDEX, data) != len(data):
         raise RuntimeError(f"Short PodLink Shell write for value {value:#x}")
+
+
+def playback_status(player):
+    data = bytes(ep0_transfer(player, 0xC0, REQUEST, 0, PLAYBACK_INDEX, PLAYBACK_STATUS.size))
+    version, sequence, operation, command_error, flags, elapsed, length, codec, rate, bits, error, label, path = (
+        PLAYBACK_STATUS.unpack(data)
+    )
+    if version != 1:
+        raise RuntimeError(f"Unsupported playback status version {version}")
+    state = "paused" if flags & 2 else "playing" if flags & 1 else "stopped"
+    if flags & 4:
+        state = "recording"
+    return dict(state=state, flags=flags, path=path.split(b"\0", 1)[0].decode("utf-8", "replace"),
+                elapsed_ms=elapsed, length_ms=length, codec_id=codec,
+                codec=label.split(b"\0", 1)[0].decode("utf-8", "replace"),
+                frequency_hz=rate, bits_per_sample=bits, playback_error=error,
+                sequence=sequence, operation=operation, command_error=command_error)
+
+
+def playback_payload(action, argument, start_ms):
+    if action == "play":
+        path = argument.encode("utf-8")
+        if not path.startswith(b"/") or not 2 <= len(path) <= 259 or any(
+            ch in path for ch in (b"\0", b"\r", b"\n")
+        ):
+            raise ValueError("play requires an absolute iPod path of 2 to 259 UTF-8 bytes")
+        return struct.pack("<I", playback_ms(start_ms if start_ms is not None else 0)) + path
+    if action == "seek":
+        return struct.pack("<I", playback_ms(argument))
+    if argument is not None:
+        raise ValueError(f"{action} takes no argument")
+    return b""
+
+
+def playback_ms(value):
+    try:
+        position = int(value)
+        if 0 <= position <= 0x7fffffff:
+            return position
+    except (ValueError, TypeError):
+        pass
+    raise ValueError("Playback position must be an integer from 0 to 2147483647 ms")
 
 
 def plugin_status(player):
@@ -391,12 +438,30 @@ def execute_settings(serial, command, argument, value, yes, json_output):
         print_settings_row(row)
 
 
-def execute(serial, action, argument=None, *, value=None, yes=False, json_output=False):
+def execute(serial, action, argument=None, *, value=None, yes=False, json_output=False,
+            start_ms=None):
+    if start_ms is not None and (action != "play" or argument is None):
+        raise ValueError("--start-ms requires play with an iPod path")
     if action in SETTINGS_REQUESTS:
         execute_settings(serial, action, argument, value, yes, json_output)
         return
-    if value is not None or yes or json_output:
-        raise ValueError("Extra value, --yes and --json apply to Settings commands")
+    if action == "log-fetch":
+        if not argument or not argument.startswith("/") or not value or yes or json_output:
+            raise ValueError("log-fetch requires an absolute iPod log path and a local output path")
+        record_fetch(serial, argument, value)
+        print(f"log-fetch: {argument} -> {value}")
+        return
+    if value is not None or yes or (json_output and action != "playback-status"):
+        raise ValueError("Unexpected argument, --yes or --json")
+    if action == "playback-status":
+        if argument is not None:
+            raise ValueError("playback-status takes no argument")
+        result = playback_status(find_player(serial))
+        print(json.dumps(result, ensure_ascii=False) if json_output else
+              " ".join(f"{key}={value!r}" for key, value in result.items()))
+        return
+    parameterized = action in PLAYBACK_COMMANDS and (action not in COMMANDS or argument is not None)
+    payload = playback_payload(action, argument, start_ms) if parameterized else b""
     player = find_player(serial)
     if action == "plugin-status":
         print(plugin_status(player))
@@ -456,10 +521,16 @@ def execute(serial, action, argument=None, *, value=None, yes=False, json_output
         if record_status(player)[1] != RECORD_ACTIVE:
             raise RuntimeError("No shell recording is active")
         command, expected_record_state = RECORD_STOP, RECORD_READY
+    elif parameterized:
+        command = PLAYBACK_COMMANDS[action]
     else:
         command = COMMANDS[action]
     address = (player.bus, player.address)
-    ep0_transfer(player, 0x40, REQUEST, command, INDEX, b"")
+    index = PLAYBACK_INDEX if parameterized else INDEX
+    transferred = ep0_transfer(player, 0x40, REQUEST, command, index, payload)
+    if parameterized and transferred != len(payload):
+        raise RuntimeError("Short PodLink Shell command write")
+    expected_sequence = (initial[2] + 1) & 0xFFFFFFFF
     deadline = time.monotonic() + 35
     while time.monotonic() < deadline:
         time.sleep(0.2)
@@ -470,7 +541,19 @@ def execute(serial, action, argument=None, *, value=None, yes=False, json_output
             reply = status(current)
         except (RuntimeError, usb.core.USBError):
             continue
-        if action == "reboot" or reply[2] == ((initial[2] + 1) & 0xFFFFFFFF):
+        if parameterized:
+            result = playback_status(current)
+            if result["sequence"] == expected_sequence and result["operation"] == command:
+                error = result["command_error"]
+                if error:
+                    detail = PLAYBACK_COMMAND_ERRORS.get(error, f"error {error}")
+                    raise RuntimeError(f"{action}: {detail}")
+                print(f"{action}: processed")
+                return
+            if reply[2] != initial[2] and reply[2] != expected_sequence:
+                raise RuntimeError("Playback result superseded by another shell command")
+            continue
+        if action == "reboot" or reply[2] == expected_sequence:
             if expected_record_state is not None:
                 _, state, path = record_status(current)
                 if state != expected_record_state:
@@ -487,23 +570,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--serial", required=True, help="USB serial number of the iPod")
     actions = ("status", "debug-list", "debug", *COMMANDS,
+               "next", "prev", "open-lyrics", "playback-status", "log-fetch",
                "record-info", "record-start", "record-stop", "record-fetch",
                "plugin-launch", "plugin-status", "plugin-exit", "screenshot",
                *SETTINGS_REQUESTS)
     parser.add_argument("command", nargs="?", choices=actions)
     parser.add_argument("name", nargs="?",
-                        help="Debug label, Settings selector, plugin name, recording source or output file")
-    parser.add_argument("value", nargs="?", help="settings-set value in config.cfg syntax")
+                        help="Debug label, Settings selector, plugin name, path or seek position")
+    parser.add_argument("value", nargs="?", help="settings-set value or log-fetch output path")
+    parser.add_argument("--start-ms", type=int, help="Starting position for play with a path")
     parser.add_argument("--format", choices=("wav",), default="wav",
                         help="record-start format (default: wav)")
     parser.add_argument("--yes", action="store_true", help="Confirm a Settings action")
-    parser.add_argument("--json", action="store_true", help="Print Settings results as JSON")
+    parser.add_argument("--json", action="store_true", help="Print Settings or playback status as JSON")
     args = parser.parse_intermixed_args()
     failures = (RuntimeError, OSError, ValueError, struct.error)
 
     def execute_args(parsed):
         execute(parsed.serial, parsed.command, parsed.name, value=parsed.value,
-                yes=parsed.yes, json_output=parsed.json)
+                yes=parsed.yes, json_output=parsed.json, start_ms=parsed.start_ms)
 
     if args.command:
         try:
@@ -522,7 +607,9 @@ def main():
             if words[0] not in actions:
                 print("Unknown command")
                 continue
-            if words[0] in SETTINGS_REQUESTS:
+            if words[0] in SETTINGS_REQUESTS or words[0] in PLAYBACK_COMMANDS or words[0] in (
+                "playback-status", "log-fetch"
+            ):
                 try:
                     execute_args(parser.parse_intermixed_args(["--serial", args.serial, *words]))
                 except SystemExit:
