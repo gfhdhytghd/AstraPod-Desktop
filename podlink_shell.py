@@ -23,6 +23,17 @@ PLAYBACK_COMMANDS = {"play": 1, "seek": 2, "next": 3, "prev": 4, "open-lyrics": 
 PLAYBACK_STATUS = struct.Struct("<IIIi6Ii24s260s")
 PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playlist",
                            34: "seek outside track", 61: "no active playback"}
+LCD_INDEX = 0x4955
+LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "coverflow-60hz": 3, "lcd-diag": 4}
+LCD_TIMINGS = {f"0x{timing:02x}": timing for timing in (0x33, 0x22, 0x21, 0x12, 0x11)}
+LCD_SWITCH = {"off": 0, "on": 1, "get": 2}
+LCD_REPLY = struct.Struct("<4I")
+LCD_ERRORS = {5: "could not save lcd-te-diag.txt",
+              16: "LCD asleep or busy; retry with the LCD awake",
+              61: "no usable LCD sync source", 128: "PodLink disconnected",
+              134: "requires LCD type 1"}
+LCD_DIAG_PATH = "/.rockbox/lcd-te-diag.txt"
+UI_PERF_PATH = "/.rockbox/ui-perf.txt"
 SETTINGS_INDEX = 0x4953
 SETTINGS_REQUESTS = {"settings-tree": 1, "settings-get": 2,
                      "settings-set": 3, "settings-action": 4}
@@ -438,6 +449,51 @@ def execute_settings(serial, command, argument, value, yes, json_output):
         print_settings_row(row)
 
 
+def execute_lcd(serial, action, argument):
+    if action == "lcd-timing":
+        if argument is not None and argument not in LCD_TIMINGS:
+            raise ValueError("lcd-timing accepts " + ", ".join(LCD_TIMINGS))
+        option = LCD_TIMINGS.get(argument, 0)
+    elif action == "lcd-diag":
+        if argument is not None:
+            raise ValueError("lcd-diag takes no argument")
+        option = 0
+    else:
+        if argument not in LCD_SWITCH:
+            raise ValueError(f"{action} requires on, off or get")
+        option = LCD_SWITCH[argument]
+
+    player = find_player(serial)
+    cookie = secrets.randbelow(0xFFFFFFFF) + 1
+    payload = struct.pack("<IB", cookie, option)
+    if ep0_transfer(player, 0x40, REQUEST, LCD_COMMANDS[action], LCD_INDEX,
+                    payload) != len(payload):
+        raise RuntimeError("Short PodLink Shell LCD command write")
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        data = bytes(ep0_transfer(player, 0xC0, REQUEST, 0, LCD_INDEX, LCD_REPLY.size))
+        if len(data) != LCD_REPLY.size:
+            raise RuntimeError("Short PodLink Shell LCD reply")
+        version, completed_cookie, error, value = LCD_REPLY.unpack(data)
+        if version != 1:
+            raise RuntimeError(f"Unsupported PodLink Shell LCD reply version {version}")
+        if completed_cookie != cookie:
+            time.sleep(0.05)
+            continue
+        if error:
+            detail = LCD_ERRORS.get(error, f"error {error}")
+            raise RuntimeError(f"{action}: {detail}")
+        if action == "lcd-diag":
+            print(f"lcd-diag: saved {LCD_DIAG_PATH}")
+        elif action == "lcd-timing":
+            print(f"LCD_PHTIME=0x{value:02x}")
+        else:
+            print(f"{action}: {'on' if value else 'off'}")
+        return
+    raise RuntimeError(f"{action}: timed out waiting for the firmware result")
+
+
 def execute(serial, action, argument=None, *, value=None, yes=False, json_output=False,
             start_ms=None):
     if start_ms is not None and (action != "play" or argument is None):
@@ -453,6 +509,15 @@ def execute(serial, action, argument=None, *, value=None, yes=False, json_output
         return
     if value is not None or yes or (json_output and action != "playback-status"):
         raise ValueError("Unexpected argument, --yes or --json")
+    if action in LCD_COMMANDS:
+        execute_lcd(serial, action, argument)
+        return
+    if action == "ui-perf":
+        if not argument:
+            raise ValueError("ui-perf requires a local output path")
+        record_fetch(serial, UI_PERF_PATH, argument)
+        print(f"ui-perf: {UI_PERF_PATH} -> {argument}")
+        return
     if action == "playback-status":
         if argument is not None:
             raise ValueError("playback-status takes no argument")
@@ -573,10 +638,10 @@ def main():
                "next", "prev", "open-lyrics", "playback-status", "log-fetch",
                "record-info", "record-start", "record-stop", "record-fetch",
                "plugin-launch", "plugin-status", "plugin-exit", "screenshot",
-               *SETTINGS_REQUESTS)
+               *SETTINGS_REQUESTS, *LCD_COMMANDS, "ui-perf")
     parser.add_argument("command", nargs="?", choices=actions)
     parser.add_argument("name", nargs="?",
-                        help="Debug label, Settings selector, plugin name, path or seek position")
+                        help="Debug label, Settings selector, plugin name, path, seek position or LCD option")
     parser.add_argument("value", nargs="?", help="settings-set value or log-fetch output path")
     parser.add_argument("--start-ms", type=int, help="Starting position for play with a path")
     parser.add_argument("--format", choices=("wav",), default="wav",
@@ -608,7 +673,7 @@ def main():
                 print("Unknown command")
                 continue
             if words[0] in SETTINGS_REQUESTS or words[0] in PLAYBACK_COMMANDS or words[0] in (
-                "playback-status", "log-fetch"
+                "playback-status", "log-fetch", *LCD_COMMANDS, "ui-perf"
             ):
                 try:
                     execute_args(parser.parse_intermixed_args(["--serial", args.serial, *words]))

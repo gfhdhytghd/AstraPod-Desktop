@@ -348,3 +348,70 @@ def test_log_fetch_borrows_existing_download(monkeypatch):
     monkeypatch.setattr(shell, "record_fetch", lambda *args: calls.append(args))
     shell.execute("serial", "log-fetch", "/.rockbox/crumbs-last.txt", value="crumbs.txt")
     assert calls == [("serial", "/.rockbox/crumbs-last.txt", "crumbs.txt")]
+
+
+class LCDPlayer:
+    def __init__(self, value=0, error=0):
+        self.value = value
+        self.error = error
+        self.writes = []
+        self.reads = 0
+
+    def ctrl_transfer(self, direction, request, value, index, data, *, timeout):
+        assert (request, index, timeout) == (0x5D, 0x4955, 1000)
+        if direction == 0x40:
+            self.cookie, argument = struct.unpack("<IB", data)
+            assert self.cookie
+            self.writes.append((value, argument))
+            return len(data)
+        assert (direction, value, data) == (0xC0, 0, 16)
+        self.reads += 1
+        if self.reads == 1:
+            return struct.pack("<4I", 1, self.cookie ^ 1, 5, 0)
+        return struct.pack("<4I", 1, self.cookie, self.error, self.value)
+
+
+@pytest.mark.parametrize(("command", "argument", "opcode", "option", "value", "output"), [
+    ("lcd-timing", None, 1, 0, 0x33, "LCD_PHTIME=0x33"),
+    ("lcd-timing", "0x21", 1, 0x21, 0x21, "LCD_PHTIME=0x21"),
+    ("lcd-te-sync", "on", 2, 1, 1, "lcd-te-sync: on"),
+    ("lcd-te-sync", "get", 2, 2, 0, "lcd-te-sync: off"),
+    ("coverflow-60hz", "off", 3, 0, 0, "coverflow-60hz: off"),
+    ("lcd-diag", None, 4, 0, 0, "lcd-diag: saved /.rockbox/lcd-te-diag.txt"),
+])
+def test_lcd_command_waits_for_its_result(monkeypatch, capsys, command, argument,
+                                          opcode, option, value, output):
+    player = LCDPlayer(value)
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    shell.execute("serial", command, argument)
+    assert player.writes == [(opcode, option)]
+    assert player.reads == 2
+    assert capsys.readouterr().out.strip() == output
+
+
+@pytest.mark.parametrize(("command", "argument"), [
+    ("lcd-timing", "0x00"),
+    ("lcd-te-sync", "toggle"),
+    ("coverflow-60hz", None),
+    ("lcd-diag", "extra"),
+])
+def test_lcd_rejects_invalid_options_before_usb(monkeypatch, command, argument):
+    monkeypatch.setattr(shell, "find_player", lambda serial: pytest.fail("unexpected USB lookup"))
+    with pytest.raises(ValueError):
+        shell.execute("serial", command, argument)
+
+
+def test_lcd_diag_reports_write_failure(monkeypatch, capsys):
+    monkeypatch.setattr(shell, "find_player", lambda serial: LCDPlayer(error=5))
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    with pytest.raises(RuntimeError, match="could not save lcd-te-diag.txt"):
+        shell.execute("serial", "lcd-diag")
+    assert capsys.readouterr().out == ""
+
+
+def test_ui_perf_uses_log_fetch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(shell, "record_fetch", lambda *args: calls.append(args))
+    shell.execute("serial", "ui-perf", "capture.txt")
+    assert calls == [("serial", "/.rockbox/ui-perf.txt", "capture.txt")]
