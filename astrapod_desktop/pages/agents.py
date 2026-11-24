@@ -390,7 +390,9 @@ class AgentsPage(Page):
     def open_t3_thread(self) -> None:
         thread = self._selected_thread()
         if thread and thread.get("link"):
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl(thread["link"]))
+            # xdg-open honours the default t3code handler; Qt's openUrl goes
+            # through the portal, which asks when two handlers exist.
+            QtCore.QProcess.startDetached("xdg-open", [thread["link"]])
 
     def _show_herdr(self, state: dict) -> None:
         herdr = state.get("herdr") or {}
