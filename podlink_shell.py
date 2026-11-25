@@ -27,7 +27,8 @@ LCD_INDEX = 0x4955
 LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "lcd-pacing": 3, "lcd-diag": 4,
                 "lcd-dma-burst": 5, "lcd-dma-width": 6, "lcd-boost": 7,
                 "lcd-bench": 8, "lcd-pio": 9, "lcd-async": 11,
-                "lcd-stock-regs": 12, "lcd-te-irq": 13, "lcd-pattern": 14}
+                "lcd-stock-regs": 12, "lcd-te-irq": 13, "lcd-pattern": 14,
+                "lcd-te-offset": 15}
 LCD_TIMINGS = {f"0x{timing:02x}": timing
                for timing in (0x33, 0x22, 0x21, 0x12, 0x11, 0x10, 0x01)}
 LCD_TIMINGS["0x00"] = 0xFF  # Wire value 0 stays the query opcode's argument.
@@ -37,6 +38,7 @@ LCD_BENCH_OPTIONS = {"full": 0, "band": 1}
 LCD_STOCK_MASKS = {"off": 0, "on": 0xF}
 LCD_STOCK_REGS = ("LCD_CON", "LCD+0x88", "LCD+0x7c", "LCD+0x78")
 LCD_TE_IRQ = {"off": 0, "rise": 1, "fall": 2}
+LCD_TE_OFFSET_LIMIT_US = 5000
 LCD_BENCH_DETAILS = struct.Struct("<4I")
 LCD_STOCK_DETAILS = struct.Struct("<9I")
 LCD_SWITCH = {"off": 0, "on": 1, "get": 2}
@@ -495,6 +497,13 @@ def execute_lcd(serial, action, argument):
         if argument not in LCD_TE_IRQ:
             raise ValueError("lcd-te-irq requires off, rise or fall")
         option = LCD_TE_IRQ[argument]
+    elif action == "lcd-te-offset":
+        try:
+            option = int(argument, 10)
+        except (TypeError, ValueError):
+            option = LCD_TE_OFFSET_LIMIT_US + 1
+        if abs(option) > LCD_TE_OFFSET_LIMIT_US:
+            raise ValueError("lcd-te-offset requires an integer from -5000 to 5000 us")
     elif action == "lcd-pattern":
         if argument is not None:
             raise ValueError("lcd-pattern takes no argument")
@@ -536,6 +545,8 @@ def execute_lcd(serial, action, argument):
             print(f"{register}: 0x{before:08x} -> 0x{after:08x}")
     elif action == "lcd-te-irq":
         print(f"lcd-te-irq: {argument}")
+    elif action == "lcd-te-offset":
+        print(f"lcd-te-offset: {option:+d} us")
     elif action == "lcd-pattern":
         print("lcd-pattern: displayed scrolling colour bars")
     else:
@@ -544,7 +555,7 @@ def execute_lcd(serial, action, argument):
 
 def lcd_exchange(player, action, opcode, option, details_format=None):
     cookie = secrets.randbelow(0xFFFFFFFF) + 1
-    payload = struct.pack("<IB", cookie, option)
+    payload = struct.pack("<Ii" if action == "lcd-te-offset" else "<IB", cookie, option)
     if ep0_transfer(player, 0x40, REQUEST, opcode, LCD_INDEX, payload) != len(payload):
         raise RuntimeError("Short PodLink Shell LCD command write")
 
