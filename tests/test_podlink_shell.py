@@ -385,6 +385,7 @@ class LCDPlayer:
     ("lcd-pacing", "off", 3, 0, 0, "lcd-pacing: off"),
     ("lcd-pacing", "get", 3, 2, 1, "lcd-pacing: on"),
     ("lcd-diag", None, 4, 0, 0, "lcd-diag: saved /.rockbox/lcd-te-diag.txt"),
+    ("lcd-diag", "survey", 4, 1, 0, "lcd-diag: saved /.rockbox/lcd-te-diag.txt"),
 ])
 def test_lcd_command_waits_for_its_result(monkeypatch, capsys, command, argument,
                                           opcode, option, value, output):

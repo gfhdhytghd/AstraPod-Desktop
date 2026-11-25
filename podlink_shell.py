@@ -474,9 +474,9 @@ def execute_lcd(serial, action, argument):
             raise ValueError("lcd-bench requires full or band")
         option = LCD_BENCH_OPTIONS[argument]
     elif action == "lcd-diag":
-        if argument is not None:
-            raise ValueError("lcd-diag takes no argument")
-        option = 0
+        if argument not in (None, "survey"):
+            raise ValueError("lcd-diag takes no argument or survey")
+        option = 1 if argument == "survey" else 0
     elif action == "lcd-pacing" and argument == "status":
         option = None
     else:
