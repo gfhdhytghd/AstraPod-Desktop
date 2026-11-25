@@ -26,13 +26,19 @@ PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playl
 LCD_INDEX = 0x4955
 LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "lcd-pacing": 3, "lcd-diag": 4,
                 "lcd-dma-burst": 5, "lcd-dma-width": 6, "lcd-boost": 7,
-                "lcd-bench": 8, "lcd-pio": 9, "lcd-async": 11}
+                "lcd-bench": 8, "lcd-pio": 9, "lcd-async": 11,
+                "lcd-stock-regs": 12, "lcd-te-irq": 13, "lcd-pattern": 14}
 LCD_TIMINGS = {f"0x{timing:02x}": timing
                for timing in (0x33, 0x22, 0x21, 0x12, 0x11, 0x10, 0x01)}
 LCD_TIMINGS["0x00"] = 0xFF  # Wire value 0 stays the query opcode's argument.
 LCD_DMA_OPTIONS = {"lcd-dma-burst": {"get": 0, "1": 1, "4": 4, "8": 8, "16": 16},
                    "lcd-dma-width": {"get": 0, "16": 16, "32": 32}}
 LCD_BENCH_OPTIONS = {"full": 0, "band": 1}
+LCD_STOCK_MASKS = {"off": 0, "on": 0xF}
+LCD_STOCK_REGS = ("LCD_CON", "LCD+0x88", "LCD+0x7c", "LCD+0x78")
+LCD_TE_IRQ = {"off": 0, "rise": 1, "fall": 2}
+LCD_BENCH_DETAILS = struct.Struct("<4I")
+LCD_STOCK_DETAILS = struct.Struct("<9I")
 LCD_SWITCH = {"off": 0, "on": 1, "get": 2}
 LCD_PACE_STATUS = 10  # Argument selects one LCD_PACE_FIELDS entry.
 LCD_PACE_FIELDS = ("period", "divisor", "shown", "missed", "offset", "cost", "dma", "flags")
@@ -460,6 +466,7 @@ def execute_settings(serial, command, argument, value, yes, json_output):
 
 
 def execute_lcd(serial, action, argument):
+    details_format = None
     if action == "lcd-timing":
         if argument is not None and argument not in LCD_TIMINGS:
             raise ValueError("lcd-timing accepts " + ", ".join(LCD_TIMINGS))
@@ -473,6 +480,25 @@ def execute_lcd(serial, action, argument):
         if argument not in LCD_BENCH_OPTIONS:
             raise ValueError("lcd-bench requires full or band")
         option = LCD_BENCH_OPTIONS[argument]
+        details_format = LCD_BENCH_DETAILS
+    elif action == "lcd-stock-regs":
+        option = LCD_STOCK_MASKS.get(argument)
+        if option is None:
+            try:
+                option = int(argument, 16 if argument.startswith(("0x", "0X")) else 10)
+            except (AttributeError, ValueError):
+                option = -1
+        if not 0 <= option <= 0xF:
+            raise ValueError("lcd-stock-regs requires on, off or a mask from 0 to 0xf")
+        details_format = LCD_STOCK_DETAILS
+    elif action == "lcd-te-irq":
+        if argument not in LCD_TE_IRQ:
+            raise ValueError("lcd-te-irq requires off, rise or fall")
+        option = LCD_TE_IRQ[argument]
+    elif action == "lcd-pattern":
+        if argument is not None:
+            raise ValueError("lcd-pattern takes no argument")
+        option = 0
     elif action == "lcd-diag":
         if argument not in (None, "survey"):
             raise ValueError("lcd-diag takes no argument or survey")
@@ -490,20 +516,33 @@ def execute_lcd(serial, action, argument):
         print_pace_status({field: lcd_exchange(player, action, LCD_PACE_STATUS, number)
                            for number, field in enumerate(LCD_PACE_FIELDS)})
         return
-    value = lcd_exchange(player, action, LCD_COMMANDS[action], option)
+    result = lcd_exchange(player, action, LCD_COMMANDS[action], option, details_format)
     if action == "lcd-diag":
         print(f"lcd-diag: saved {LCD_DIAG_PATH}")
     elif action == "lcd-timing":
-        print(f"LCD_PHTIME=0x{value:02x}")
+        print(f"LCD_PHTIME=0x{result:02x}")
     elif action in LCD_DMA_OPTIONS:
-        print(f"{action}: {value}")
+        print(f"{action}: {result}")
     elif action == "lcd-bench":
-        print(f"lcd-bench: {argument} measured")
+        if result == 0:
+            print(f"lcd-bench: {argument} measured")
+        else:
+            frames, dma, elapsed = result
+            print(f"lcd-bench: {argument}, {frames} frames, "
+                  f"mean DMA {dma} us, mean elapsed {elapsed} us")
+    elif action == "lcd-stock-regs":
+        print(f"lcd-stock-regs: mask=0x{option:x}")
+        for register, before, after in zip(LCD_STOCK_REGS, result[:4], result[4:]):
+            print(f"{register}: 0x{before:08x} -> 0x{after:08x}")
+    elif action == "lcd-te-irq":
+        print(f"lcd-te-irq: {argument}")
+    elif action == "lcd-pattern":
+        print("lcd-pattern: displayed scrolling colour bars")
     else:
-        print(f"{action}: {'on' if value else 'off'}")
+        print(f"{action}: {'on' if result else 'off'}")
 
 
-def lcd_exchange(player, action, opcode, option):
+def lcd_exchange(player, action, opcode, option, details_format=None):
     cookie = secrets.randbelow(0xFFFFFFFF) + 1
     payload = struct.pack("<IB", cookie, option)
     if ep0_transfer(player, 0x40, REQUEST, opcode, LCD_INDEX, payload) != len(payload):
@@ -522,8 +561,19 @@ def lcd_exchange(player, action, opcode, option):
             continue
         if error:
             detail = LCD_ERRORS.get(error, f"error {error}")
+            if error == 5 and action in ("lcd-bench", "lcd-pattern"):
+                detail = "no LCD DMA completed"
             raise RuntimeError(f"{action}: {detail}")
-        return value
+        if details_format is None or (action == "lcd-bench" and value == 0):
+            return value
+        data = bytes(ep0_transfer(player, 0xC0, REQUEST, opcode, LCD_INDEX,
+                                  details_format.size))
+        if len(data) != details_format.size:
+            raise RuntimeError(f"{action}: short LCD details")
+        detail_cookie, *details = details_format.unpack(data)
+        if detail_cookie != cookie:
+            raise RuntimeError(f"{action}: stale LCD details")
+        return details
     raise RuntimeError(f"{action}: timed out waiting for the firmware result")
 
 
