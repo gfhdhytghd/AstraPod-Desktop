@@ -26,12 +26,15 @@ PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playl
 LCD_INDEX = 0x4955
 LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "coverflow-60hz": 3, "lcd-diag": 4,
                 "lcd-dma-burst": 5, "lcd-dma-width": 6, "lcd-boost": 7,
-                "lcd-bench": 8, "lcd-pio": 9}
+                "lcd-bench": 8, "lcd-pio": 9, "lcd-dma-dst-burst": 10,
+                "lcd-pattern": 11, "lcd-dma-dst-width": 12}
 LCD_TIMINGS = {f"0x{timing:02x}": timing
                for timing in (0x33, 0x22, 0x21, 0x12, 0x11, 0x10, 0x01)}
 LCD_TIMINGS["0x00"] = 0xFF  # Wire value 0 stays the query opcode's argument.
 LCD_DMA_OPTIONS = {"lcd-dma-burst": {"get": 0, "1": 1, "4": 4, "8": 8, "16": 16},
-                   "lcd-dma-width": {"get": 0, "16": 16, "32": 32}}
+                   "lcd-dma-width": {"get": 0, "16": 16, "32": 32},
+                   "lcd-dma-dst-burst": {"get": 0, "1": 1, "4": 4},
+                   "lcd-dma-dst-width": {"get": 0, "16": 16, "32": 32}}
 LCD_BENCH_OPTIONS = {"full": 0, "band": 1}
 LCD_SWITCH = {"off": 0, "on": 1, "get": 2}
 LCD_REPLY = struct.Struct("<4I")
