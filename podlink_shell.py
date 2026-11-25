@@ -26,7 +26,7 @@ PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playl
 LCD_INDEX = 0x4955
 LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "lcd-pacing": 3, "lcd-diag": 4,
                 "lcd-dma-burst": 5, "lcd-dma-width": 6, "lcd-boost": 7,
-                "lcd-bench": 8, "lcd-pio": 9}
+                "lcd-bench": 8, "lcd-pio": 9, "lcd-async": 11}
 LCD_TIMINGS = {f"0x{timing:02x}": timing
                for timing in (0x33, 0x22, 0x21, 0x12, 0x11, 0x10, 0x01)}
 LCD_TIMINGS["0x00"] = 0xFF  # Wire value 0 stays the query opcode's argument.
