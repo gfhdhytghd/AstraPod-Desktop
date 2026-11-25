@@ -382,7 +382,8 @@ class LCDPlayer:
     ("lcd-pio", "on", 9, 1, 1, "lcd-pio: on"),
     ("lcd-te-sync", "on", 2, 1, 1, "lcd-te-sync: on"),
     ("lcd-te-sync", "get", 2, 2, 0, "lcd-te-sync: off"),
-    ("coverflow-60hz", "off", 3, 0, 0, "coverflow-60hz: off"),
+    ("lcd-pacing", "off", 3, 0, 0, "lcd-pacing: off"),
+    ("lcd-pacing", "get", 3, 2, 1, "lcd-pacing: on"),
     ("lcd-diag", None, 4, 0, 0, "lcd-diag: saved /.rockbox/lcd-te-diag.txt"),
 ])
 def test_lcd_command_waits_for_its_result(monkeypatch, capsys, command, argument,
@@ -403,13 +404,58 @@ def test_lcd_command_waits_for_its_result(monkeypatch, capsys, command, argument
     ("lcd-bench", None),
     ("lcd-pio", "4"),
     ("lcd-te-sync", "toggle"),
-    ("coverflow-60hz", None),
+    ("lcd-pacing", None),
+    ("lcd-pacing", "toggle"),
     ("lcd-diag", "extra"),
 ])
 def test_lcd_rejects_invalid_options_before_usb(monkeypatch, command, argument):
     monkeypatch.setattr(shell, "find_player", lambda serial: pytest.fail("unexpected USB lookup"))
     with pytest.raises(ValueError):
         shell.execute("serial", command, argument)
+
+
+class PaceStatusPlayer(LCDPlayer):
+    def __init__(self, fields):
+        super().__init__()
+        self.fields = fields
+
+    def ctrl_transfer(self, direction, request, value, index, data, *, timeout):
+        if direction == 0x40:
+            self.value = self.fields[data[4]]
+        return super().ctrl_transfer(direction, request, value, index, data, timeout=timeout)
+
+
+def test_lcd_pacing_status_reads_every_field(monkeypatch, capsys):
+    # period, divisor, shown, missed, offset, cost, dma, flags
+    player = PaceStatusPlayer([14934, 2, 118, 3, 1250, 16100, 15800, 0b111])
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    shell.execute("serial", "lcd-pacing", "status")
+    assert player.writes == [(10, field) for field in range(8)]
+    assert capsys.readouterr().out.splitlines() == [
+        "lcd-pacing: on",
+        "period: 14934 us (66.961 Hz, measured TE)",
+        "TE phase: known",
+        "last animation: half rate",
+        "shown: 118 frames",
+        "missed: 3 frames",
+        "wake offset: 1250 us after TE",
+        "cost: 16100 us per frame (average)",
+        "dma: 15800 us (longest)",
+    ]
+
+
+def test_lcd_pacing_status_without_animation(monkeypatch, capsys):
+    player = PaceStatusPlayer([16667, 0, 0, 0, 0, 0, 0, 0])
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    shell.execute("serial", "lcd-pacing", "status")
+    assert capsys.readouterr().out.splitlines() == [
+        "lcd-pacing: off",
+        "period: 16667 us (59.999 Hz, authored 60 fps)",
+        "TE phase: unknown",
+        "last animation: none",
+    ]
 
 
 def test_lcd_diag_reports_write_failure(monkeypatch, capsys):

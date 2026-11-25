@@ -24,7 +24,7 @@ PLAYBACK_STATUS = struct.Struct("<IIIi6Ii24s260s")
 PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playlist",
                            34: "seek outside track", 61: "no active playback"}
 LCD_INDEX = 0x4955
-LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "coverflow-60hz": 3, "lcd-diag": 4,
+LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "lcd-pacing": 3, "lcd-diag": 4,
                 "lcd-dma-burst": 5, "lcd-dma-width": 6, "lcd-boost": 7,
                 "lcd-bench": 8, "lcd-pio": 9}
 LCD_TIMINGS = {f"0x{timing:02x}": timing
@@ -34,6 +34,9 @@ LCD_DMA_OPTIONS = {"lcd-dma-burst": {"get": 0, "1": 1, "4": 4, "8": 8, "16": 16}
                    "lcd-dma-width": {"get": 0, "16": 16, "32": 32}}
 LCD_BENCH_OPTIONS = {"full": 0, "band": 1}
 LCD_SWITCH = {"off": 0, "on": 1, "get": 2}
+LCD_PACE_STATUS = 10  # Argument selects one LCD_PACE_FIELDS entry.
+LCD_PACE_FIELDS = ("period", "divisor", "shown", "missed", "offset", "cost", "dma", "flags")
+LCD_PACE_ENABLED, LCD_PACE_MEASURED, LCD_PACE_PHASED = 1, 2, 4
 LCD_REPLY = struct.Struct("<4I")
 LCD_ERRORS = {5: "could not save lcd-te-diag.txt",
               16: "LCD asleep or busy; retry with the LCD awake",
@@ -474,16 +477,36 @@ def execute_lcd(serial, action, argument):
         if argument is not None:
             raise ValueError("lcd-diag takes no argument")
         option = 0
+    elif action == "lcd-pacing" and argument == "status":
+        option = None
     else:
         if argument not in LCD_SWITCH:
-            raise ValueError(f"{action} requires on, off or get")
+            choices = "on, off, get or status" if action == "lcd-pacing" else "on, off or get"
+            raise ValueError(f"{action} requires {choices}")
         option = LCD_SWITCH[argument]
 
     player = find_player(serial)
+    if action == "lcd-pacing" and argument == "status":
+        print_pace_status({field: lcd_exchange(player, action, LCD_PACE_STATUS, number)
+                           for number, field in enumerate(LCD_PACE_FIELDS)})
+        return
+    value = lcd_exchange(player, action, LCD_COMMANDS[action], option)
+    if action == "lcd-diag":
+        print(f"lcd-diag: saved {LCD_DIAG_PATH}")
+    elif action == "lcd-timing":
+        print(f"LCD_PHTIME=0x{value:02x}")
+    elif action in LCD_DMA_OPTIONS:
+        print(f"{action}: {value}")
+    elif action == "lcd-bench":
+        print(f"lcd-bench: {argument} measured")
+    else:
+        print(f"{action}: {'on' if value else 'off'}")
+
+
+def lcd_exchange(player, action, opcode, option):
     cookie = secrets.randbelow(0xFFFFFFFF) + 1
     payload = struct.pack("<IB", cookie, option)
-    if ep0_transfer(player, 0x40, REQUEST, LCD_COMMANDS[action], LCD_INDEX,
-                    payload) != len(payload):
+    if ep0_transfer(player, 0x40, REQUEST, opcode, LCD_INDEX, payload) != len(payload):
         raise RuntimeError("Short PodLink Shell LCD command write")
 
     deadline = time.monotonic() + 15
@@ -500,18 +523,31 @@ def execute_lcd(serial, action, argument):
         if error:
             detail = LCD_ERRORS.get(error, f"error {error}")
             raise RuntimeError(f"{action}: {detail}")
-        if action == "lcd-diag":
-            print(f"lcd-diag: saved {LCD_DIAG_PATH}")
-        elif action == "lcd-timing":
-            print(f"LCD_PHTIME=0x{value:02x}")
-        elif action in LCD_DMA_OPTIONS:
-            print(f"{action}: {value}")
-        elif action == "lcd-bench":
-            print(f"lcd-bench: {argument} measured")
-        else:
-            print(f"{action}: {'on' if value else 'off'}")
-        return
+        return value
     raise RuntimeError(f"{action}: timed out waiting for the firmware result")
+
+
+def print_pace_status(status):
+    flags = status["flags"]
+    enabled = bool(flags & LCD_PACE_ENABLED)
+    period = status["period"]
+    source = ("authored 60 fps" if not enabled else
+              "measured TE" if flags & LCD_PACE_MEASURED else "nominal TE")
+    print(f"lcd-pacing: {'on' if enabled else 'off'}")
+    print(f"period: {period} us ({1e6 / period:.3f} Hz, {source})" if period
+          else "period: unknown")
+    print(f"TE phase: {'known' if flags & LCD_PACE_PHASED else 'unknown'}")
+    divisor = status["divisor"]
+    if not divisor:
+        print("last animation: none")
+        return
+    rate = {1: "full", 2: "half"}.get(divisor, f"1/{divisor}")
+    print(f"last animation: {rate} rate")
+    print(f"shown: {status['shown']} frames")
+    print(f"missed: {status['missed']} frames")
+    print(f"wake offset: {status['offset']} us after TE")
+    print(f"cost: {status['cost']} us per frame (average)")
+    print(f"dma: {status['dma']} us (longest)")
 
 
 def execute(serial, action, argument=None, *, value=None, yes=False, json_output=False,
