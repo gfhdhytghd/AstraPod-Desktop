@@ -374,6 +374,12 @@ class LCDPlayer:
 @pytest.mark.parametrize(("command", "argument", "opcode", "option", "value", "output"), [
     ("lcd-timing", None, 1, 0, 0x33, "LCD_PHTIME=0x33"),
     ("lcd-timing", "0x21", 1, 0x21, 0x21, "LCD_PHTIME=0x21"),
+    ("lcd-timing", "0x00", 1, 0xFF, 0, "LCD_PHTIME=0x00"),
+    ("lcd-dma-burst", "8", 5, 8, 8, "lcd-dma-burst: 8"),
+    ("lcd-dma-width", "32", 6, 32, 32, "lcd-dma-width: 32"),
+    ("lcd-boost", "get", 7, 2, 0, "lcd-boost: off"),
+    ("lcd-bench", "band", 8, 1, 0, "lcd-bench: band measured"),
+    ("lcd-pio", "on", 9, 1, 1, "lcd-pio: on"),
     ("lcd-te-sync", "on", 2, 1, 1, "lcd-te-sync: on"),
     ("lcd-te-sync", "get", 2, 2, 0, "lcd-te-sync: off"),
     ("coverflow-60hz", "off", 3, 0, 0, "coverflow-60hz: off"),
@@ -391,7 +397,11 @@ def test_lcd_command_waits_for_its_result(monkeypatch, capsys, command, argument
 
 
 @pytest.mark.parametrize(("command", "argument"), [
-    ("lcd-timing", "0x00"),
+    ("lcd-timing", "0xff"),
+    ("lcd-dma-burst", "2"),
+    ("lcd-dma-width", "8"),
+    ("lcd-bench", None),
+    ("lcd-pio", "4"),
     ("lcd-te-sync", "toggle"),
     ("coverflow-60hz", None),
     ("lcd-diag", "extra"),

@@ -24,8 +24,15 @@ PLAYBACK_STATUS = struct.Struct("<IIIi6Ii24s260s")
 PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playlist",
                            34: "seek outside track", 61: "no active playback"}
 LCD_INDEX = 0x4955
-LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "coverflow-60hz": 3, "lcd-diag": 4}
-LCD_TIMINGS = {f"0x{timing:02x}": timing for timing in (0x33, 0x22, 0x21, 0x12, 0x11)}
+LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "coverflow-60hz": 3, "lcd-diag": 4,
+                "lcd-dma-burst": 5, "lcd-dma-width": 6, "lcd-boost": 7,
+                "lcd-bench": 8, "lcd-pio": 9}
+LCD_TIMINGS = {f"0x{timing:02x}": timing
+               for timing in (0x33, 0x22, 0x21, 0x12, 0x11, 0x10, 0x01)}
+LCD_TIMINGS["0x00"] = 0xFF  # Wire value 0 stays the query opcode's argument.
+LCD_DMA_OPTIONS = {"lcd-dma-burst": {"get": 0, "1": 1, "4": 4, "8": 8, "16": 16},
+                   "lcd-dma-width": {"get": 0, "16": 16, "32": 32}}
+LCD_BENCH_OPTIONS = {"full": 0, "band": 1}
 LCD_SWITCH = {"off": 0, "on": 1, "get": 2}
 LCD_REPLY = struct.Struct("<4I")
 LCD_ERRORS = {5: "could not save lcd-te-diag.txt",
@@ -454,6 +461,15 @@ def execute_lcd(serial, action, argument):
         if argument is not None and argument not in LCD_TIMINGS:
             raise ValueError("lcd-timing accepts " + ", ".join(LCD_TIMINGS))
         option = LCD_TIMINGS.get(argument, 0)
+    elif action in LCD_DMA_OPTIONS:
+        options = LCD_DMA_OPTIONS[action]
+        if argument not in options:
+            raise ValueError(f"{action} accepts " + ", ".join(options))
+        option = options[argument]
+    elif action == "lcd-bench":
+        if argument not in LCD_BENCH_OPTIONS:
+            raise ValueError("lcd-bench requires full or band")
+        option = LCD_BENCH_OPTIONS[argument]
     elif action == "lcd-diag":
         if argument is not None:
             raise ValueError("lcd-diag takes no argument")
@@ -488,6 +504,10 @@ def execute_lcd(serial, action, argument):
             print(f"lcd-diag: saved {LCD_DIAG_PATH}")
         elif action == "lcd-timing":
             print(f"LCD_PHTIME=0x{value:02x}")
+        elif action in LCD_DMA_OPTIONS:
+            print(f"{action}: {value}")
+        elif action == "lcd-bench":
+            print(f"lcd-bench: {argument} measured")
         else:
             print(f"{action}: {'on' if value else 'off'}")
         return
