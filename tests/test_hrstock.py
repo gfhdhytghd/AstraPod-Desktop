@@ -1,5 +1,6 @@
 """Integration coverage using temporary stock databases and generated media."""
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -10,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "herdremote"))
 
 import hrmediasync
 import hrstock
-from test_hrstockdb import ITUNES, create_fixture, libgpod
+from test_hrstockdb import DEVICE, ITUNES, create_fixture, libgpod
 
 
 @pytest.fixture
@@ -258,7 +259,7 @@ def test_import_photo_albums_and_stock_video(tmp_path, pictures, movie, model, c
     command = hrstockvideo.media_command
 
     def encode(*args):
-        if "-c:v" in args:
+        if "-c:v" in args and "-f" in args and args[-2] == "ipod":
             encoder = args[args.index("-c:v") + 1]
             used_encoders.append(encoder)
             if compressed and encoder == "h264_nvenc":
@@ -269,6 +270,12 @@ def test_import_photo_albums_and_stock_video(tmp_path, pictures, movie, model, c
     root = tmp_path / "volume"
     create_fixture(root, model, checksum, compressed)
     database = root / ITUNES / ("iTunesCDB" if compressed else "iTunesDB")
+    if compressed:
+        sysinfo = root / DEVICE / "SysInfoExtended"
+        props = plistlib.loads(sysinfo.read_bytes())
+        props["AlbumArt"] = [{"FormatId": 1055, "PixelFormat": "4C353635",
+                              "RenderWidth": 128, "RenderHeight": 128, "DisplayWidth": 128}]
+        sysinfo.write_bytes(plistlib.dumps(props))
     original = database.read_bytes()
     assert len(hrstock.import_files(root, pictures)) == 2
     assert database.read_bytes() == original
@@ -291,6 +298,7 @@ def test_import_photo_albums_and_stock_video(tmp_path, pictures, movie, model, c
         track, = db.tracks
         assert track.media_type == 64
         assert track.title == "Test Episode"
+        assert track.has_artwork
 
 
 def test_photo_and_video_publication_rolls_back(tmp_path, pictures, movie, monkeypatch):

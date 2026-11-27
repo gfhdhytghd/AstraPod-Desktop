@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from hrstockmedia import StockMedia, _extract_cover, _ffmpeg, _is_picture, _milliseconds
-from hrstockmedia import _number, FAT_FILE_LIMIT, SAMPLE_RATES
+from hrstockmedia import _number, FAT_FILE_LIMIT, MAX_ART_BYTES, SAMPLE_RATES
 from podlink import media_command
 
 VIDEO_SUFFIXES = frozenset({".m4v", ".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpg", ".mpeg"})
@@ -45,6 +45,22 @@ def _compatible(container, streams, video, audio):
         and audio.get("profile") == "LC" and 0 < _number(audio.get("bit_rate")) <= 160_000
         and audio.get("channels") in (1, 2) and _number(audio.get("sample_rate")) in SAMPLE_RATES
     )
+
+
+def _video_poster(path, directory, length):
+    picture = directory / "cover.jpg"
+    try:
+        media_command(
+            *_ffmpeg(path), "-ss", str(min(length / 10000, 5)),
+            "-map", "0:v:0", "-frames:v", "1",
+            "-vf", "scale=320:240:force_original_aspect_ratio=decrease",
+            "-c:v", "mjpeg", "-q:v", "3", "-update", "1", str(picture))
+        if 0 < picture.stat().st_size <= MAX_ART_BYTES:
+            return picture
+    except (OSError, RuntimeError):
+        pass
+    picture.unlink(missing_ok=True)
+    return None
 
 
 def prepare_video(path, directory, *, kind=None):
@@ -103,8 +119,8 @@ def prepare_video(path, directory, *, kind=None):
     size = output.stat().st_size
     if not 0 < size <= FAT_FILE_LIMIT:
         raise ValueError("prepared video exceeds the FAT file size range")
-    # libgpod can use a tagged cover, or the desktop can import the video without one.
-    artwork = _extract_cover(path, streams, directory)
+    artwork = (_extract_cover(path, streams, directory)
+               or _video_poster(output, directory, length))
     return StockMedia(
         source=path, upload=output, suffix=".m4v", title=tags.get("title") or path.stem,
         artist=tags.get("artist", ""), album=tags.get("album", ""),

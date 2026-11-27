@@ -24,7 +24,8 @@ picker. Automatic mode reads the container's media type and show tags.
 The import remuxes compatible video or converts it to H.264 Baseline Level
 3.0 with AAC-LC. Conversion tries FFmpeg's NVIDIA encoder before libx264.
 Compatible files and converted files both use `.m4v` under
-`iPod_Control/Music/Fxx`.
+`iPod_Control/Music/Fxx`. Embedded cover art takes priority. When the file
+has no cover, import uses a frame from the prepared video.
 
 The stock transaction publishes the video files, photo database and
 thumbnails together with the library changes. The **跳过 iPod 上已有的歌曲**
