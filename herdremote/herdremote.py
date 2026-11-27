@@ -24,7 +24,6 @@ import signal
 import sys
 import threading
 import time
-import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import podlink  # noqa: E402  podlink.py: the PodLink frame codec
@@ -38,6 +37,7 @@ import hrdetect  # noqa: E402
 import hrdetail  # noqa: E402
 import hrherdr  # noqa: E402
 import hrorder  # noqa: E402
+import hrtimezone
 import hrproto  # noqa: E402
 import hrt3  # noqa: E402
 import hrvoice  # noqa: E402
@@ -163,20 +163,24 @@ class ClockSync:
     def __init__(self):
         self.anchor = None
         self.offset = None
+        self.zone = None
+        self.supports_zone = False
         self.next_sync = 0.0
 
     def poll(self, send, mono=None, wall=None, offset=None):
         mono = time.monotonic() if mono is None else mono
         wall = time.time() if wall is None else wall
+        zone = hrtimezone.local_zone() if self.supports_zone else None
+        local = hrtimezone.local_time(wall, zone)
         if offset is None:
-            offset = int(datetime.datetime.fromtimestamp(wall).astimezone().utcoffset().total_seconds())
+            offset = int(local.utcoffset().total_seconds())
         anchor = wall - mono
         if (self.anchor is not None and mono < self.next_sync and
-                abs(anchor - self.anchor) <= CLOCK_JUMP_SECONDS and offset == self.offset):
+                abs(anchor - self.anchor) <= CLOCK_JUMP_SECONDS and
+                offset == self.offset and zone == self.zone):
             return False
-        local = datetime.datetime.fromtimestamp(wall).astimezone()
-        send(hrproto.clock(local))
-        self.anchor, self.offset = anchor, offset
+        send(hrproto.clock(local, zone) if zone else hrproto.clock(local))
+        self.anchor, self.offset, self.zone = anchor, offset, zone
         self.next_sync = mono + CLOCK_SYNC_SECONDS
         return True
 
@@ -234,8 +238,9 @@ class Daemon:
                                           release_serial=self.close_link)
         self.reset_session()
 
-    def reset_session(self):
-        self.clock_sync = ClockSync()
+    def reset_session(self, keep_clock=False):
+        if not keep_clock:
+            self.clock_sync = ClockSync()
         self.session_generation = getattr(self, "session_generation", 0) + 1
         self.keys.reset()
         if not getattr(self, "ir_fallback", None) or not self.ir_fallback.talking:
@@ -560,6 +565,7 @@ class Daemon:
         self.reset_session()
         self.send(hrproto.hello(VERSION))
         self.send(hrhandoff.CAPABILITY)
+        self.send(hrtimezone.QUERY)
         self.clock_sync.poll(self.send)
         return True
 
@@ -707,6 +713,10 @@ class Daemon:
             self.next_tick = now + TICK_SECONDS
 
     def command(self, payload):
+        if payload == hrtimezone.CAPABILITY:
+            self.clock_sync.supports_zone = True
+            self.clock_sync.poll(self.send)
+            return
         if payload == hrdisk.CAPABILITY and self.disk_control.hello(payload, self.send):
             return
         if self.remote_log.submit(payload):
@@ -728,7 +738,7 @@ class Daemon:
             self.send(hrproto.result(args[0], False, "IR host fallback active"))
             return
         if name == "hr":
-            self.reset_session()
+            self.reset_session(keep_clock=True)
             self.sent_ws = b""
         elif name == "qx":
             self.question_ext = True
