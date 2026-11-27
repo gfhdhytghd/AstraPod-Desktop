@@ -23,7 +23,7 @@ def demo_services(count: int = 0, delay: bool = True, appearance=None) -> Servic
     daemon = FakeDaemon()
     return Services(library=FakeLibrary(count, delay=delay), daemon=daemon,
                     plugins=PluginBridge(host), sync=FakeSync(daemon=daemon), prober=FakeProber(),
-                    appearance=appearance)
+                    appearance=appearance, demo=True)
 
 
 def create_application(argv=None, services: Services | None = None):

@@ -32,6 +32,7 @@ from .pages.albums import AlbumsPage
 from .pages.browse import BrowsePage
 from .pages.device import MODEL_NAMES, DevicePage, device_name
 from .pages.extensions import ExtensionsPage
+from .pages.extras import ExtrasPage
 from .pages.importer import ImportPage
 from .pages.info import InfoDialog
 from .pages.logs import LogsPage
@@ -52,7 +53,7 @@ SECTIONS = [
     ("添加音乐", [("import", "直接导入", "import"), ("sync", "Jellyfin 同步", "sync")]),
     ("远程", [("agents", "Agent", "agents"), ("usage", "Usage", "usage")]),
     ("电脑", [("extensions", "扩展", "extensions"), ("logs", "日志", "logs"),
-            ("settings", "设置", "settings")]),
+            ("settings", "设置", "settings"), ("extras", "日历与联系人", "artists")]),
 ]
 
 
@@ -80,6 +81,7 @@ class Services:
     sync: object
     prober: object
     appearance: object = None
+    demo: bool = False
 
 
 class Toast(QtWidgets.QWidget):
@@ -371,7 +373,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for page in (DevicePage(self), *self._library_pages(self.library_state, "device."),
                      *self._library_pages(self.jellyfin), ImportPage(self), SyncPage(self),
                      AgentsPage(self), UsagePage(self),
-                     ExtensionsPage(self), LogsPage(self), SettingsPage(self)):
+                     ExtensionsPage(self), LogsPage(self), SettingsPage(self), ExtrasPage(self)):
             self.pages[page.key] = page
             self.stack.addWidget(page)
         sync = self.pages["sync"]
