@@ -281,9 +281,13 @@ class Client:
         if not new and (not etag or not STRONG_ETAG.fullmatch(etag)):
             raise ValueError("服务器未提供强 ETag，无法安全写回日历。")
         condition = {"If-None-Match": "*"} if new else {"If-Match": etag}
-        self.request("PUT", href, body.encode(),
-                     headers={**condition, "Content-Type": "text/calendar; charset=utf-8"},
-                     expected=(200, 201, 204))
+        _, headers, _ = self.request(
+            "PUT", href, body.encode(),
+            headers={**condition, "Content-Type": "text/calendar; charset=utf-8"},
+            expected=(200, 201, 204),
+        )
+        written_etag = headers.get("ETag", "")
+        return written_etag if STRONG_ETAG.fullmatch(written_etag) else None
 
     def delete(self, href, etag):
         if not etag or not STRONG_ETAG.fullmatch(etag):

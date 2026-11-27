@@ -34,6 +34,7 @@ class DavFixture:
         self.ctags = True
         self.invalid_token = False
         self.before_put = None
+        self.after_put = None
         self.save(self.original, entry("one", "initial", "22"))
 
     def save(self, path, body):
@@ -111,7 +112,11 @@ class DavFixture:
         if existing is None and headers.get("If-None-Match") != "*":
             return 412, "", {}
         self.save(path, body if method == "PUT" else None)
-        return (204 if existing else 201), "", {}
+        reply_headers = {"ETag": self.resources[path][0]} if method == "PUT" else {}
+        if method == "PUT" and self.after_put:
+            update, self.after_put = self.after_put, None
+            self.save(path, update)
+        return (204 if existing else 201), "", reply_headers
 
 
 @pytest.fixture
@@ -239,7 +244,11 @@ def test_ctag_etag_and_invalid_token_fallback(dav):
     assert [call[0] for call in model.calls] == ["PROPFIND", "PROPFIND"]
 
 
-def test_conditional_race_keeps_device_edit_for_retry(dav, player):
+@pytest.mark.parametrize(("race", "error"), [
+    ("before_put", "同步期间发生变化"),
+    ("after_put", "写入后收到另一处编辑"),
+])
+def test_conditional_race_keeps_device_edit_for_retry(dav, player, race, error):
     model, client = dav
     root, disk, store = player
     (collection,) = client.discover()
@@ -250,8 +259,8 @@ def test_conditional_race_keeps_device_edit_for_retry(dav, player):
     sync()
     (export,) = (root / "Calendars").glob("*.ics")
     export.write_text(entry("one", "my edit", "24"))
-    model.before_put = entry("one", "concurrent edit", "25")
-    with pytest.raises(RuntimeError, match="同步期间发生变化"):
+    setattr(model, race, entry("one", "concurrent edit", "25"))
+    with pytest.raises(RuntimeError, match=error):
         sync()
     assert "my edit" in export.read_text()
     assert "concurrent edit" in model.resources[model.original][1]

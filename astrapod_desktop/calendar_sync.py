@@ -75,7 +75,7 @@ def _sync_collection(client, store, disk, collection, key, snapshot, state, befo
                     client.delete(href, etag)
                 else:
                     body = ics.as_resource(winner, previous["body"] if previous else None)
-                    client.put(href, body, etag=etag, new=previous is None)
+                    written_etag = client.put(href, body, etag=etag, new=previous is None)
             except DavError as error:
                 if error.status in (404, 409, 412):
                     raise RuntimeError("CalDAV 日历在同步期间发生变化。请重新同步。") from None
@@ -84,9 +84,13 @@ def _sync_collection(client, store, disk, collection, key, snapshot, state, befo
                 del snapshot["resources"][href]
             else:
                 saved = client.get(href)
+                if written_etag and saved["etag"] and written_etag != saved["etag"]:
+                    raise RuntimeError("CalDAV 在写入后收到另一处编辑。请重新同步。")
                 stored = ics.split(saved["body"])
                 if set(stored) != {uid}:
                     raise ValueError("CalDAV 服务器返回的 UID 与写入的条目不符。")
+                if (not written_etag or not saved["etag"]) and stored[uid] != winner:
+                    _save_conflict(store, conflicts, collection, uid, winner, "iPod")
                 snapshot["resources"][href] = saved
                 winner = stored[uid]
         if winner is not None:
