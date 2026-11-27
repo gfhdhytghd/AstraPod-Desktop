@@ -1,6 +1,7 @@
 """Jellyfin sync: log in, choose a scope, preview the difference, apply."""
 from __future__ import annotations
 
+from html import escape
 import os
 
 from .. import stock_transfer
@@ -97,7 +98,8 @@ class DiffDelegate(QtWidgets.QStyledItemDelegate):
         font.setPixelSize(11)
         painter.setFont(font)
         painter.setPen(QtGui.QColor(t.text_muted))
-        note = {"add": "将写入 iPod", "remove": "将从 iPod 删除", "same": "iPod 已有"}.get(kind, "")
+        note = {"add": "将写入 iPod", "remove": "将从 iPod 删除", "same": "iPod 已有",
+                "unmatched": "未匹配"}.get(kind, "")
         painter.drawText(rect.adjusted(0, 0, -10, 0),
                          Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, note)
         painter.restore()
@@ -480,8 +482,11 @@ class SyncPage(Page):
         transfer_ready = not disk.transition and disk.available
         self.preview_button.setEnabled(interactive and transfer_ready and self.source is not None
                                        and 0 <= index < len(self.scopes))
-        self.apply_button.setEnabled(interactive and transfer_ready and self.plan is not None
-                                     and bool(self.plan.additions or self.plan.removals))
+        playlist_report = getattr(self.plan, "playlist_report", None)
+        can_apply = self.plan is not None and (
+            self.plan.additions or self.plan.removals
+            or (playlist_report is not None and playlist_report.changes))
+        self.apply_button.setEnabled(interactive and transfer_ready and bool(can_apply))
         self.progress.setVisible(self.busy or self.restoring)
         if self.busy:
             set_badge(self.connection_badge, "处理中…", "busy")
@@ -511,6 +516,7 @@ class SyncPage(Page):
         self.invalidate_plan()
 
     def invalidate_plan(self, *_args) -> None:
+        self.status.setToolTip("")
         self.plan = None
         self.list_model.clear()
         self.preview_stack.setCurrentWidget(self.placeholder)
@@ -620,7 +626,17 @@ class SyncPage(Page):
         self.preview_stack.setCurrentWidget(self.details)
         self.status.setText(
             f"目标 {len(plan.tracks)} 首：写入 {len(plan.additions)} 首，"
-            f"iPod 已有 {len(plan.originals)} 首，删除 {len(plan.removals)} 首。")
+            f"iPod 已有 {len(plan.originals)} 首，删除 {len(plan.removals)} 首。"
+            + self._playlist_status(getattr(plan, "playlist_report", None)))
+
+    def _playlist_status(self, report):
+        self.status.setToolTip("")
+        if report is None:
+            return ""
+        if report.unmatched:
+            lines = (escape(f"{playlist} · {entry}") for playlist, entry in report.unmatched)
+            self.status.setToolTip("<qt>" + "<br>".join(lines) + "</qt>")
+        return f"AstraPod 播放列表变更 {report.changes} 个，未匹配 {len(report.unmatched)} 项。"
 
     def _fill_list(self) -> None:
         self.list_model.clear()
@@ -631,6 +647,10 @@ class SyncPage(Page):
         rows = [("add", track.label) for track in plan.additions]
         rows += [("same", track.label) for track in plan.originals]
         rows += [("remove", name) for name in sorted(plan.removals)]
+        report = getattr(plan, "playlist_report", None)
+        if report is not None:
+            rows += [("unmatched", f"{playlist} · {entry}")
+                     for playlist, entry in report.unmatched]
         for kind, text in rows:
             if wanted in (None, "all", kind):
                 item = QtGui.QStandardItem(text)
@@ -692,12 +712,13 @@ class SyncPage(Page):
                      self.sync_complete)
 
     def sync_complete(self, result, *, stock=False) -> None:
-        added, removed = result
+        counts, playlists = result if stock else (result, None)
+        added, removed = counts
         self.invalidate_plan()
         text = f"同步完成：写入 {added} 首，删除 {removed} 首。"
         if stock:
             text += "iPod 已安全弹出。"
-        self.status.setText(text)
+        self.status.setText(text + self._playlist_status(playlists))
         self.window_.flash(f"Jellyfin 同步完成：写入 {added} 首，删除 {removed} 首")
 
     def apply_theme(self, tokens) -> None:

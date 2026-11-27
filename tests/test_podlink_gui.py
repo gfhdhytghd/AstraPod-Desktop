@@ -1017,6 +1017,8 @@ class SyncTests(GuiCase):
         self.assertIn("写入 5 首，删除 2 首", page.status.text())
 
     def test_stock_preview_is_read_only_and_apply_mounts_for_write(self) -> None:
+        from hrstockplaylists import PlaylistReport
+
         device = self.show_stock_transfer_target()
         page = self.page()
         page.connected((object(), self.services.sync.scopes()))
@@ -1036,21 +1038,49 @@ class SyncTests(GuiCase):
             finally:
                 calls.append(("unmount", selected, write))
 
+        def apply_report(*_args, playlist_report, **_options):
+            playlist_report(PlaylistReport(0, ()))
+            return 5, 2
+
         with (patch("hrstockdevice.stock_mount", mount),
               patch("hrstock.preview", return_value=plan) as preview,
-              patch("hrstock.apply", return_value=(5, 2)) as apply,
+              patch("hrstock.apply", side_effect=apply_report) as apply,
               patch.object(page, "confirm_removals", return_value=True)):
             page.preview()
             wait_until(self.app, lambda: page.plan is plan and not page.busy)
             preview.assert_called_once_with(self.root, page.source, page.scopes[0], volume_key=key)
             page.confirm()
             wait_until(self.app, lambda: not page.busy and page.plan is None)
-            apply.assert_called_once_with(self.root, page.source, plan, volume_key=key)
+            args, kwargs = apply.call_args
+            self.assertEqual(args, (self.root, page.source, plan))
+            self.assertEqual(kwargs["volume_key"], key)
+            self.assertTrue(callable(kwargs["playlist_report"]))
         self.assertEqual(calls, [("mount", device, False, True), ("unmount", device, False),
                                  ("mount", device, True, True), ("unmount", device, True)])
         self.assertFalse(any(item[0] in ("preview", "preview_disk", "apply", "apply_disk")
                              for item in self.services.sync.calls))
         self.assertIn("iPod 已安全弹出", page.status.text())
+
+    def test_stock_playlist_only_plan_can_apply_and_reports_unmatched_entries(self):
+        from hrstock import StockPlan
+        from hrstockplaylists import PlaylistReport
+
+        self.show_stock_transfer_target()
+        page = self.page()
+        page.connected((object(), self.services.sync.scopes()))
+        report = PlaylistReport(1, (("/Playlists/New Playlist 1.m3u8", "/Music/Lost.flac"),))
+        plan = StockPlan("fixture", page.scopes[0], "stock:fixture", (), frozenset(),
+                         playlist_revision="fixture", playlist_report=report)
+        page.show_plan(plan)
+        page.update_buttons()
+        self.assertTrue(page.apply_button.isEnabled())
+        self.assertEqual(page.preview_rows(),
+                         [("unmatched", "/Playlists/New Playlist 1.m3u8 · /Music/Lost.flac")])
+        with patch("astrapod_desktop.stock_transfer.apply", return_value=((0, 0), report)):
+            page.confirm()
+            wait_until(self.app, lambda: not page.busy and page.plan is None)
+        self.assertIn("未匹配 1 项", page.status.text())
+        self.assertIn("/Music/Lost.flac", page.status.toolTip())
 
     def test_credential_change_invalidates_and_failure_recovers(self) -> None:
         page = self.page()

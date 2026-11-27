@@ -26,6 +26,8 @@ def apply(device, source, plan):
     from hrstockdevice import stock_mount
 
     volume = device.volume
+    reports = []
     with stock_mount(device, write=True, authorize=True) as root:
-        return hrstock.apply(root, source, plan,
-                             volume_key=(volume.usb[1], volume.uuid_path.name))
+        counts = hrstock.apply(root, source, plan, playlist_report=reports.append,
+                               volume_key=(volume.usb[1], volume.uuid_path.name))
+    return counts, reports[0]

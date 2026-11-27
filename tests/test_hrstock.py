@@ -317,3 +317,168 @@ def test_photo_and_video_publication_rolls_back(tmp_path, pictures, movie, monke
     assert {p.relative_to(photo_dir): p.read_bytes()
             for p in photo_dir.rglob("*") if p.is_file()} == photos_before
     assert not list(root.rglob("*.m4v"))
+
+
+@pytest.mark.parametrize("model,checksum,compressed", [
+    ("MB029", 1, False), ("MC293", 2, True),
+])
+def test_stock_sync_reconciles_saved_playlists(tmp_path, model, checksum, compressed):
+    from test_hrstockdb import add_playlist, example_row
+
+    root = tmp_path / "volume"
+    create_fixture(root, model, checksum, compressed)
+    with hrstock.hrstockdb.open_database(root) as db:
+        first, second = (db.add_track(example_row(n), filetype="MPEG audio file",
+                                      sample_rate=44100) for n in (1, 2))
+        add_playlist(hrstock.hrstockdb._library(), db, "New Playlist 1", (second,))
+        db.save()
+    original = hrstock.read_library(root).playlists[1]
+
+    directory = root / "pLAYLISTS"
+    directory.mkdir()
+    playlist = directory / "New Playlist 1.M3U8"
+    playlist.write_bytes(b"\xef\xbb\xbf#EXTM3U\r\n#EXTINF:1,Track\r\n"
+                         b"../ipod_control/music/F07/ab01.MP3\r\n"
+                         b"C:\\iPod_Control\\Music\\F07\\AB02.mp3\r\n"
+                         b"/Music/Unregistered.flac\r\n"
+                         b"/iPod_Control/Music/F07/AB01.mp3\r\n")
+    ignored = directory / "Ignored.m3u"
+    ignored.write_text("/iPod_Control/Music/F07/AB01.mp3\n")
+    scope = hrmediasync.Scope("all", "fixture")
+    source = Source("a", None)
+    source.desired = ()
+    reports = []
+
+    plan = hrstock.preview(root, source, scope)
+    assert not plan.additions and not plan.removals
+    assert plan.playlist_report.changes == 1
+    assert plan.playlist_report.unmatched == (("/pLAYLISTS/New Playlist 1.M3U8",
+                                         "/Music/Unregistered.flac"),)
+    assert hrstock.apply(root, source, plan, playlist_report=reports.append) == (0, 0)
+    assert reports == [plan.playlist_report]
+
+    master, untouched, saved = hrstock.read_library(root).playlists
+    assert master.track_ids == (first, second)
+    assert untouched == original
+    assert saved.name == "New Playlist 2"
+    assert saved.track_ids == (first, second, first)
+    assert not source.downloads
+
+    database = root / ITUNES / ("iTunesCDB" if compressed else "iTunesDB")
+    db_before = database.read_bytes()
+    index = root / ITUNES / hrstock.hrstockplaylists.INDEX
+    index_before = index.read_bytes()
+    plan = hrstock.preview(root, source, scope)
+    assert plan.playlist_report.changes == 0
+    assert hrstock.apply(root, source, plan) == (0, 0)
+    assert database.read_bytes() == db_before
+    assert index.read_bytes() == index_before
+
+    playlist.write_text("/iPod_Control/Music/F07/AB02.mp3\n")
+    with pytest.raises(RuntimeError, match="playlists changed after preview"):
+        hrstock.apply(root, source, plan)
+    assert database.read_bytes() == db_before
+    assert hrstock.apply(root, source, hrstock.preview(root, source, scope)) == (0, 0)
+    updated = hrstock.read_library(root).playlists[-1]
+    assert updated.id == saved.id
+    assert updated.track_ids == (second,)
+
+    playlist.unlink()
+    plan = hrstock.preview(root, source, scope)
+    assert plan.playlist_report.changes == 1
+    assert hrstock.apply(root, source, plan) == (0, 0)
+    assert hrstock.read_library(root).playlists == (master, original)
+    assert hrstock.preview(root, source, scope).playlist_report.changes == 0
+
+
+def test_stock_sync_reads_custom_catalogue_and_ignores_live_queue(tmp_path, monkeypatch):
+    import hrstockdevice
+
+    root = tmp_path / "volume"
+    create_fixture(root)
+    usb = hrstockdevice._UsbDisk(None, "", "05ac", hrstockdevice.CLASSIC_USB_PRODUCT,
+                                 "Apple", "", root / "no-vpd")
+    monkeypatch.setattr(hrstockdevice, "_usb_disk", lambda _: usb)
+    firmware = root / ".rockbox"
+    firmware.mkdir()
+    (firmware / "config.cfg").write_text("playlist catalog directory: /.rockbox\n")
+    (firmware / "on-the-go.m3u8").write_text("/Music/Live Queue.flac\n")
+    custom = firmware / "Custom"
+    custom.mkdir()
+    (custom / "测试.m3u8").write_text("/Music/未匹配.flac\n")
+    source = Source("a", None)
+    source.desired = ()
+    scope = hrmediasync.Scope("all", "fixture")
+
+    plan = hrstock.preview(root, source, scope)
+    assert plan.playlist_report.changes == 1
+    assert plan.playlist_report.unmatched == (("/.rockbox/Custom/测试.m3u8", "/Music/未匹配.flac"),)
+    assert hrstock.apply(root, source, plan) == (0, 0)
+    saved = hrstock.read_library(root).playlists[-1]
+    assert saved.name == "测试"
+    assert saved.track_ids == ()
+
+
+def test_stock_sync_rolls_back_playlist_index_if_database_publication_fails(tmp_path, monkeypatch):
+    root = tmp_path / "volume"
+    create_fixture(root)
+    playlist = root / "Playlists" / "New Playlist 1.m3u8"
+    playlist.parent.mkdir()
+    playlist.write_text("/Music/Unregistered.flac\n")
+    source = Source("a", None)
+    source.desired = ()
+    scope = hrmediasync.Scope("all", "fixture")
+    plan = hrstock.preview(root, source, scope)
+    database = root / ITUNES / "iTunesDB"
+    original = database.read_bytes()
+    index = database.with_name(hrstock.hrstockplaylists.INDEX)
+    replace = hrstock.hrstocktxn._replace
+    published_index = []
+
+    def fail(source, target, **kwargs):
+        if target.name == database.name and not published_index:
+            published_index.append(target.with_name(index.name).is_file())
+            raise OSError("synthetic database publication failure")
+        return replace(source, target, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hrstock.hrstocktxn, "_replace", fail)
+        with pytest.raises(OSError, match="synthetic database publication failure"):
+            hrstock.apply(root, source, plan)
+    assert published_index == [True]
+    assert not index.exists()
+    assert database.read_bytes() == original
+    assert hrstock.apply(root, source, plan) == (0, 0)
+    assert index.is_file()
+
+
+def test_stock_sync_rechecks_playlist_sources_before_publishing(tmp_path, monkeypatch):
+    root = tmp_path / "volume"
+    create_fixture(root)
+    playlist = root / "Playlists" / "New Playlist 1.m3u8"
+    playlist.parent.mkdir()
+    playlist.write_text("/Music/First.flac\n")
+    source = Source("a", None)
+    source.desired = ()
+    scope = hrmediasync.Scope("all", "fixture")
+    plan = hrstock.preview(root, source, scope)
+    database = root / ITUNES / "iTunesDB"
+    original = database.read_bytes()
+    prepare = hrstock.hrstocktxn._prepare
+
+    def change_playlist(*args, **kwargs):
+        staged = prepare(*args, **kwargs)
+        playlist.write_text("/Music/Second.flac\n")
+        return staged
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hrstock.hrstocktxn, "_prepare", change_playlist)
+        with pytest.raises(RuntimeError, match="playlists changed during sync"):
+            hrstock.apply(root, source, plan)
+    assert database.read_bytes() == original
+    assert not database.with_name(hrstock.hrstockplaylists.INDEX).exists()
+    assert playlist.read_text() == "/Music/Second.flac\n"
+    refreshed = hrstock.preview(root, source, scope)
+    assert refreshed.playlist_report.unmatched == (("/Playlists/New Playlist 1.m3u8",
+                                                   "/Music/Second.flac"),)
+    assert hrstock.apply(root, source, refreshed) == (0, 0)

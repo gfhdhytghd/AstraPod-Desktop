@@ -14,6 +14,8 @@ identity, tracks=()) returns its device, owned and matched fields for callers
 that fetched the source rows. apply(root, source, plan) returns (added, removed)
 and requires a stock preview. import_files(root, paths, progress=None,
 skip_duplicates=True) uses the same event and result dictionaries as hrlibrary.
+Stock preview and apply also reconcile the AstraPod playlist catalogue.
+Apply can report playlist changes and unmatched entries via playlist_report.
 
 Call from a worker thread. The caller selects the mount and safely ejects it.
 Writes can ask polkit to authorize a read-only identity query. recover(root)
@@ -40,6 +42,7 @@ import hrmediasync
 import hrstockdb
 import hrstockmedia
 import hrstockphoto
+import hrstockplaylists
 import hrstockvideo
 import hrstocktxn
 from hrstockdevice import (MODEL_NUMBERS, UnsupportedStockModel, assert_stock_layout,
@@ -66,6 +69,12 @@ class StockInventory:
     device: str
     owned: frozenset[str]
     matched: frozenset[str]
+
+
+@dataclass(frozen=True, kw_only=True)
+class StockPlan(hrmediasync.Plan):
+    playlist_revision: str
+    playlist_report: hrstockplaylists.PlaylistReport
 
 
 @dataclass(frozen=True)
@@ -181,6 +190,16 @@ def _row_path(path):
                        or "\0" in part for part in parts):
         return ""
     return "/" + "/".join(parts)
+
+
+def _playlist_edits(snapshot, database, tracks):
+    paths = {}
+    for track in tracks if snapshot.files else ():
+        path = _row_path(track.path).casefold()
+        if path:
+            # Duplicate paths cannot identify a particular stock track.
+            paths[path] = None if path in paths else track.id
+    return snapshot.plan(database.playlists, paths)
 
 
 def _music_parts(path):
@@ -363,7 +382,8 @@ class _Session:
             self.owners[name] = _Owner(track_id, on_disk, media.size_bytes)
         return on_disk
 
-    def commit(self, database, *, owner_update=False, progress=None, photos=()):
+    def commit(self, database, *, owner_update=False, progress=None, photos=(),
+               playlist_snapshot=None, playlist_index=None):
         replacements = {}
         if database is not None:
             changed = database.save()
@@ -394,10 +414,18 @@ class _Session:
                 for name, owner in self.owners.items()
             }}, sort_keys=True), encoding="utf-8")
             replacements[_destination(self.root, Path("iPod_Control/iTunes") / _OWNERS)] = index
+        if playlist_index is not None:
+            index = self.stage / hrstockplaylists.INDEX
+            index.write_text(playlist_index, encoding="utf-8")
+            target = _destination(self.root, Path("iPod_Control/iTunes") / index.name)
+            replacements[target] = index
         if replacements.get(self.primary) is None:
             raise RuntimeError("libgpod did not emit the active iPod database")
         def validate():
             self.validate_snapshot()
+            if (playlist_snapshot is not None
+                    and playlist_snapshot != hrstockplaylists.snapshot(self.root, self.tunes)):
+                raise RuntimeError("AstraPod playlists changed during sync")
             if photo_files is not None and photo_files != hrstockphoto.snapshot(self.root):
                 raise RuntimeError("The iPod Photo Database changed during the operation")
 
@@ -532,26 +560,35 @@ def inventory(root, identity, tracks=(), *, volume_key=None):
 def preview(root, source, scope, *, volume_key=None):
     """Use the caller-validated physical volume key across remounts, if supplied."""
     tracks = source.tracks(scope)
-    current = inventory(root, source.identity, tracks, volume_key=volume_key)
-    return hrmediasync.Plan(source.identity, scope, current.device, tracks,
-                            current.owned, current.matched)
+    with _session(root, volume_key=volume_key) as (session, database):
+        stored = database.tracks
+        current = session.inventory(source.identity, tracks, stored)
+        snapshot = hrstockplaylists.snapshot(session.root, session.tunes)
+        edits = _playlist_edits(snapshot, database, stored)
+        return StockPlan(source.identity, scope, current.device, tracks,
+                         current.owned, current.matched,
+                         playlist_revision=snapshot.revision, playlist_report=edits.report)
 
 
-def apply(root, source, plan, *, volume_key=None):
+def apply(root, source, plan, *, volume_key=None, playlist_report=None):
     if not plan.device.startswith("stock:"):
         raise RuntimeError("Build a stock iPod preview before applying this plan")
     hrmediasync.validate_source(source, plan)
-    with _session(root, write=True, volume_key=volume_key) as (session, database):
+    with (_session(root, write=True, volume_key=volume_key) as (session, database),
+          ExitStack() as staging_resources):
         tracks = database.tracks
         current = session.inventory(plan.identity, plan.tracks, tracks)
         if current != StockInventory(plan.device, plan.owned, plan.matched):
             raise RuntimeError("iPod changed after preview; build a new preview")
+        snapshot = hrstockplaylists.snapshot(session.root, session.tunes)
+        if isinstance(plan, StockPlan) and snapshot.revision != plan.playlist_revision:
+            raise RuntimeError("AstraPod playlists changed after preview; build a new preview")
         additions = plan.additions
-        if not additions and not plan.removals:
-            return 0, 0
+        music_changed = bool(additions or plan.removals)
 
-        with TemporaryDirectory(prefix="astrapod-stock-media-") as directory:
-            staging = Path(directory)
+        if music_changed:
+            staging = Path(staging_resources.enter_context(
+                TemporaryDirectory(prefix="astrapod-stock-media-")))
             downloaded = {}
             for index, track in enumerate(additions):
                 if not hrmediasync.owned_name(track.name, plan.identity):
@@ -575,7 +612,15 @@ def apply(root, source, plan, *, volume_key=None):
             database.remove_tracks(removal_ids)
             for name, media in downloaded.items():
                 session.add(database, media, name=name)
-            session.commit(database, owner_update=True)
+            tracks = database.tracks
+
+        edits = _playlist_edits(snapshot, database, tracks)
+        playlist_index = edits.apply(database) if edits.report.changes else None
+        if music_changed or edits.report.changes:
+            session.commit(database, owner_update=music_changed,
+                           playlist_snapshot=snapshot, playlist_index=playlist_index)
+    if playlist_report is not None:
+        playlist_report(edits.report)
     return len(additions), len(plan.removals)
 
 
