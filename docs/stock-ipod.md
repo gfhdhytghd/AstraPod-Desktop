@@ -10,6 +10,27 @@ with a stock iTunes library and an existing playlist. Disconnect other
 iPods before starting. A dual-boot volume can keep its PodBox and Apple
 files. Boot Apple firmware for these checks.
 
+## Import photos and videos
+
+With the iPod in stock firmware, open **直接导入** and add individual files
+or a folder. Photos use their immediate parent folder as the album name.
+Photo import uses ImageMagick 7 (`magick`). For HEIC and HEIF, ImageMagick
+must include its HEIC decoder. Albums and screen-sized copies are stored in
+`/Photos/Photo Database` and `/Photos/Thumbs`. The Classic thumbnail IDs are
+1066 (64 × 64 RGB565), 1024 (320 × 240 RGB565), and 1067 (720 × 480 I420).
+
+Import video into Movies, TV Shows, or Music Videos using the category
+picker. Automatic mode reads the container's media type and show tags.
+The import remuxes compatible video or converts it to H.264 Baseline Level
+3.0 with AAC-LC. Conversion tries FFmpeg's NVIDIA encoder before libx264.
+Compatible files and converted files both use `.m4v` under
+`iPod_Control/Music/Fxx`.
+
+The stock transaction publishes the video files, photo database and
+thumbnails together with the library changes. The **跳过 iPod 上已有的歌曲**
+switch applies to audio tracks. A second import of the same photo or video
+creates another entry.
+
 ## Desktop app
 
 1. Connect the stock iPod with its FAT volume unmounted. On the device page,

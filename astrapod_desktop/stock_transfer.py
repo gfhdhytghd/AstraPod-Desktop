@@ -1,13 +1,14 @@
 """Stock transport for the desktop transfer pages. Call from a device job."""
 
 
-def import_files(device, paths, progress, *, skip_duplicates, before_commit):
+def import_files(device, paths, progress, *, skip_duplicates, before_commit, video_kind=None):
     import hrstock
     from hrstockdevice import stock_mount
 
     with stock_mount(device, write=True, authorize=True) as root:
+        options = {"video_kind": video_kind} if video_kind else {}
         return hrstock.import_files(root, paths, progress, skip_duplicates=skip_duplicates,
-                                    before_commit=before_commit)
+                                    before_commit=before_commit, **options)
 
 
 def preview(device, source, scope):

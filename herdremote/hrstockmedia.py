@@ -63,6 +63,11 @@ class StockMedia:
     codec: str
     filetype: str
     artwork: Path | None
+    media_type: int = 1
+    show: str = ""
+    episode: str = ""
+    season: int = 0
+    episode_number: int = 0
 
 
 def _number(value):
@@ -195,8 +200,8 @@ def _ffmpeg(path):
             "-protocol_whitelist", "file", "-i", str(path))
 
 
-def _extract_cover(path, probe, directory):
-    for stream in probe.streams:
+def _extract_cover(path, streams, directory):
+    for stream in streams:
         if not _is_picture(stream):
             continue
         width, height = _number(stream.get("width")), _number(stream.get("height"))
@@ -272,7 +277,7 @@ def prepare_media(path, directory, *, fallback_title=None):
             sample_rate=prepared.sample_rate, source_rate=original.sample_rate,
             channels=prepared.channels,
             size_bytes=size, codec=codec, filetype=filetype,
-            artwork=_extract_cover(path, original, work))
+            artwork=_extract_cover(path, original.streams, work))
     except (OSError, RuntimeError, ValueError) as error:
         raise RuntimeError(f"{path}: {error}") from error
 

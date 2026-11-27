@@ -221,3 +221,99 @@ def test_external_change_during_journal_copy_preserves_external_database(tmp_pat
     assert not database.with_name("iTunesDB.astrapod-bak").exists()
     assert not tuple((root / "iPod_Control/Music").glob("F*/*.m4a"))
     assert not hrstock.hrstocktxn.pending(database.parent)
+
+
+@pytest.fixture
+def movie(tmp_path):
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg and ffprobe are required")
+    source = tmp_path / "Test Episode.mkv"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=960x540:rate=50:duration=1",
+                    "-c:v", "mpeg4", str(source)], check=True)
+    return source
+
+
+@pytest.fixture
+def pictures(tmp_path):
+    if not shutil.which("magick"):
+        pytest.skip("ImageMagick is required")
+    folder = tmp_path / "Weekend"
+    folder.mkdir()
+    sources = [folder / "red.jpg", folder / "blue.heic"]
+    for color, path in zip(("red", "blue"), sources):
+        subprocess.run(["magick", "-size", "96x64", f"xc:{color}", str(path)], check=True)
+    return sources
+
+
+@pytest.mark.parametrize("model,checksum,compressed", [
+    ("MB029", 1, False), ("MC293", 2, True),
+])
+def test_import_photo_albums_and_stock_video(tmp_path, pictures, movie, model, checksum,
+                                            compressed, monkeypatch):
+    from hrstockphoto import _counts
+    import hrstockvideo
+
+    used_encoders = []
+    command = hrstockvideo.media_command
+
+    def encode(*args):
+        if "-c:v" in args:
+            encoder = args[args.index("-c:v") + 1]
+            used_encoders.append(encoder)
+            if compressed and encoder == "h264_nvenc":
+                raise RuntimeError("simulated unavailable NVIDIA encoder")
+        return command(*args)
+
+    monkeypatch.setattr(hrstockvideo, "media_command", encode)
+    root = tmp_path / "volume"
+    create_fixture(root, model, checksum, compressed)
+    database = root / ITUNES / ("iTunesCDB" if compressed else "iTunesDB")
+    original = database.read_bytes()
+    assert len(hrstock.import_files(root, pictures)) == 2
+    assert database.read_bytes() == original
+    assert _counts(root) == (2, 2)
+    assert {p.name for p in (root / "Photos/Thumbs").iterdir()} == {
+        "F1024_1.ithmb", "F1066_1.ithmb", "F1067_1.ithmb",
+    }
+    assert (root / "Photos/Thumbs/F1024_1.ithmb").stat().st_size == 2 * 320 * 240 * 2
+
+    records = hrstock.import_files(root, [movie, pictures[0]], video_kind="tv-show")
+    assert len(records) == 2
+    assert _counts(root) == (3, 2)
+    video = root / records[0]["device"][1:]
+    assert video.suffix == ".m4v"
+    assert hrstockvideo._compatible(*hrstockvideo._probe(video))
+    assert used_encoders[0] == "h264_nvenc"
+    if compressed:
+        assert used_encoders == ["h264_nvenc", "libx264"]
+    with hrstock._session(root) as (_, db):
+        track, = db.tracks
+        assert track.media_type == 64
+        assert track.title == "Test Episode"
+
+
+def test_photo_and_video_publication_rolls_back(tmp_path, pictures, movie, monkeypatch):
+    root = tmp_path / "volume"
+    create_fixture(root, "MB029")
+    database = root / ITUNES / "iTunesDB"
+    original = database.read_bytes()
+    assert hrstock.import_files(root, [pictures[0]])
+    photo_dir = root / "Photos"
+    photos_before = {p.relative_to(photo_dir): p.read_bytes()
+                     for p in photo_dir.rglob("*") if p.is_file()}
+    replace = hrstock.hrstocktxn._replace
+
+    def fail(source, target, **kwargs):
+        if target.name == "Photo Database" and target.parts[-2] == "Photos":
+            if source.name.startswith("new-"):
+                raise OSError("simulated photo write failure")
+        return replace(source, target, **kwargs)
+
+    monkeypatch.setattr(hrstock.hrstocktxn, "_replace", fail)
+    with pytest.raises(OSError, match="simulated photo write failure"):
+        hrstock.import_files(root, [movie, pictures[0]])
+    assert database.read_bytes() == original
+    assert {p.relative_to(photo_dir): p.read_bytes()
+            for p in photo_dir.rglob("*") if p.is_file()} == photos_before
+    assert not list(root.rglob("*.m4v"))

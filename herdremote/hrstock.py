@@ -39,6 +39,8 @@ import hrlibrary
 import hrmediasync
 import hrstockdb
 import hrstockmedia
+import hrstockphoto
+import hrstockvideo
 import hrstocktxn
 from hrstockdevice import (MODEL_NUMBERS, UnsupportedStockModel, assert_stock_layout,
                            checked_path, detect)
@@ -159,8 +161,10 @@ def _metadata(root):
 
 def _destination(root, relative):
     parts = relative.parts
-    if (len(parts) < 3 or parts[0] != "iPod_Control" or parts[1] not in _METADATA
-            or ".." in parts):
+    music_metadata = len(parts) >= 3 and parts[0] == "iPod_Control" and parts[1] in _METADATA
+    photo_metadata = relative == hrstockphoto.PHOTO_DB or (
+        relative.parent == hrstockphoto.THUMBS and hrstockphoto.THUMB_NAME.fullmatch(relative.name))
+    if not (music_metadata or photo_metadata) or ".." in parts:
         raise RuntimeError(f"Unexpected libgpod output path: {relative}")
     parent = root
     for depth in range(1, len(parts) + 1):
@@ -349,7 +353,9 @@ class _Session:
             album=media.album, album_artist=media.album_artist, genre=media.genre,
             composer=media.composer, grouping=media.grouping, comment=media.comment,
             year=media.year, disc=media.disc, track=media.track, length_ms=media.length_ms,
-            bitrate_kbps=media.bitrate_kbps, size_bytes=media.size_bytes)
+            bitrate_kbps=media.bitrate_kbps, size_bytes=media.size_bytes,
+            media_type=media.media_type, show=media.show, episode=media.episode,
+            season=media.season, episode_number=media.episode_number)
         track_id = database.add_track(record, filetype=media.filetype,
                                       sample_rate=media.sample_rate, artwork=media.artwork)
         self.additions[path] = media.upload
@@ -357,11 +363,30 @@ class _Session:
             self.owners[name] = _Owner(track_id, on_disk, media.size_bytes)
         return on_disk
 
-    def commit(self, database, *, owner_update=False, progress=None):
-        changed = database.save()
-        replacements = {_destination(self.root, path): self.stage / path for path in changed}
-        replacements.update({_destination(self.root, path): None
-                             for path in database.removed_files})
+    def commit(self, database, *, owner_update=False, progress=None, photos=()):
+        replacements = {}
+        if database is not None:
+            changed = database.save()
+            replacements = {_destination(self.root, path): self.stage / path for path in changed}
+            replacements.update({_destination(self.root, path): None
+                                 for path in database.removed_files})
+        else:
+            primary_stage = Path("iPod_Control/iTunes") / _STOCK_FILES[self.primary.name.casefold()]
+            replacements[self.primary] = self.stage / primary_stage
+        photo_files = None
+        if photos:
+            photo_files = hrstockphoto.snapshot(self.root)
+            photo_stage = self.stage / "photo-stage"
+            (photo_stage / hrstockphoto.THUMBS).mkdir(parents=True)
+            for relative, (source, _) in photo_files.items():
+                shutil.copyfile(source, photo_stage / relative, follow_symlinks=False)
+            (photo_stage / "iPod_Control/Device").mkdir(parents=True)
+            output = hrstockphoto.write(photo_stage, photos)
+            photo_paths = photo_files.keys() | output.keys()
+            for relative in sorted(photo_paths, key=lambda path:
+                                   (path == hrstockphoto.PHOTO_DB, path)):
+                target = _destination(self.root, relative)
+                replacements[target] = output[relative][0] if relative in output else None
         if owner_update:
             index = self.stage / _OWNERS
             index.write_text(json.dumps({"version": 1, "tracks": {
@@ -371,10 +396,15 @@ class _Session:
             replacements[_destination(self.root, Path("iPod_Control/iTunes") / _OWNERS)] = index
         if replacements.get(self.primary) is None:
             raise RuntimeError("libgpod did not emit the active iPod database")
-        self.validate_snapshot()
+        def validate():
+            self.validate_snapshot()
+            if photo_files is not None and photo_files != hrstockphoto.snapshot(self.root):
+                raise RuntimeError("The iPod Photo Database changed during the operation")
+
+        validate()
         hrstocktxn.publish(self.root, self.tunes, self.primary, replacements=replacements,
                            additions=self.additions, removals=self.removals, progress=progress,
-                           precommit=self.validate_snapshot)
+                           precommit=validate)
 
 
 @contextmanager
@@ -549,17 +579,21 @@ def apply(root, source, plan, *, volume_key=None):
     return len(additions), len(plan.removals)
 
 
-def import_files(root, paths, progress=None, skip_duplicates=True, *, before_commit=None):
+def import_files(root, paths, progress=None, skip_duplicates=True, *, before_commit=None,
+                 video_kind=None):
     def event(path, state, *, sent=0, total=0, error=None):
         if progress is not None:
             progress(dict(file=str(path), state=state, sent=sent, total=total, error=error))
 
     stored = []
+    photos = []
     with (_session(root, write=True) as (session, database),
           TemporaryDirectory(prefix="astrapod-stock-import-") as directory):
         known = defaultdict(list)
         if skip_duplicates:
             for track in database.tracks:
+                if track.media_type not in (0, 1):
+                    continue
                 tags = _tags(track)
                 path = _row_path(track.path)
                 if tags and path and checked_path(session.root, *path[1:].split("/")):
@@ -568,13 +602,23 @@ def import_files(root, paths, progress=None, skip_duplicates=True, *, before_com
             path = Path(value)
             event(path, "probe")
             try:
-                tags = hrstockmedia.probe_music_tags(path) if skip_duplicates else None
+                suffix = path.suffix.lower()
+                folder = Path(directory) / str(index)
+                folder.mkdir()
+                if suffix in hrstockphoto.PHOTO_FORMATS:
+                    image = folder / "photo.jpg"
+                    hrstockphoto.normalize(path, image)
+                    album = path.absolute().parent.name or "Imported Photos"
+                    photos.append((path, image, album))
+                    event(path, "upload", total=image.stat().st_size)
+                    continue
+                is_video = suffix in hrstockvideo.VIDEO_SUFFIXES
+                tags = hrstockmedia.probe_music_tags(path) if skip_duplicates and not is_video else None
                 if tags and any(tags.matches(other) for other in known[tags.key]):
                     event(path, "skip")
                     continue
-                folder = Path(directory) / str(index)
-                folder.mkdir()
-                media = hrstockmedia.prepare_media(path, folder)
+                media = (hrstockvideo.prepare_video(path, folder, kind=video_kind) if is_video
+                         else hrstockmedia.prepare_media(path, folder))
             except (OSError, RuntimeError, ValueError) as error:
                 event(path, "error", error=str(error))
                 continue
@@ -584,7 +628,7 @@ def import_files(root, paths, progress=None, skip_duplicates=True, *, before_com
             if tags:
                 known[tags.key].append(tags)
 
-        if stored:
+        if stored or photos:
             if before_commit is not None:
                 before_commit()
             uploads = {session.root / device_path[1:]: (path, media)
@@ -595,13 +639,22 @@ def import_files(root, paths, progress=None, skip_duplicates=True, *, before_com
                 event(path, "upload", sent=sent, total=media.size_bytes)
 
             try:
-                session.commit(database, progress=report if progress is not None else None)
+                session.commit(database if stored else None,
+                               progress=report if progress is not None else None,
+                               photos=[(image, album) for _, image, album in photos])
             except (OSError, RuntimeError, ValueError) as error:
                 for path, media, _ in stored:
                     event(path, "error", total=media.size_bytes, error=str(error))
+                for path, image, _ in photos:
+                    event(path, "error", total=image.stat().st_size, error=str(error))
                 raise
+        for path, image, _ in photos:
+            size = image.stat().st_size
+            event(path, "done", sent=size, total=size)
     for path, media, _ in stored:
         event(path, "done", sent=media.size_bytes, total=media.size_bytes)
     return [dict(source=str(path), device=device_path,
                  source_sample_rate_hz=media.source_rate, sample_rate_hz=media.sample_rate)
-            for path, media, device_path in stored]
+            for path, media, device_path in stored] + [
+                dict(source=str(path), device="/Photos/Photo Database", album=album)
+                for path, _, album in photos]
