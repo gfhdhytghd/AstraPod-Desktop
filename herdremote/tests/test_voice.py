@@ -319,6 +319,20 @@ class DaemonTests(VoiceFixture, unittest.TestCase):
         self.bus.ready.side_effect = hrvoice.VoiceError(hrvoice.NOT_RUNNING)
         self.assertEqual(self.result(b"vd\t9\t-"), ["R", "9", "err", hrvoice.NOT_RUNNING])
 
+    def test_t3_player_voice_commits_at_desktop_focus(self):
+        self.daemon.agents.control = "t3"
+        self.daemon.t3_player = True
+        for target in (b"t3t1", b"w:t3p1"):
+            with self.subTest(target=target):
+                self.bus.status.side_effect = [(0, "idle"), (23, "recording")]
+                self.assertEqual(self.result(b"vd\t1\t" + target),
+                                 ["R", "1", "ok", "Talking"])
+                self.assertEqual(self.result(b"vu\t2"), ["R", "2", "ok", "Sent"])
+        self.focus.assert_not_called()
+        self.assertEqual(self.methods(), ["HoldStart", "HoldStop"] * 2)
+        with self.assertRaisesRegex(ValueError, "Voice cannot reach T3"):
+            self.daemon.queue_voice("vd", "t3t1")  # Explicit API target.
+
     def test_daemon_discard_command(self):
         self.assertEqual(self.result(b"vd\t7\t-"), ["R", "7", "ok", "Talking"])
         self.bus.status.side_effect = None

@@ -1050,5 +1050,7 @@ herdr actions use `pane.send_keys` for Esc, `pane.zoom` for the displayed
 zoom mode and `pane.send_input` for an ordered text-and-Enter submission.
 The `org.lais.FcitxVoice1` D-Bus interface supplies recording lifecycle
 signals and methods for committing input at the focused desktop field.
-It has no transcript return path for HerdRemote, so T3 detail refuses
-voice holds.
+For an iPod in T3 mode, hold-to-talk uses the current desktop input field
+even when the player is showing a thread or project. It does not move
+desktop focus, even with `voice_focus=on`. The IME does not return a
+transcript to HerdRemote or post it to the selected T3 thread.
