@@ -414,14 +414,16 @@ class PlayerProtocol(unittest.TestCase):
         pane = self.daemon.agents.threads.alias("running")
         self.command(f"det\t{pane}")
         self.command(f"ft\t2\t{wid}\tall")
+        self.daemon.voice.press.return_value = (True, "Talking")
         self.command(f"vd\t3\t{pane}")
+        self.assertEqual(self.rows("R")[-1], [["R", "3", "ok", "Talking"]])
         self.daemon.link.max_message = 256
         self.daemon.send.reset_mock()
         self.daemon.push()
         self.assertEqual(self.rows("D")[-1][0][1:6],
                          [pane, "-1", "Thread running", "Running · gpt-6.2-sol", "hello world"])
         self.daemon.herdr.assert_not_called()
-        self.assertFalse(self.daemon.voice.press.called)
+        self.daemon.voice.press.assert_called_once_with("-")
         self.assertTrue(all(len(c.args[0]) <= 256 for c in self.daemon.send.call_args_list))
         self.daemon.configure_agents(hragent.config({"T3_CONTROL": "on"}))
         self.daemon.push()

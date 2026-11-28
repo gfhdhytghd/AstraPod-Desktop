@@ -1028,6 +1028,12 @@ class Daemon:
         if self.desktop.voice_owner is not None:
             self.send(hrproto.result(req, False, "Voice input busy"))
             return
+        # T3 selections carry context on the player. The desktop IME commits
+        # at the current focus, just as it does for an untargeted Usage hold.
+        if (name == "vd" and self.player_t3 and target and
+                (hragent.THREAD.fullmatch(target) or
+                 target.startswith("w:") and hragent.PROJECT.fullmatch(target[2:]))):
+            target = "-"
         if self.voice_worker is not None:
             try:
                 self.queue_voice(name, target, req)
