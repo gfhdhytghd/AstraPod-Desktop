@@ -421,6 +421,13 @@ class JellyfinLibrary(RufinLibrary):
                 return self.generation, len(rows), self.album_art_keys(rows)
             return None
 
+    def album_art_order(self):
+        with self.lock:
+            if self.session is not None:
+                return tuple(art_id(template) for template in self.art_aliases.values())
+            return tuple(row['art'] for row in self.fallback_albums or ()
+                         if row.get('art') not in (None, '-'))
+
     def art(self, uri):
         # Rufin uses the same URI as Jellyfin for a known album or track.
         with self.lock:

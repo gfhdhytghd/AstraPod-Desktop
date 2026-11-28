@@ -1222,7 +1222,7 @@ class Daemon:
                 self.pump_reads()
                 self.push()
                 if self.cider is not None:
-                    self.cider.poll(self.link.send, self.link.best_effort_delay)
+                    self.cider.poll(self.link.send, self.link.best_effort_delay, self.link.max_message)
                 self.plugin_link.poll(self.link)
                 self.poll_desktop()
             except (podlink.LinkClosed, hrcider.SessionExpired) as error:
