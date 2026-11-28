@@ -292,7 +292,7 @@ class DesktopAPI(unittest.TestCase):
         self.assertFalse(self.server.state()["link"]["borrowed"])
 
     def test_agent_control_reload_preserves_link_and_player_capabilities(self):
-        link = self.daemon.link = SimpleNamespace(opened=True)
+        link = self.daemon.link = SimpleNamespace(opened=True, send=Mock())
         self.daemon.sent_ws = b"existing picture"
         self.daemon.t3_player = self.daemon.question_ext = True
         for revision, mode in enumerate(("t3", "herdr"), 1):
@@ -302,7 +302,8 @@ class DesktopAPI(unittest.TestCase):
             self.assertEqual(self.server.state()["agents"], {"control": mode})
             self.assertEqual(self.server.state()["t3"]["enabled"], mode == "t3")
             self.assertIs(self.daemon.link, link)
-            self.assertEqual(self.daemon.sent_ws, b"existing picture")
+            self.assertEqual(self.daemon.sent_ws, b"")
+            self.assertEqual(link.send.call_args.args[1], hrproto.agent_mode(mode))
             self.assertTrue(self.daemon.question_ext)
             self.assertEqual(self.daemon.player_t3, mode == "t3")
 
