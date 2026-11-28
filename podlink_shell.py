@@ -19,7 +19,7 @@ import usb.core
 COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4, "open-bench": 5}
 REQUEST, INDEX = 0x5D, 0x4951
 PLAYBACK_INDEX = 0x4954
-PLAYBACK_COMMANDS = {"play": 1, "seek": 2, "next": 3, "prev": 4, "open-lyrics": 5}
+PLAYBACK_COMMANDS = {"play": 1, "seek": 2, "next": 3, "prev": 4, "open-lyrics": 5, "probe-video": 6}
 PLAYBACK_STATUS = struct.Struct("<IIIi6Ii24s260s")
 PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playlist",
                            34: "seek outside track", 61: "no active playback"}
@@ -151,12 +151,14 @@ def playback_status(player):
 
 
 def playback_payload(action, argument, start_ms):
-    if action == "play":
-        path = argument.encode("utf-8")
+    if action in ("play", "probe-video"):
+        path = (argument or "").encode("utf-8")
         if not path.startswith(b"/") or not 2 <= len(path) <= 259 or any(
             ch in path for ch in (b"\0", b"\r", b"\n")
         ):
-            raise ValueError("play requires an absolute iPod path of 2 to 259 UTF-8 bytes")
+            raise ValueError(f"{action} requires an absolute iPod path of 2 to 259 UTF-8 bytes")
+        if action == "probe-video":
+            return path
         return struct.pack("<I", playback_ms(start_ms if start_ms is not None else 0)) + path
     if action == "seek":
         return struct.pack("<I", playback_ms(argument))
@@ -729,8 +731,13 @@ def execute(serial, action, argument=None, *, value=None, yes=False, json_output
                 error = result["command_error"]
                 if error:
                     detail = PLAYBACK_COMMAND_ERRORS.get(error, f"error {error}")
+                    if action == "probe-video" and error == errno.EIO:
+                        detail = f"decode={result['playback_error']} (see player log)"
                     raise RuntimeError(f"{action}: {detail}")
-                print(f"{action}: processed")
+                if action == "probe-video":
+                    print(f"{action}: frames={result['playback_error']}")
+                else:
+                    print(f"{action}: processed")
                 return
             if reply[2] != initial[2] and reply[2] != expected_sequence:
                 raise RuntimeError("Playback result superseded by another shell command")
@@ -752,7 +759,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--serial", required=True, help="USB serial number of the iPod")
     actions = ("status", "debug-list", "debug", *COMMANDS,
-               "next", "prev", "open-lyrics", "playback-status", "log-fetch",
+               "next", "prev", "open-lyrics", "probe-video", "playback-status", "log-fetch",
                "record-info", "record-start", "record-stop", "record-fetch",
                "plugin-launch", "plugin-status", "plugin-exit", "screenshot",
                *SETTINGS_REQUESTS, *LCD_COMMANDS, "ui-perf")
