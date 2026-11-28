@@ -188,12 +188,17 @@ def _library() -> CDLL:
             ("g_strdup", c_void_p, c_char_p),
             ("g_error_free", None, _ErrorPointer),
             ("g_list_delete_link", _List, _List, _List),
+            ("g_list_free", None, _List),
             ("itdb_parse", _DbPointer, c_char_p, _ErrorOut),
             ("itdb_free", None, _DbPointer),
             ("itdb_write", c_int, _DbPointer, _ErrorOut),
             ("itdb_device_supports_artwork", c_int, c_void_p),
             ("itdb_playlist_mpl", _PlaylistPointer, _DbPointer),
             ("itdb_playlist_is_mpl", c_int, _PlaylistPointer),
+            ("itdb_playlist_is_podcasts", c_int, _PlaylistPointer),
+            ("itdb_playlist_new", _PlaylistPointer, c_char_p, c_int),
+            ("itdb_playlist_add", None, _DbPointer, _PlaylistPointer, c_int),
+            ("itdb_playlist_remove", None, _PlaylistPointer),
             ("itdb_playlist_add_track", None, _PlaylistPointer, _TrackPointer, c_int32),
             ("itdb_track_new", _TrackPointer),
             ("itdb_track_free", None, _TrackPointer),
@@ -534,6 +539,41 @@ class StockDatabase:
                 bool(_library().itdb_playlist_is_mpl(pointer)),
             ))
         return tuple(playlists)
+
+    def update_playlists(
+        self, updates: Iterable[tuple[int | None, str, Iterable[int]]], removals: Iterable[int],
+    ) -> tuple[int, ...]:
+        """Update static playlists by ID and return their IDs in input order."""
+        library = _library()
+        database = self._get_pointer()
+        playlists = {pointer.contents.id: pointer for pointer in self._native_playlists()}
+        tracks = {track.contents.dbid or track.contents.id: track
+                  for track in self._native_tracks()}
+
+        def existing(playlist_id):
+            playlist = playlists[playlist_id]
+            if (playlist.contents.is_spl or library.itdb_playlist_is_mpl(playlist)
+                    or library.itdb_playlist_is_podcasts(playlist)):
+                raise StockDatabaseError("Cannot replace a special stock iPod playlist.")
+            return playlist
+
+        for playlist_id in removals:
+            library.itdb_playlist_remove(existing(playlist_id))
+
+        ids = []
+        for playlist_id, name, members in updates:
+            if playlist_id is None:
+                playlist = library.itdb_playlist_new(name.encode("utf-8"), False)
+                library.itdb_playlist_add(database, playlist, -1)
+            else:
+                playlist = existing(playlist_id)
+                library.g_list_free(playlist.contents.members)
+                playlist.contents.members = _List()
+                playlist.contents.num = 0
+            for track_id in reversed(tuple(members)):
+                library.itdb_playlist_add_track(playlist, tracks[track_id], 0)
+            ids.append(playlist.contents.id)
+        return tuple(ids)
 
     def add_track(
         self, row: DatabaseTrack, *, filetype: str, sample_rate: int, artwork: Path | None = None,

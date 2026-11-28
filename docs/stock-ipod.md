@@ -62,6 +62,30 @@ creates another entry.
    ejection. Verify that the iPod still plays the original and locally
    imported tracks.
 
+## Sync AstraPod playlists
+
+Stock sync also mirrors the AstraPod playlist catalogue. Its default directory
+is `/Playlists`. The `playlist catalog directory` setting in
+`/.rockbox/config.cfg` can select another directory. Stock sync reads saved
+UTF-8 `.m3u8` files in the catalogue and its subdirectories. AstraPod's live
+On-The-Go queue stays in `/.rockbox/on-the-go.m3u8`. Saved On-The-Go lists
+appear as **New Playlist N**.
+
+On the Jellyfin sync page, preview and apply even when there are zero track
+changes. Unmatched entries appear in the preview and in the status tooltip
+after apply. Check **Music > Playlists** in Apple firmware. The list contains
+the matched tracks in source order, including repeated tracks. Stock sync
+matches paths against the stock library. An entry for a track absent from
+that library is skipped. A playlist with no matching entries is empty.
+
+On a second preview, the playlist change count is zero unless the sources
+or matching tracks changed. Edit a saved list, apply, and check its new
+contents. Delete its `.m3u8`, apply again, and check that its stock copy is
+gone. Existing stock playlists with the same name keep their contents.
+The writer gives the imported playlist a free display name. It stores the
+imported playlist's ID and name in `iPod_Control/iTunes/.astrapod-playlists.json`
+and publishes the index with the database in the same transaction.
+
 ## Direct transport
 
 1. Mount the iPod's FAT volume in the file manager. Confirm that the mount
