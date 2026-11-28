@@ -61,6 +61,46 @@ then queues a Rockbox database update on the restored PodLink connection.
 Keep `/Music/PodLink` inside the player's database scan roots. Disk Mode needs
 `udisksctl`, `gdbus`, `lsblk` and HerdRemote from the same desktop checkout.
 
+### Calendars, to-dos and contacts
+
+Open **日历与联系人**. To try the workflow with a temporary player and a
+sample calendar, start the desktop app with `--demo`.
+
+- Under **日历与待办**, enter the CalDAV server URL, username and password or
+  app password. Select **连接并列出日历** and check the calendars you want.
+  The app saves the password through `secret-tool` (libsecret and an unlocked
+  desktop Secret Service). Use the same CalDAV server address and account
+  as in DankCalendar. Use HTTPS. If discovery redirects to a different
+  host, enter the destination server URL directly.
+- Use **导入 ICS** to bring one or more files into **本地日历**, which appears
+  in the same list. Each file may contain multiple calendars, events and
+  tasks. Select **编辑本地日历** to change an entry. The editor preserves
+  timezone definitions, recurrence rules and excluded dates. To save a
+  local or CalDAV calendar to a file, select its row and use **导出 ICS**.
+- Turn on **磁盘模式** and select **同步日历与待办**. Choose where the app
+  should send new iPod events and tasks. Items without a destination stay in
+  `/Calendars/AstraPod.ics`. The app writes one `AstraPod-DAV-*.ics` per
+  selected calendar and syncs edits and deletions in those files back to
+  the server. For competing edits, the latest modification wins. A tie
+  uses the server's version. The app keeps the losing edit as an `.ics`
+  file and lists it in the conflict dialog. A competing deletion keeps
+  the edited item and reports the conflict. The local calendar syncs in
+  both directions through `/Calendars/AstraPod-Local.ics` and works
+  without a CalDAV account. For local conflicts with equal timestamps,
+  the app keeps the desktop version.
+- Under **联系人**, use **导入 vCard** for one or more `.vcf` files. Select a
+  contact and choose **编辑联系人** to update its fields. **同步联系人** reads
+  changes from the iPod and writes new contacts to `/Contacts/AstraPod`.
+  The app preserves embedded photos and keeps edited contacts in their
+  source files. Missing contacts are kept in the desktop library.
+- Turn off **磁盘模式** to eject the player when finished.
+
+**打开冲突副本** opens the local folder that holds the saved versions. It also
+contains the local contacts and calendar sync cache under
+`$XDG_DATA_HOME/astrapod/extras` (default `~/.local/share/astrapod/extras`).
+The sync uses the AstraPod firmware's
+[Extras data format][extras-format] and the existing USB Disk Mode transport.
+
 ## User services
 
 The supplied units expect the checkout and its `.venv` at
@@ -120,3 +160,4 @@ AstraPod Desktop is licensed under GPL-2.0-or-later. See [LICENSE](LICENSE).
 [ir]: usb_remote_key/README.md
 [plugins]: docs/input-plugins.md
 [cider]: https://github.com/gfhdhytghd/AstraPod-Cider
+[extras-format]: https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/extras-data-format.md

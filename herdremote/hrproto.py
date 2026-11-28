@@ -231,8 +231,11 @@ def result(req, ok, text=None):
     return encode([fields])
 
 
-def tick(age_seconds, herdr_ok):
-    return encode([["T", str(int(age_seconds)), "1" if herdr_ok else "0"]])
+def tick(age_seconds, herdr_ok, t3_ok=None):
+    fields = ["T", str(int(age_seconds)), "1" if herdr_ok else "0"]
+    if t3_ok is not None:
+        fields.append("1" if t3_ok else "0")
+    return encode([fields])
 
 
 def usage(items, now, *, replace_errors=False):
@@ -294,7 +297,8 @@ def parse_command(payload):
               "ks": 1, "act": 3,
               "vd": 2, "vu": 1, "vc": 1, "k": 2, "ft": 3, "det": 1}
     if name in ("qx", "tc"):
-        return (name, args) if len(records) == 1 and args == ["1"] else None
+        valid = (["1"], ["2"]) if name == "tc" else (["1"],)
+        return (name, args) if len(records) == 1 and args in valid else None
     if name == "qi":
         if (len(records) == 1 and len(args) == 4 and args[2] == "enter"
                 and all(args) and len(args[0].encode("utf-8")) <= 7
@@ -339,8 +343,8 @@ def parse_command(payload):
     return name, args
 
 
-def clock(local=None):
-    """RTC local civil time, with an explicit UTC offset (seconds east)."""
+def clock(local=None, zone=None):
+    """Encode legacy TS and the negotiated optional UTC/zone extension."""
     local = local or datetime.datetime.now().astimezone()
     offset = local.utcoffset()
     if offset is None or not 2000 <= local.year <= 2037:
@@ -348,4 +352,14 @@ def clock(local=None):
     seconds = int(offset.total_seconds())
     if abs(seconds) > 14 * 3600 or offset.total_seconds() != seconds:
         raise ValueError("Invalid UTC offset")
-    return encode([["TS", "1", local.strftime("%Y-%m-%dT%H:%M:%S"), "%+d" % seconds]])
+    fields = ["TS", "1", local.strftime("%Y-%m-%dT%H:%M:%S"), "%+d" % seconds]
+    if zone is not None:
+        import hrtimezone
+        name, rule = zone
+        if not hrtimezone.NAME.fullmatch(name) or not hrtimezone.RULE.fullmatch(rule):
+            raise ValueError("Invalid time zone metadata")
+        utc = local.astimezone(datetime.timezone.utc)
+        if not 2000 <= utc.year <= 2037:
+            raise ValueError("RTC sync needs a UTC date in 2000..2037")
+        fields += [utc.strftime("%Y-%m-%dT%H:%M:%SZ"), name, rule]
+    return encode([fields])

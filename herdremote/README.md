@@ -496,6 +496,12 @@ requests merged history or moves the computer viewport. The fake herdr can
 return either the legacy record or a record containing cursor metadata.
 The [HerdRemote protocol](https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/herdremote-protocol.md) defines the fields and their budgets.
 
+## Computer clock sync
+
+HerdRemote sets the player's clock when PodLink connects. Players that
+advertise time zone support can also follow the computer's zone. See the
+[clock wire format](../docs/herdremote-protocol.md#computer-clock-sync).
+
 ## Scroll latency
 
 The link loop polls and handles incoming commands before publishing dashboard

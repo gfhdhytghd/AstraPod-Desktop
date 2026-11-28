@@ -12,6 +12,7 @@ python tests/firmware/cider_featured_test.py "$out/featured"
 python tests/firmware/remote_menu_pipeline_test.py "$out/menu"
 python tests/firmware/remote_palette_test.py "$out/palette"
 python tests/firmware/fu76_handoff_contract_test.py "$out/handoff"
+python tests/firmware/time_zone_contract_test.py "$out/time-zone"
 ```
 
 The wire check uses the firmware's `tools/tests/podlink_rust_build.py`

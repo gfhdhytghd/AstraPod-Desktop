@@ -24,7 +24,6 @@ import signal
 import sys
 import threading
 import time
-import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import podlink  # noqa: E402  podlink.py: the PodLink frame codec
@@ -38,6 +37,7 @@ import hrdetect  # noqa: E402
 import hrdetail  # noqa: E402
 import hrherdr  # noqa: E402
 import hrorder  # noqa: E402
+import hrtimezone
 import hrproto  # noqa: E402
 import hrt3  # noqa: E402
 import hrvoice  # noqa: E402
@@ -164,20 +164,24 @@ class ClockSync:
     def __init__(self):
         self.anchor = None
         self.offset = None
+        self.zone = None
+        self.supports_zone = False
         self.next_sync = 0.0
 
     def poll(self, send, mono=None, wall=None, offset=None):
         mono = time.monotonic() if mono is None else mono
         wall = time.time() if wall is None else wall
+        zone = hrtimezone.local_zone() if self.supports_zone else None
+        local = hrtimezone.local_time(wall, zone)
         if offset is None:
-            offset = int(datetime.datetime.fromtimestamp(wall).astimezone().utcoffset().total_seconds())
+            offset = int(local.utcoffset().total_seconds())
         anchor = wall - mono
         if (self.anchor is not None and mono < self.next_sync and
-                abs(anchor - self.anchor) <= CLOCK_JUMP_SECONDS and offset == self.offset):
+                abs(anchor - self.anchor) <= CLOCK_JUMP_SECONDS and
+                offset == self.offset and zone == self.zone):
             return False
-        local = datetime.datetime.fromtimestamp(wall).astimezone()
-        send(hrproto.clock(local))
-        self.anchor, self.offset = anchor, offset
+        send(hrproto.clock(local, zone) if zone else hrproto.clock(local))
+        self.anchor, self.offset, self.zone = anchor, offset, zone
         self.next_sync = mono + CLOCK_SYNC_SECONDS
         return True
 
@@ -235,8 +239,9 @@ class Daemon:
                                           release_serial=self.close_link)
         self.reset_session()
 
-    def reset_session(self):
-        self.clock_sync = ClockSync()
+    def reset_session(self, keep_clock=False):
+        if not keep_clock:
+            self.clock_sync = ClockSync()
         self.session_generation = getattr(self, "session_generation", 0) + 1
         self.keys.reset()
         if not getattr(self, "ir_fallback", None) or not self.ir_fallback.talking:
@@ -250,6 +255,8 @@ class Daemon:
         self.question_ext = False
         self.t3_player = False
         self.t3_capability_deadline = None
+        self.t3_health_capable = False
+        self.sent_t3_health = None
         self.t3_focus_pending = None
         self.agents.reset()
         self.custom_pending = {}
@@ -560,27 +567,28 @@ class Daemon:
             self.link.keepalive_timeout = 3.0
             self.link.nonce_keepalive = True
             self.link.open()
+            self.reset_session()
+            self.send(hrproto.hello(VERSION))
+            self.send(hrproto.agent_mode(self.agents.control))
+            self.send(hrhandoff.CAPABILITY)
+            self.send(hrtimezone.QUERY)
+            self.clock_sync.poll(self.send)
         except (OSError, RuntimeError, TimeoutError, podlink.LinkClosed) as e:
             log.info("PodLink at %s not ready: %s", device, e)
-            self.close_link()
+            self.close_link(graceful=False)
             return False
         log.info("PodLink session open on %s", device)
         self.link_device = device
         self.link_serial = DEVICE["serial"] if not self.args.port else None
-        self.reset_session()
-        self.send(hrproto.hello(VERSION))
-        self.send(hrproto.agent_mode(self.agents.control))
-        self.send(hrhandoff.CAPABILITY)
-        self.clock_sync.poll(self.send)
         return True
 
-    def close_link(self):
+    def close_link(self, *, graceful=True):
         self.disk_control.reset()
         self.plugin_link.link_lost()
         if self.cider is not None:
             self.cider.disconnect()
         self.reset_session()
-        if self.link and self.link.opened:
+        if graceful and self.link and self.link.opened:
             try:
                 self.link.close(1001, "herdremote stopping")
             except (OSError, RuntimeError, TimeoutError, podlink.LinkClosed):
@@ -642,7 +650,23 @@ class Daemon:
         self.flush_replies()
         if not t3_mode and not self.model_time:
             return  # do not present an empty startup model while a read is pending
-        picture = self.agents.client.snapshot() if t3_mode else ({}, {}, {})
+        health_tick = t3_mode and self.t3_health_capable
+        t3_ok, picture = self.agents.client.player_snapshot() if t3_mode else (
+            False, ({}, {}, {}))
+        if health_tick:
+            now = time.monotonic()
+            if t3_ok != self.sent_t3_health or now >= self.next_tick:
+                self.send(hrproto.tick(0, self.herdr_ok, t3_ok))
+                self.sent_t3_health = t3_ok
+                self.next_tick = now + TICK_SECONDS
+            if not t3_ok:
+                # Keep the player's last rows available for local navigation.
+                # Drop prompts while their upstream session is unavailable.
+                for qid in self.sent_questions:
+                    self.send(hrproto.question_gone(qid))
+                self.sent_questions.clear()
+                self.agents.recent_questions.clear()
+                return
         limit = self.detail_limit()
         spaces = self.agents.workspaces(picture) if t3_mode else self.model["workspaces"]
         ws = hrproto.workspaces(spaces, limit)
@@ -720,13 +744,17 @@ class Daemon:
             # detail frames less than one second apart.
             now = time.monotonic()
             self.next_detail = now + DETAIL_SECONDS
-        if now >= self.next_tick:
+        if not health_tick and now >= self.next_tick:
             # The firmware uses a false heartbeat to display a herdr-specific error.
             age, ok = (0, True) if t3_mode else (now - self.model_time, self.herdr_ok)
             self.send(hrproto.tick(age, ok))
             self.next_tick = now + TICK_SECONDS
 
     def command(self, payload):
+        if payload == hrtimezone.CAPABILITY:
+            self.clock_sync.supports_zone = True
+            self.clock_sync.poll(self.send)
+            return
         if payload == hrdisk.CAPABILITY and self.disk_control.hello(payload, self.send):
             return
         if self.remote_log.submit(payload):
@@ -748,7 +776,7 @@ class Daemon:
             self.send(hrproto.result(args[0], False, "IR host fallback active"))
             return
         if name == "hr":
-            self.reset_session()
+            self.reset_session(keep_clock=True)
             self.sent_ws = b""
             self.t3_capability_deadline = time.monotonic() + T3_CAPABILITY_SECONDS
             if self.link is not None:
@@ -760,6 +788,9 @@ class Daemon:
         elif name == "tc":
             self.t3_player = self.sent_ws is not None
             self.t3_capability_deadline = None
+            if self.t3_player and args[0] == "2":
+                self.t3_health_capable = True
+                self.next_tick = 0
         elif self.agents.control == "t3" and not self.t3_player:
             return
         elif name == "qi":
@@ -1192,7 +1223,8 @@ class Daemon:
                 continue
             except (OSError, TimeoutError, ValueError) as error:
                 log.info("PodLink lost: %s", error)
-                self.close_link()
+                # A failed write can leave a partial frame on the wire.
+                self.close_link(graceful=False)
                 continue
             time.sleep(0.02)
 
