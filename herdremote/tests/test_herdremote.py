@@ -16,7 +16,7 @@ import threading
 import time
 import types
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, call, patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -505,7 +505,14 @@ class LinkRecovery(unittest.TestCase):
                 self.assertIsNone(daemon.link)
                 self.assertIsNone(daemon.port)
                 self.assertTrue(daemon.open_link())
-                recovered.send.assert_any_call(podlink.TEXT, hrproto.hello(herdremote.VERSION))
+                self.assertEqual(recovered.send.call_args_list, [
+                    call(podlink.TEXT, hrproto.hello(herdremote.VERSION)),
+                    call(podlink.TEXT, hrproto.agent_mode(daemon.agents.control)),
+                    call(podlink.TEXT, herdremote.hrhandoff.CAPABILITY),
+                    call(podlink.TEXT, herdremote.hrtimezone.QUERY),
+                    call(podlink.TEXT, ANY),
+                ])
+                self.assertTrue(recovered.send.call_args.args[1].startswith(b"TS\t1\t"))
                 daemon.close_link()
                 recovered.close.assert_called_once()
                 recovered_port.close.assert_called_once()

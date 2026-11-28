@@ -343,8 +343,8 @@ def parse_command(payload):
     return name, args
 
 
-def clock(local=None):
-    """RTC local civil time, with an explicit UTC offset (seconds east)."""
+def clock(local=None, zone=None):
+    """Encode legacy TS and the negotiated optional UTC/zone extension."""
     local = local or datetime.datetime.now().astimezone()
     offset = local.utcoffset()
     if offset is None or not 2000 <= local.year <= 2037:
@@ -352,4 +352,14 @@ def clock(local=None):
     seconds = int(offset.total_seconds())
     if abs(seconds) > 14 * 3600 or offset.total_seconds() != seconds:
         raise ValueError("Invalid UTC offset")
-    return encode([["TS", "1", local.strftime("%Y-%m-%dT%H:%M:%S"), "%+d" % seconds]])
+    fields = ["TS", "1", local.strftime("%Y-%m-%dT%H:%M:%S"), "%+d" % seconds]
+    if zone is not None:
+        import hrtimezone
+        name, rule = zone
+        if not hrtimezone.NAME.fullmatch(name) or not hrtimezone.RULE.fullmatch(rule):
+            raise ValueError("Invalid time zone metadata")
+        utc = local.astimezone(datetime.timezone.utc)
+        if not 2000 <= utc.year <= 2037:
+            raise ValueError("RTC sync needs a UTC date in 2000..2037")
+        fields += [utc.strftime("%Y-%m-%dT%H:%M:%SZ"), name, rule]
+    return encode([fields])
