@@ -508,6 +508,7 @@ class LinkRecovery(unittest.TestCase):
                 self.assertEqual(recovered.send.call_args_list, [
                     call(podlink.TEXT, hrproto.hello(herdremote.VERSION)),
                     call(podlink.TEXT, hrproto.agent_mode(daemon.agents.control)),
+                    call(podlink.TEXT, hrproto.thread_list()),
                     call(podlink.TEXT, herdremote.hrhandoff.CAPABILITY),
                     call(podlink.TEXT, herdremote.hrtimezone.QUERY),
                     call(podlink.TEXT, ANY),

@@ -459,6 +459,59 @@ class PlayerProtocol(unittest.TestCase):
         self.daemon.push()
         self.assertEqual(self.rows("T")[-1], [["T", "0", "1"]])
 
+    def test_hello_announces_the_thread_list(self):
+        for mode in ("herdr", "t3"):
+            self.daemon.configure_agents(hragent.config({"AGENT_CONTROL": mode}))
+            self.daemon.send.reset_mock()
+            self.command("hr\t1")
+            frames = [call.args[0] for call in self.daemon.send.call_args_list]
+            self.assertEqual(frames[1:3], [hrproto.agent_mode(mode), b"TL\t1"])
+
+    def test_thread_list_spans_projects_in_attention_order(self):
+        self.enable_t3()
+        ask = request("ask", createdAt="2026-11-20T09:00:00.000Z")
+        rows = [thread("idle-new", updatedAt="2026-11-20T10:05:00.000Z"),
+                thread("running", projectId="other", status="running",
+                       updatedAt="2026-11-20T10:02:00.000Z"),
+                thread("waiting", projectId="other", pendingRuntimeRequest=ask),
+                thread("idle-old", updatedAt="2026-11-20T08:00:00.000Z"),
+                thread("settled", settledOverride="settled", status="completed",
+                       updatedAt="2026-11-20T10:09:00.000Z"),
+                thread("archived-project", projectId="gone"),
+                thread("deleted", deletedAt=UTC)]
+        rows += [thread(f"old{i}", updatedAt="2020-01-01T00:00:00Z") for i in range(20)]
+        self.install(rows, {"running": detail(messages=[message("a", "assistant", "hi\nthere")])},
+                     (None, project("other"), project("gone", archivedAt=UTC)))
+        alias = self.daemon.agents.threads.alias
+        self.command("sub\tt3\tactive")
+        self.daemon.push()
+        agents = self.rows("A")[-1]
+        self.assertEqual(agents[0], ["A", "t3", "16"])
+        self.assertEqual([row[0] for row in agents[1:5]],
+                         [alias("waiting"), alias("running"), alias("idle-new"), alias("idle-old")])
+        self.assertEqual([row[5] for row in agents[1:4]],
+                         ["Project other", "Project other", "Project project"])
+        self.assertEqual(agents[2][6], "hi")
+        names = [row[4] for row in agents[1:]]
+        for gone in ("settled", "archived-project", "deleted"):
+            self.assertNotIn("Thread " + gone, names)
+        self.command("sub\tt3\tall")
+        self.daemon.push()
+        agents = self.rows("A")[-1]
+        self.assertEqual(agents[1][0], alias("settled"))
+        self.assertNotIn("Thread archived-project", [row[4] for row in agents[1:]])
+        self.assertFalse([tabs for tabs in self.rows("T") if len(tabs[0]) == 7])
+
+    def test_thread_list_needs_a_t3_player(self):
+        self.install((thread("running", status="running"),))
+        self.command("sub\tt3\tactive")
+        self.daemon.push()
+        self.assertFalse(self.rows("A"))
+        self.enable_t3()
+        self.command("sub\tt3\tlatest")
+        self.daemon.push()
+        self.assertFalse(self.rows("A"))
+
     def test_thread_focus_opens_local_link_and_project_stays_focus_free(self):
         opener, (pane,) = self.setup_focus(thread(SID, title="Build"))
         project_id = self.daemon.agents.projects.alias("project")
