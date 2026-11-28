@@ -16,6 +16,7 @@ import threading
 import time
 import types
 import unittest
+from unittest.mock import Mock, patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -481,6 +482,33 @@ class FakeHerdr(threading.Thread):
                     result = {}
                 conn.sendall(json.dumps(dict(id=request["id"],
                                              result=result)).encode() + b"\n")
+
+
+class LinkRecovery(unittest.TestCase):
+    def test_initial_write_timeout_releases_port_without_another_write(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(
+                os.environ, XDG_RUNTIME_DIR=folder, XDG_CONFIG_HOME=folder):
+            tty = Path(folder) / "fake-tty"
+            tty.touch()
+            daemon = herdremote.Daemon(types.SimpleNamespace(
+                socket=str(Path(folder) / "herdr.sock"), state=None, port=str(tty)))
+            self.addCleanup(daemon.usage.close)
+            port, recovered_port = Mock(), Mock()
+            stalled = Mock()
+            stalled.send.side_effect = TimeoutError("Write timeout")
+            recovered = Mock()
+            with (patch.object(podlink, "serial_port", side_effect=[port, recovered_port]),
+                  patch.object(podlink, "Link", side_effect=[stalled, recovered])):
+                self.assertFalse(daemon.open_link())
+                port.close.assert_called_once()
+                stalled.close.assert_not_called()
+                self.assertIsNone(daemon.link)
+                self.assertIsNone(daemon.port)
+                self.assertTrue(daemon.open_link())
+                recovered.send.assert_any_call(podlink.TEXT, hrproto.hello(herdremote.VERSION))
+                daemon.close_link()
+                recovered.close.assert_called_once()
+                recovered_port.close.assert_called_once()
 
 
 class Focus(unittest.TestCase):

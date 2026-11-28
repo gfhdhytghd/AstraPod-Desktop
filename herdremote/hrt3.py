@@ -353,6 +353,10 @@ class Client:
         with self.lock:
             return self.picture
 
+    def player_snapshot(self):
+        with self.lock:
+            return self.connected, self.picture
+
     def usage_token(self):
         with self.lock:
             return self.token
