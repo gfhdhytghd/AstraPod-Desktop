@@ -77,6 +77,11 @@ def agent_mode(control):
     return encode([("M", control)])
 
 
+def thread_list():
+    """Sent after M: this daemon serves sub t3, the T3 thread list across projects."""
+    return encode([("TL", "1")])
+
+
 def hello(daemon_version):
     return encode([["HR", str(VERSION), clean(daemon_version, 32)]])
 

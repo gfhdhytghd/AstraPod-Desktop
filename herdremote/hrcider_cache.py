@@ -7,6 +7,7 @@ import struct
 import json
 import os
 import sqlite3
+import tempfile
 import threading
 import time
 import zlib
@@ -269,19 +270,31 @@ class Cache:
             header=struct.pack('<6H',0x5441,8,dim,dim,int(tier=='M'),0)
             if len(raw)!=12+2*dim*dim or raw[:12]!=header:raise ValueError('Invalid native artwork')
         name = key+'-'+tier+('.img' if tier=='original' else '.aat')
-        with self.lock:
-            tmp = self.root/(name+'.tmp')
-            with tmp.open('wb') as out:
+        # Slow disk flushes for unrelated covers must not stall cache hits.
+        # Give each writer its own file, then publish it under the index lock.
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=self.root, suffix='.tmp', delete=False) as out:
+                tmp = Path(out.name)
                 out.write(raw)
                 out.flush()
                 os.fsync(out.fileno())
-            os.replace(tmp,self.root/name)
-            self.touches.pop((key,tier),None)
-            with self.db:
-                self.db.execute('INSERT OR REPLACE INTO art VALUES (?,?,?,?,?)', (key,tier,name,len(raw),time.time()))
-                if tier!='original':self.db.execute('INSERT OR REPLACE INTO art_crc VALUES (?,?,?)',(key,tier,zlib.crc32(raw)))
-            if self.db.execute('SELECT COALESCE(SUM(bytes),0) FROM art').fetchone()[0] > self.art_limit:
-                self.evict()
+            with self.lock:
+                if self.closed:
+                    return
+                os.replace(tmp, self.root / name)
+                self.touches.pop((key, tier), None)
+                with self.db:
+                    self.db.execute('INSERT OR REPLACE INTO art VALUES (?,?,?,?,?)',
+                                    (key, tier, name, len(raw), time.time()))
+                    if tier != 'original':
+                        self.db.execute('INSERT OR REPLACE INTO art_crc VALUES (?,?,?)',
+                                        (key, tier, zlib.crc32(raw)))
+                if self.db.execute('SELECT COALESCE(SUM(bytes),0) FROM art').fetchone()[0] > self.art_limit:
+                    self.evict()
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
 
     def evict(self):
         with self.lock, self.db:

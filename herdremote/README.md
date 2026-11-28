@@ -968,8 +968,12 @@ cannot find `t3` in its PATH or at `~/.local/bin/t3`. Adjust
 `AGENT_QUICK_REPLIES` with one reply per line, up to eight lines and 60
 UTF-8 bytes per reply. A T3 sheet has room for the first seven replies.
 
-Selecting a T3 thread in **System > Agents** or entering its detail
-switches the thread view in the T3 desktop app. The window may stay
+With current firmware, **System > Agents** opens on the threads of every
+project in one list: threads that wait for an answer first, then running
+threads, then the rest, each most recent first. Scrolling the list leaves
+the desktop alone. Entering a thread's detail switches the thread view in
+the T3 desktop app. Older firmware lists projects first and follows the
+selected thread as it scrolls. The window may stay
 behind another window. With `T3_FOLLOW_IPOD=off`, the daemon confirms
 thread focus requests without opening the app link. The default is
 `on`. With follow on, the daemon passes a `t3code://threads/…` link
