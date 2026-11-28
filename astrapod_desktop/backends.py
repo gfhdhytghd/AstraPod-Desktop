@@ -639,7 +639,11 @@ class ProbedFile:
 
 
 IMPORT_SUFFIXES = {".flac", ".m4a", ".mp3"}
-STOCK_IMPORT_SUFFIXES = IMPORT_SUFFIXES | {".wav"}
+STOCK_VIDEO_SUFFIXES = {".m4v", ".mp4", ".mov", ".mkv", ".avi", ".webm", ".mpg", ".mpeg"}
+STOCK_PHOTO_SUFFIXES = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".tiff", ".tif",
+                        ".bmp", ".webp", ".gif"}
+STOCK_ONLY_SUFFIXES = STOCK_VIDEO_SUFFIXES | STOCK_PHOTO_SUFFIXES | {".wav"}
+STOCK_IMPORT_SUFFIXES = IMPORT_SUFFIXES | STOCK_ONLY_SUFFIXES
 
 
 def _leading_int(value) -> int:
@@ -670,8 +674,11 @@ class FileProber:
             return result
         suffixes = STOCK_IMPORT_SUFFIXES if stock else IMPORT_SUFFIXES
         if result.path.suffix.lower() not in suffixes:
-            result.error = ("只能导入 FLAC、M4A、MP3 和 WAV 文件" if stock else
+            result.error = ("不支持此文件格式" if stock else
                             "只能导入 FLAC、M4A 和 MP3 文件")
+            return result
+        if result.path.suffix.lower() in STOCK_PHOTO_SUFFIXES:
+            result.title, result.album = result.path.stem, result.path.parent.name
             return result
         try:
             out = subprocess.run(
@@ -684,6 +691,16 @@ class FileProber:
             return result
         fmt = info.get("format", {})
         tags = {key.lower(): value for key, value in (fmt.get("tags") or {}).items()}
+        if result.path.suffix.lower() in STOCK_VIDEO_SUFFIXES:
+            video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"
+                          and not s.get("disposition", {}).get("attached_pic")), None)
+            if video is None:
+                result.error = "文件不含视频画面"
+                return result
+            result.title = tags.get("title") or result.path.stem
+            result.album = tags.get("show", "")
+            result.codec = video.get("codec_name", "")
+            return result
         audio = next((s for s in info.get("streams", [])
                       if s.get("codec_type") == "audio"), {})
         for key, value in (audio.get("tags") or {}).items():

@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import fmt, icons, stock_transfer
-from ..backends import IMPORT_SUFFIXES, STOCK_IMPORT_SUFFIXES, expand_paths, music_tags_for
+from ..backends import (IMPORT_SUFFIXES, STOCK_IMPORT_SUFFIXES, STOCK_ONLY_SUFFIXES,
+                        STOCK_VIDEO_SUFFIXES, expand_paths, music_tags_for)
 from ..jobs import Cancelled
 from ..qt import QtCore, QtGui, QtWidgets, Qt, Signal
 from ..widgets import (DropFrame, PageHeader, ToggleSwitch, button, configure_table, draw_art,
@@ -17,6 +18,7 @@ from .sync import disk_mode_option
 R = QtCore.QRectF
 ITEM_ROLE = Qt.ItemDataRole.UserRole + 30
 WAV_REQUIRES_STOCK = "WAV 文件只能导入 Apple 原厂固件。"
+MEDIA_REQUIRES_STOCK = "照片和视频导入需要连接运行 Apple 原厂固件的 iPod。"
 
 
 @dataclass
@@ -306,6 +308,13 @@ class ImportPage(Page):
         self.skip_check.setChecked(True)
         self.skip_check.toggled.connect(self._skip_toggled)
         footer_layout.addWidget(self.skip_check)
+        self.video_kind = QtWidgets.QComboBox()
+        self.video_kind.setAccessibleName("视频分类")
+        for label_text, kind in (("自动识别视频", None), ("影片", "movie"),
+                                 ("电视节目", "tv-show"), ("音乐视频", "music-video")):
+            self.video_kind.addItem(label_text, kind)
+        self.video_kind.hide()
+        footer_layout.addWidget(self.video_kind)
         self.cancel_button = button("取消", None, None, self.cancel)
         self.cancel_button.setVisible(False)
         footer_layout.addWidget(self.cancel_button)
@@ -324,14 +333,14 @@ class ImportPage(Page):
     # Adding ---------------------------------------------------------
     @property
     def formats(self) -> str:
-        return "FLAC、M4A、MP3 和 WAV" if self.window_.disk.stock else "FLAC、M4A 和 MP3"
+        return "音乐、照片和视频" if self.window_.disk.stock else "FLAC、M4A 和 MP3"
 
     def add_files(self) -> None:
         suffixes = STOCK_IMPORT_SUFFIXES if self.window_.disk.stock else IMPORT_SUFFIXES
         filters = " ".join(f"*{suffix}" for suffix in sorted(suffixes))
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "添加到 iPod", str(Path.home() / "Music"),
-            f"音乐文件 ({filters});;所有文件 (*)")
+            f"媒体文件 ({filters});;所有文件 (*)")
         if paths:
             self.add_paths(paths)
 
@@ -348,7 +357,7 @@ class ImportPage(Page):
         files = expand_paths(paths, stock=self.window_.disk.stock is not None)
         fresh = self.model.add(files)
         if not files:
-            self.window_.flash(f"没有找到可以导入的音频文件。支持 {self.formats}。")
+            self.window_.flash(f"没有找到可以导入的文件。支持 {self.formats}。")
         self.stack.setCurrentWidget(self.table if self.model.items else self.target)
         self.update_summary()
         if fresh:
@@ -364,7 +373,7 @@ class ImportPage(Page):
         prober = self.window_.services.prober
 
         def probe(item):
-            if item.path.suffix.lower() == ".wav":
+            if item.path.suffix.lower() in STOCK_ONLY_SUFFIXES:
                 return prober.probe(item.path, stock=True)
             return prober.probe(item.path)
 
@@ -386,8 +395,9 @@ class ImportPage(Page):
             item.cover = None if image.isNull() else image
         if result.error:
             item.state, item.error, item.include = "error", result.error, False
-        elif item.path.suffix.lower() == ".wav" and self.window_.disk.stock is None:
-            item.state, item.error, item.include = "error", WAV_REQUIRES_STOCK, False
+        elif item.path.suffix.lower() in STOCK_ONLY_SUFFIXES and self.window_.disk.stock is None:
+            message = WAV_REQUIRES_STOCK if item.path.suffix.lower() == ".wav" else MEDIA_REQUIRES_STOCK
+            item.state, item.error, item.include = "error", message, False
         elif self._is_duplicate(result):
             item.state = "duplicate"
             item.include = not self.skip_check.isChecked()
@@ -404,10 +414,12 @@ class ImportPage(Page):
             self.header.subtitle.setText(f"把电脑上的 {self.formats} 加入 iPod")
             self.target.update()
             for item in self.model.items:
-                if item.probed is None or item.probed.error or item.path.suffix.lower() != ".wav":
+                suffix = item.path.suffix.lower()
+                if item.probed is None or item.probed.error or suffix not in STOCK_ONLY_SUFFIXES:
                     continue
                 if item.state in ("ready", "duplicate") and disk.stock is None:
-                    item.state, item.error, item.include = "error", WAV_REQUIRES_STOCK, False
+                    message = WAV_REQUIRES_STOCK if suffix == ".wav" else MEDIA_REQUIRES_STOCK
+                    item.state, item.error, item.include = "error", message, False
                     self.model.changed(item)
                 elif item.state == "error" and disk.stock is not None:
                     item.state, item.error, item.include = "ready", "", True
@@ -439,6 +451,8 @@ class ImportPage(Page):
                 self.model.changed(item)
 
     def _is_duplicate(self, probed) -> bool:
+        if probed.path.suffix.lower() in STOCK_ONLY_SUFFIXES - {".wav"}:
+            return False
         tags = music_tags_for(probed.title, probed.artist, probed.album, probed.length_ms,
                               probed.disc, probed.track)
         if tags is None:
@@ -488,6 +502,9 @@ class ImportPage(Page):
 
     def _update_import_enabled(self):
         disk = self.window_.disk
+        self.video_kind.setVisible(disk.stock is not None and any(
+            item.path.suffix.lower() in STOCK_VIDEO_SUFFIXES for item in self.model.items))
+        self.video_kind.setEnabled(self.job is None)
         self.import_button.setEnabled(
             self.job is None and disk.available and not disk.transition
             and bool(self.selected()) and not any(i.state == "probing" for i in self.model.items))
@@ -502,13 +519,16 @@ class ImportPage(Page):
             item.state, item.progress = "queued", 0.0
             self.model.changed(item)
         skip = self.skip_check.isChecked()
+        kind = self.video_kind.currentData()
         volume, player, stock = disk.volume, disk.player, disk.stock
         cached_library = self.window_.library_state.snapshot()
         library = self.window_.library_state.library
         session_for_device = getattr(library, "session_for_device", None)
         open_session = session_for_device() if session_for_device else library.session
         paths = [item.path for item in chosen]
-        counts = {"done": 0, "skip": 0, "error": 0}
+        counts = {"done": 0, "skip": 0, "error": 0,
+                  "media": any(path.suffix.lower() in STOCK_ONLY_SUFFIXES - {".wav"}
+                               for path in paths)}
 
         def work(job):
             def progress(event):
@@ -523,8 +543,9 @@ class ImportPage(Page):
             try:
                 job.check()
                 if stock is not None:
+                    options = {"video_kind": kind} if kind else {}
                     stock_transfer.import_files(stock, paths, progress, skip_duplicates=skip,
-                                                before_commit=before_commit)
+                                                before_commit=before_commit, **options)
                 elif volume is not None:
                     library.import_disk(paths, progress, skip_duplicates=skip, volume=volume,
                                         on_write=lambda: disk.written.emit(player))
@@ -611,11 +632,12 @@ class ImportPage(Page):
         for widget in (self.add_files_button, self.add_folder_button, self.clear_button,
                        self.skip_check):
             widget.setEnabled(True)
-        text = f"已导入 {counts['done']} 首"
+        unit = "个文件" if counts["media"] else "首"
+        text = f"已导入 {counts['done']} {unit}"
         if counts["skip"]:
-            text += f"，跳过 {counts['skip']} 首重复"
+            text += f"，跳过 {counts['skip']} {unit}重复"
         if counts["error"]:
-            text += f"，{counts['error']} 首失败"
+            text += f"，{counts['error']} {unit}失败"
         if cancelled:
             text += "，其余已取消"
         text += "。"
@@ -707,12 +729,12 @@ class DropTarget(QtWidgets.QWidget):
         painter.setFont(font)
         painter.setPen(QtGui.QColor(t.text_primary))
         painter.drawText(R(rect.left(), center.y() + 2, rect.width(), 30), Qt.AlignmentFlag.AlignCenter,
-                         "松开即可添加" if hovering else "把音乐拖到这里")
+                         "松开即可添加" if hovering else "把文件拖到这里")
         font = QtGui.QFont(self.font())
         font.setPixelSize(13)
         painter.setFont(font)
         painter.setPen(QtGui.QColor(t.text_muted))
         painter.drawText(R(rect.left(), center.y() + 36, rect.width(), 40), Qt.AlignmentFlag.AlignCenter,
-                         "文件或整个文件夹都可以，导入前会先列出每首歌让你确认。\n"
+                         "拖入文件或文件夹，确认列表后导入。\n"
                          f"支持 {self.page.formats}。高于 48 kHz 的音频会先在电脑上转换。")
         painter.end()

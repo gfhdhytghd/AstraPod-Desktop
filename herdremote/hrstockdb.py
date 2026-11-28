@@ -85,6 +85,10 @@ class DatabaseTrack:
     size_bytes: int = 0
     media_type: int = 1
     has_artwork: bool = False
+    show: str = ""
+    episode: str = ""
+    season: int = 0
+    episode_number: int = 0
 
 
 @dataclass(frozen=True)
@@ -163,6 +167,7 @@ class _Track(Structure):
         ("unk179", c_uint8), ("unk180", c_uint32), ("pregap", c_uint32),
         ("samplecount", c_uint64), ("unk196", c_uint32), ("postgap", c_uint32),
         ("unk204", c_uint32), ("mediatype", c_uint32),
+        ("season_nr", c_uint32), ("episode_nr", c_uint32),
     ]
 
 
@@ -288,13 +293,13 @@ def _text(value: int | bytes | None) -> str:
 _TRACK_STRINGS = {
     "ipod_path": "path", "title": "title", "album": "album", "artist": "artist",
     "genre": "genre", "comment": "comment", "composer": "composer", "grouping": "grouping",
-    "albumartist": "album_artist",
+    "albumartist": "album_artist", "tvshow": "show", "tvepisode": "episode",
 }
 _TRACK_NUMBERS = {
     "size": "size_bytes", "tracklen": "length_ms", "cd_nr": "disc", "track_nr": "track",
     "bitrate": "bitrate_kbps", "year": "year", "time_modified": "mtime",
     "time_played": "last_played", "rating": "rating", "playcount": "play_count",
-    "mediatype": "media_type",
+    "mediatype": "media_type", "season_nr": "season", "episode_nr": "episode_number",
 }
 
 
@@ -536,8 +541,11 @@ class StockDatabase:
         if not _SUPPORTED_TRACK_PATH.fullmatch(row.path):
             raise StockDatabaseError("A new track must use an Apple Music/Fxx path.")
         extension = Path(row.path).suffix.lower()
-        if extension not in (".mp3", ".m4a", ".wav"):
+        if extension not in (".mp3", ".m4a", ".wav", ".m4v"):
             raise StockDatabaseError(f"Unsupported stock iPod file extension: {extension}")
+        video = extension == ".m4v"
+        if video != (row.media_type in (2, 32, 64)):
+            raise StockDatabaseError("Video metadata and file extension must agree.")
         if not 0 < sample_rate <= 48000 or not 0 < row.size_bytes <= 0xFFFFFFFF:
             raise StockDatabaseError("Invalid sample rate or file size for a stock track.")
         if not 0 < row.length_ms <= 0x7FFFFFFF:
@@ -569,6 +577,9 @@ class StockDatabase:
             track.time_added = int(time.time())
             track.transferred = 1
             track.type2 = int(extension == ".mp3")
+            track.movie_flag = int(video)
+            track.skip_when_shuffling = int(video)
+            track.remember_playback_position = int(video)
             track.filetype_marker = int.from_bytes(
                 extension[1:].upper().ljust(4).encode("ascii"), "big"
             )

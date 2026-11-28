@@ -25,6 +25,7 @@ _PLAN = "plan.json"
 _MARKER = "committed"
 _SLOT = re.compile(r"(?:old|new|audio)-[0-9]+\Z")
 _F_DIRECTORY = re.compile(r"f[0-9]{2}\Z")
+_THUMBNAIL = re.compile(r"f[0-9]+_[0-9]+\.ithmb\Z")
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _CHUNK = 1024 * 1024
 
@@ -105,7 +106,8 @@ class _Volume:
             child = parent / part
             if _checked_stat(child, self.device, stat.S_ISDIR) is None and create:
                 child.mkdir()
-                _fsync_directory(parent)
+                # The pinned root is a /proc/self/fd link owned by the caller.
+                _fsync_directory(f"{parent}/." if parent == self.root else parent)
             parent = child
         expected = stat.S_ISDIR if directory else stat.S_ISREG
         info = _checked_stat(path, self.device, expected)
@@ -127,6 +129,9 @@ class _Volume:
             valid = (len(parts) >= 3 and parts[0] == "ipod_control"
                      and parts[1] in ("itunes", "artwork", "device")
                      and (parts[1] != "itunes" or parts[2] not in (_JOURNAL, _GARBAGE)))
+            valid = valid or parts == ("photos", "photo database") or (
+                len(parts) == 3 and parts[:2] == ("photos", "thumbs")
+                and _THUMBNAIL.fullmatch(parts[2]))
             if parts[-1].endswith(".astrapod-bak"):
                 valid = valid and backup and len(parts) == 3 and parts[1] == "itunes"
                 valid = valid and parts[-1] in ("itunesdb.astrapod-bak", "itunescdb.astrapod-bak")
