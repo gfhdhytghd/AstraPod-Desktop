@@ -200,6 +200,89 @@ def test_abort_pauses_prepared_track_and_restores_exact_volume(reason):
     assert not any(event[0] == 'end' for event in proposal.events)
 
 
+@pytest.mark.parametrize(('completion', 'keeps_playing'), [
+    ('ack', True),
+    ('missing-ack', True),
+    ('disconnect-after-end', True),
+    ('cancel', False),
+    ('write-failed', False),
+    ('end-not-written', False),
+])
+def test_rufin_completion_preserves_playback_after_lost_ack(
+        monkeypatch, caplog, completion, keeps_playing):
+    caplog.set_level('INFO', logger='herdremote.handoff')
+    proposal = SimulatedProposal('Rufin')
+    player = proposal.player
+    player.current = 'old'
+    controller = handoff.Controller(proposal.select, proposal.pin)
+    controller.proposal = proposal
+    monkeypatch.setattr(handoff, 'millis', proposal.clock)
+    play, send, wait = player.handoff_play, proposal.send, proposal.wait
+
+    def play_new(matched):
+        play(matched)
+        player.current = matched[0]
+
+    def restore(before):
+        player.current = 'old'
+        player.commands.append(('restore',))
+        player.handoff_pause()
+
+    def send_end(event, *args):
+        send(event, *args)
+        if event == 'end':
+            handoff.Proposal.send(proposal, event)
+
+    def write_end(payload):
+        assert payload == b'HF\t1\t1\tend'
+        assert player.current == 'track' and player.playing
+        volumes = [cmd[1] for cmd in player.commands if cmd[0] == 'volume']
+        assert volumes == sorted(volumes)
+        assert volumes[0] == 0 and volumes[-1] == .72 and len(volumes) > 1
+        if completion == 'write-failed':
+            raise TimeoutError('synthetic PodLink write timeout')
+
+    def wait_for_device(event, deadline):
+        if event != 'd':
+            return wait(event, deadline)
+        if completion == 'write-failed':
+            with pytest.raises(TimeoutError):
+                controller.poll(write_end)
+            controller.disconnect()
+        elif completion != 'end-not-written':
+            controller.poll(write_end)
+        if completion == 'ack':
+            controller.command(b'hf\t1\td\t1')
+        elif completion == 'cancel':
+            controller.command(b'hf\t1\tx\t1')
+        elif completion == 'disconnect-after-end':
+            controller.disconnect()
+        elif completion in ('missing-ack', 'end-not-written'):
+            proposal.now = deadline
+        return handoff.Proposal.wait(proposal, event, deadline)
+
+    player.handoff_play = play_new
+    player.handoff_restore = restore
+    proposal.send = send_end
+    proposal.wait = wait_for_device
+    proposal.run()
+
+    assert player.volume == .72
+    if keeps_playing:
+        assert proposal.events[-1] == ('end',), caplog.text
+        assert player.current == 'track' and player.playing
+        assert ('pause',) not in player.commands and ('restore',) not in player.commands
+        outcome = 'accepted' if completion == 'ack' else 'unconfirmed'
+        assert f'outcome={outcome}' in caplog.text
+    else:
+        assert player.current == 'old' and not player.playing
+        assert player.commands[-3:] == [('restore',), ('pause',), ('volume', .72)]
+        if completion == 'end-not-written':
+            sent = []
+            controller.poll(sent.append)
+            assert sent == []
+
+
 def test_no_match_does_not_touch_player():
     proposal = SimulatedProposal('Cider')
     proposal.player.handoff_match = lambda track: None

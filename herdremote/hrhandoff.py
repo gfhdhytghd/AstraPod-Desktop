@@ -84,6 +84,9 @@ class Proposal:
         self.inbox = queue.Queue(16)
         self.outbox = queue.Queue(16)
         self.cancelled = threading.Event()
+        self.device_cancelled = False
+        self.end_deadline = None
+        self.end_sent = False
         self.running = False
         self.finished = False
         self.accepted_at = None
@@ -311,9 +314,22 @@ class Proposal:
                 break
         if not self.ready(player.handoff_state(), matched):
             raise HandoffError('player-changed')
+        return end
+
+    def complete(self, end):
+        self.end_deadline = end + 2300
+        self.check(self.end_deadline)
         self.send('end')
         self.report('event=end latency_ms=%d', self.clock() - end)
-        self.wait('d', end + 2300)
+        try:
+            self.wait('d', self.end_deadline)
+        except HandoffError as error:
+            if not self.end_sent or self.device_cancelled:
+                raise
+            # The iPod can stop local playback before its reply reaches us.
+            # Preserve audible playback when the result is ambiguous.
+            return 'unconfirmed reason=' + str(error)
+        return 'accepted'
 
     def run(self):
         player, volume = None, None
@@ -342,10 +358,11 @@ class Proposal:
             mutated = True
             player.handoff_volume(0)
             timing = self.schedule(player, matched, clock, deadline, before)
-            self.fade(player, matched, volume, *timing)
+            end = self.fade(player, matched, volume, *timing)
+            outcome = self.complete(end)
             committed = True
             self.enter('done')
-            self.report('outcome=accepted')
+            self.report('outcome=%s', outcome)
         except (OSError, ValueError, TypeError, KeyError, OverflowError,
                 HandoffError, queue.Full) as error:
             reason = str(error) if isinstance(error, HandoffError) else 'host'
@@ -429,6 +446,7 @@ class Controller:
                 proposal.thread.start()
             elif self.proposal and self.proposal.ident == ident:
                 if event == 'x' and not args:
+                    self.proposal.device_cancelled = True
                     self.proposal.cancelled.set()
                 elif event == 'p' and len(args) == 5:
                     self.proposal.inbox.put_nowait((millis(), event, *map(int, args)))
@@ -449,4 +467,10 @@ class Controller:
                 return
             if b'\tping\t' in payload:
                 payload += b'\t' + str(millis()).encode()
+            is_end = payload.endswith(b'\tend')
+            if is_end and millis() >= proposal.end_deadline:
+                continue
             send(payload)
+            if is_end:
+                proposal.end_sent = True
+                proposal.report('event=end-written')
