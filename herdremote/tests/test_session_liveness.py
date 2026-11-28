@@ -96,7 +96,9 @@ class DaemonRecovery(unittest.TestCase):
         daemon=object.__new__(herdremote.Daemon)
         daemon.disk_control=Mock(serial_lease=None)
         daemon.plugin_link=Mock()
-        daemon.stopping=threading.Event();daemon.args=types.SimpleNamespace(port='/fake/tty')
+        tty = Path(self.enterContext(tempfile.TemporaryDirectory())) / "tty"
+        tty.touch()
+        daemon.stopping=threading.Event();daemon.args=types.SimpleNamespace(port=str(tty))
         daemon.cider=Mock();daemon.cider.check_liveness.side_effect=hrcider.SessionExpired('stale application')
         daemon.clock_sync=Mock();daemon.usage_keys=Mock();daemon.reset_session=Mock()
         daemon.pump_reads=Mock();daemon.adopt_foreground=Mock();daemon.flush_replies=Mock();daemon.push=Mock()
@@ -108,7 +110,7 @@ class DaemonRecovery(unittest.TestCase):
         replacement.open.side_effect=opened
         with patch.object(herdremote.podlink,'serial_port',return_value=new_port) as serial_open, patch.object(herdremote.podlink,'Link',return_value=replacement),patch.object(herdremote.time,'sleep'):
             daemon.run_loop()
-        serial_open.assert_called_once_with('/fake/tty',2)
+        serial_open.assert_called_once_with(str(tty),2)
         old_port.close.assert_called_once();daemon.cider.disconnect.assert_called_once()
         daemon.plugin_link.link_lost.assert_called_once()
         replacement.open.assert_called_once();daemon.reset_session.assert_called()

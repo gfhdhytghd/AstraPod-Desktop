@@ -227,8 +227,11 @@ def result(req, ok, text=None):
     return encode([fields])
 
 
-def tick(age_seconds, herdr_ok):
-    return encode([["T", str(int(age_seconds)), "1" if herdr_ok else "0"]])
+def tick(age_seconds, herdr_ok, t3_ok=None):
+    fields = ["T", str(int(age_seconds)), "1" if herdr_ok else "0"]
+    if t3_ok is not None:
+        fields.append("1" if t3_ok else "0")
+    return encode([fields])
 
 
 def usage(items, now, *, replace_errors=False):
@@ -290,7 +293,8 @@ def parse_command(payload):
               "ks": 1, "act": 3,
               "vd": 2, "vu": 1, "vc": 1, "k": 2, "ft": 3, "det": 1}
     if name in ("qx", "tc"):
-        return (name, args) if len(records) == 1 and args == ["1"] else None
+        valid = (["1"], ["2"]) if name == "tc" else (["1"],)
+        return (name, args) if len(records) == 1 and args in valid else None
     if name == "qi":
         if (len(records) == 1 and len(args) == 4 and args[2] == "enter"
                 and all(args) and len(args[0].encode("utf-8")) <= 7

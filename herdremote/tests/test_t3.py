@@ -365,6 +365,36 @@ class PlayerProtocol(unittest.TestCase):
         self.assertFalse(self.daemon.agents.client.state()["connected"])
         self.assertTrue(self.daemon.t3_player)
 
+    def test_v2_reachability_preserves_picture_until_t3_returns(self):
+        self.enable_t3()
+        self.install([thread("running", status="running")])
+        self.daemon.push()
+        self.assertEqual(self.rows("T")[-1], [["T", "0", "1"]])
+        self.command("tc\t2")
+        self.daemon.push()
+        self.assertEqual(self.rows("T")[-1], [["T", "0", "0", "1"]])
+        project_id = self.daemon.agents.projects.alias("project")
+        self.command(f"sub\t{project_id}\tactive")
+        self.daemon.push()
+        self.daemon.send.reset_mock()
+
+        self.daemon.agents.client.set_status(False, "T3 server unavailable")
+        self.daemon.push()
+        self.assertEqual(self.rows("T"), [[["T", "0", "0", "0"]]])
+        self.assertFalse(self.rows("W"))
+        self.assertFalse(self.rows("A"))
+
+        self.install([thread("new", status="running")])
+        self.daemon.push()
+        self.assertEqual(self.rows("T")[-1], [["T", "0", "0", "1"]])
+        self.assertEqual(self.rows("A")[-1][0], ["A", project_id, "1"])
+        self.assertEqual(self.rows("A")[-1][1][4], "Thread new")
+
+        self.command("hr\t1")
+        self.command("tc\t1")
+        self.daemon.push()
+        self.assertEqual(self.rows("T")[-1], [["T", "0", "1"]])
+
     def test_thread_focus_opens_local_link_and_project_stays_focus_free(self):
         opener, (pane,) = self.setup_focus(thread(SID, title="Build"))
         project_id = self.daemon.agents.projects.alias("project")
