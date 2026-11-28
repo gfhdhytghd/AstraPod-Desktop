@@ -327,6 +327,34 @@ def test_photo_and_video_publication_rolls_back(tmp_path, pictures, movie, monke
     assert not list(root.rglob("*.m4v"))
 
 
+def test_compatible_video_with_embedded_cover_is_remuxed(tmp_path, pictures, monkeypatch):
+    import hrstockvideo
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        pytest.skip("ffmpeg and ffprobe are required")
+    source = tmp_path / "Covered.m4v"
+    subprocess.run([
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=24",
+        "-f", "lavfi", "-i", "sine=sample_rate=44100", "-i", str(pictures[0]),
+        "-t", "2", "-map", "0:v", "-map", "1:a", "-map", "2:v",
+        "-c:v:0", "libx264", "-profile:v:0", "baseline", "-level:v:0", "3.0",
+        "-c:a", "aac", "-c:v:1", "copy", "-disposition:v:1", "attached_pic", str(source),
+    ], check=True)
+    conversions = []
+    command = hrstockvideo.media_command
+
+    def observe(*args):
+        if "-c:v" in args and args[-2] == "ipod":
+            conversions.append(args[args.index("-c:v") + 1])
+        return command(*args)
+
+    monkeypatch.setattr(hrstockvideo, "media_command", observe)
+    media = hrstockvideo.prepare_video(source, tmp_path)
+    assert hrstockvideo._compatible(*hrstockvideo._probe(media.upload))
+    assert media.artwork is not None
+    assert conversions == []
+
+
 @pytest.mark.parametrize("model,checksum,compressed", [
     ("MB029", 1, False), ("MC293", 2, True),
 ])

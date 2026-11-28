@@ -86,7 +86,9 @@ def prepare_video(path, directory, *, kind=None):
         maps += ("-map", "1:a", "-shortest")
     mux = ("-map_metadata", "0", "-map_chapters", "-1", "-movflags", "+faststart",
            "-f", "ipod", str(output))
-    if _compatible(container, streams, video, audio):
+    # The cover is copied into ArtworkDB separately from the movie streams.
+    playback_streams = [stream for stream in streams if not _is_picture(stream)]
+    if _compatible(container, playback_streams, video, audio):
         media_command(*command, *maps, "-c", "copy", *mux)
         media_command(*_ffmpeg(output), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-")
     else:
