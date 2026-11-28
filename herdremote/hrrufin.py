@@ -37,6 +37,7 @@ log = logging.getLogger('herdremote.rufin')
 SIGNATURE = b'<meta name="rufin-csrf"'
 DEFAULT_PORT = 1717
 MAX_REPLY = 2 * 1024 * 1024
+ART_MISSING_TTL = 60
 UNSUPPORTED = 'Not supported by Rufin'
 CONTEXT_SECONDS = 15
 REPEAT = {'off': 0, 'one': 1, 'all': 2}
@@ -143,6 +144,8 @@ class RufinClient(Client):
         self.state_lock = threading.RLock()
         self.uris = collections.OrderedDict()    # rufin_id -> track URI
         self.current = {}
+        self.art_missing = collections.OrderedDict()
+        self.art_missing_connection = None
         self.last_reason = None
 
     # --- connection, discovery and authentication -----------------------
@@ -580,7 +583,27 @@ class RufinClient(Client):
 
     def artwork(self, uri, size=240):
         """Fetch Rufin cover bytes and bound the dimensions to the requested size."""
-        data = self._raw('/api/artwork?' + urllib.parse.urlencode({'uri': uri, 'size': size}))
+        # XS, S, M and L share the same 240px source. A 404 from that
+        # endpoint applies to each tier until the backend has had time to recover.
+        key = (uri, size)
+        with self.state_lock:
+            connection = (self.base, self.token)
+            if connection != self.art_missing_connection:
+                self.art_missing.clear()
+                self.art_missing_connection = connection
+            if time.monotonic() < self.art_missing.get(key, 0):
+                raise HTTPStatusError(404, service=self.name)
+        try:
+            data = self._raw('/api/artwork?' + urllib.parse.urlencode({'uri': uri, 'size': size}))
+        except HTTPStatusError as error:
+            if error.code == 404:
+                with self.state_lock:
+                    if connection == (self.base, self.token) == self.art_missing_connection:
+                        self.art_missing[key] = time.monotonic() + ART_MISSING_TTL
+                        self.art_missing.move_to_end(key)
+                        if len(self.art_missing) > 4096:
+                            self.art_missing.popitem(last=False)
+            raise
         from PIL import Image, ImageOps
         with Image.open(io.BytesIO(data)) as image:
             if image.width <= size and image.height <= size:
@@ -600,7 +623,7 @@ class RufinClient(Client):
                 raw = response.read(MAX_REPLY + 1)
         except urllib.error.HTTPError as error:
             error.close()
-            raise HTTPStatusError(error.code) from None
+            raise HTTPStatusError(error.code, service=self.name) from None
         if len(raw) > MAX_REPLY:
             raise ValueError('Artwork too large')
         return raw
