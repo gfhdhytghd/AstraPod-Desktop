@@ -19,24 +19,32 @@ import usb.core
 COMMANDS = {"reboot": 1, "play": 2, "seek": 3, "stop": 4, "open-bench": 5}
 REQUEST, INDEX = 0x5D, 0x4951
 PLAYBACK_INDEX = 0x4954
-PLAYBACK_COMMANDS = {"play": 1, "seek": 2, "next": 3, "prev": 4, "open-lyrics": 5}
+PLAYBACK_COMMANDS = {"play": 1, "seek": 2, "next": 3, "prev": 4, "open-lyrics": 5, "probe-video": 6}
 PLAYBACK_STATUS = struct.Struct("<IIIi6Ii24s260s")
 PLAYBACK_COMMAND_ERRORS = {2: "file not found", 5: "cannot create playback playlist",
                            34: "seek outside track", 61: "no active playback"}
 LCD_INDEX = 0x4955
-LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "coverflow-60hz": 3, "lcd-diag": 4,
+LCD_COMMANDS = {"lcd-timing": 1, "lcd-te-sync": 2, "lcd-pacing": 3, "lcd-diag": 4,
                 "lcd-dma-burst": 5, "lcd-dma-width": 6, "lcd-boost": 7,
-                "lcd-bench": 8, "lcd-pio": 9, "lcd-dma-dst-burst": 10,
-                "lcd-pattern": 11, "lcd-dma-dst-width": 12}
+                "lcd-bench": 8, "lcd-pio": 9, "lcd-async": 11,
+                "lcd-stock-regs": 12, "lcd-te-irq": 13, "lcd-pattern": 14,
+                "lcd-te-offset": 15}
 LCD_TIMINGS = {f"0x{timing:02x}": timing
                for timing in (0x33, 0x22, 0x21, 0x12, 0x11, 0x10, 0x01)}
 LCD_TIMINGS["0x00"] = 0xFF  # Wire value 0 stays the query opcode's argument.
 LCD_DMA_OPTIONS = {"lcd-dma-burst": {"get": 0, "1": 1, "4": 4, "8": 8, "16": 16},
-                   "lcd-dma-width": {"get": 0, "16": 16, "32": 32},
-                   "lcd-dma-dst-burst": {"get": 0, "1": 1, "4": 4},
-                   "lcd-dma-dst-width": {"get": 0, "16": 16, "32": 32}}
+                   "lcd-dma-width": {"get": 0, "16": 16, "32": 32}}
 LCD_BENCH_OPTIONS = {"full": 0, "band": 1}
+LCD_STOCK_MASKS = {"off": 0, "on": 0xF}
+LCD_STOCK_REGS = ("LCD_CON", "LCD+0x88", "LCD+0x7c", "LCD+0x78")
+LCD_TE_IRQ = {"off": 0, "rise": 1, "fall": 2}
+LCD_TE_OFFSET_LIMIT_US = 5000
+LCD_BENCH_DETAILS = struct.Struct("<4I")
+LCD_STOCK_DETAILS = struct.Struct("<9I")
 LCD_SWITCH = {"off": 0, "on": 1, "get": 2}
+LCD_PACE_STATUS = 10  # Argument selects one LCD_PACE_FIELDS entry.
+LCD_PACE_FIELDS = ("period", "divisor", "shown", "missed", "offset", "cost", "dma", "flags")
+LCD_PACE_ENABLED, LCD_PACE_MEASURED, LCD_PACE_PHASED = 1, 2, 4
 LCD_REPLY = struct.Struct("<4I")
 LCD_ERRORS = {5: "could not save lcd-te-diag.txt",
               16: "LCD asleep or busy; retry with the LCD awake",
@@ -143,12 +151,14 @@ def playback_status(player):
 
 
 def playback_payload(action, argument, start_ms):
-    if action == "play":
-        path = argument.encode("utf-8")
+    if action in ("play", "probe-video"):
+        path = (argument or "").encode("utf-8")
         if not path.startswith(b"/") or not 2 <= len(path) <= 259 or any(
             ch in path for ch in (b"\0", b"\r", b"\n")
         ):
-            raise ValueError("play requires an absolute iPod path of 2 to 259 UTF-8 bytes")
+            raise ValueError(f"{action} requires an absolute iPod path of 2 to 259 UTF-8 bytes")
+        if action == "probe-video":
+            return path
         return struct.pack("<I", playback_ms(start_ms if start_ms is not None else 0)) + path
     if action == "seek":
         return struct.pack("<I", playback_ms(argument))
@@ -460,6 +470,7 @@ def execute_settings(serial, command, argument, value, yes, json_output):
 
 
 def execute_lcd(serial, action, argument):
+    details_format = None
     if action == "lcd-timing":
         if argument is not None and argument not in LCD_TIMINGS:
             raise ValueError("lcd-timing accepts " + ", ".join(LCD_TIMINGS))
@@ -473,20 +484,81 @@ def execute_lcd(serial, action, argument):
         if argument not in LCD_BENCH_OPTIONS:
             raise ValueError("lcd-bench requires full or band")
         option = LCD_BENCH_OPTIONS[argument]
-    elif action == "lcd-diag":
+        details_format = LCD_BENCH_DETAILS
+    elif action == "lcd-stock-regs":
+        option = LCD_STOCK_MASKS.get(argument)
+        if option is None:
+            try:
+                option = int(argument, 16 if argument.startswith(("0x", "0X")) else 10)
+            except (AttributeError, ValueError):
+                option = -1
+        if not 0 <= option <= 0xF:
+            raise ValueError("lcd-stock-regs requires on, off or a mask from 0 to 0xf")
+        details_format = LCD_STOCK_DETAILS
+    elif action == "lcd-te-irq":
+        if argument not in LCD_TE_IRQ:
+            raise ValueError("lcd-te-irq requires off, rise or fall")
+        option = LCD_TE_IRQ[argument]
+    elif action == "lcd-te-offset":
+        try:
+            option = int(argument, 10)
+        except (TypeError, ValueError):
+            option = LCD_TE_OFFSET_LIMIT_US + 1
+        if abs(option) > LCD_TE_OFFSET_LIMIT_US:
+            raise ValueError("lcd-te-offset requires an integer from -5000 to 5000 us")
+    elif action == "lcd-pattern":
         if argument is not None:
-            raise ValueError("lcd-diag takes no argument")
+            raise ValueError("lcd-pattern takes no argument")
         option = 0
+    elif action == "lcd-diag":
+        if argument not in (None, "survey"):
+            raise ValueError("lcd-diag takes no argument or survey")
+        option = 1 if argument == "survey" else 0
+    elif action == "lcd-pacing" and argument == "status":
+        option = None
     else:
         if argument not in LCD_SWITCH:
-            raise ValueError(f"{action} requires on, off or get")
+            choices = "on, off, get or status" if action == "lcd-pacing" else "on, off or get"
+            raise ValueError(f"{action} requires {choices}")
         option = LCD_SWITCH[argument]
 
     player = find_player(serial)
+    if action == "lcd-pacing" and argument == "status":
+        print_pace_status({field: lcd_exchange(player, action, LCD_PACE_STATUS, number)
+                           for number, field in enumerate(LCD_PACE_FIELDS)})
+        return
+    result = lcd_exchange(player, action, LCD_COMMANDS[action], option, details_format)
+    if action == "lcd-diag":
+        print(f"lcd-diag: saved {LCD_DIAG_PATH}")
+    elif action == "lcd-timing":
+        print(f"LCD_PHTIME=0x{result:02x}")
+    elif action in LCD_DMA_OPTIONS:
+        print(f"{action}: {result}")
+    elif action == "lcd-bench":
+        if result == 0:
+            print(f"lcd-bench: {argument} measured")
+        else:
+            frames, dma, elapsed = result
+            print(f"lcd-bench: {argument}, {frames} frames, "
+                  f"mean DMA {dma} us, mean elapsed {elapsed} us")
+    elif action == "lcd-stock-regs":
+        print(f"lcd-stock-regs: mask=0x{option:x}")
+        for register, before, after in zip(LCD_STOCK_REGS, result[:4], result[4:]):
+            print(f"{register}: 0x{before:08x} -> 0x{after:08x}")
+    elif action == "lcd-te-irq":
+        print(f"lcd-te-irq: {argument}")
+    elif action == "lcd-te-offset":
+        print(f"lcd-te-offset: {option:+d} us")
+    elif action == "lcd-pattern":
+        print("lcd-pattern: displayed scrolling colour bars")
+    else:
+        print(f"{action}: {'on' if result else 'off'}")
+
+
+def lcd_exchange(player, action, opcode, option, details_format=None):
     cookie = secrets.randbelow(0xFFFFFFFF) + 1
-    payload = struct.pack("<IB", cookie, option)
-    if ep0_transfer(player, 0x40, REQUEST, LCD_COMMANDS[action], LCD_INDEX,
-                    payload) != len(payload):
+    payload = struct.pack("<Ii" if action == "lcd-te-offset" else "<IB", cookie, option)
+    if ep0_transfer(player, 0x40, REQUEST, opcode, LCD_INDEX, payload) != len(payload):
         raise RuntimeError("Short PodLink Shell LCD command write")
 
     deadline = time.monotonic() + 15
@@ -502,19 +574,43 @@ def execute_lcd(serial, action, argument):
             continue
         if error:
             detail = LCD_ERRORS.get(error, f"error {error}")
+            if error == 5 and action in ("lcd-bench", "lcd-pattern"):
+                detail = "no LCD DMA completed"
             raise RuntimeError(f"{action}: {detail}")
-        if action == "lcd-diag":
-            print(f"lcd-diag: saved {LCD_DIAG_PATH}")
-        elif action == "lcd-timing":
-            print(f"LCD_PHTIME=0x{value:02x}")
-        elif action in LCD_DMA_OPTIONS:
-            print(f"{action}: {value}")
-        elif action == "lcd-bench":
-            print(f"lcd-bench: {argument} measured")
-        else:
-            print(f"{action}: {'on' if value else 'off'}")
-        return
+        if details_format is None or (action == "lcd-bench" and value == 0):
+            return value
+        data = bytes(ep0_transfer(player, 0xC0, REQUEST, opcode, LCD_INDEX,
+                                  details_format.size))
+        if len(data) != details_format.size:
+            raise RuntimeError(f"{action}: short LCD details")
+        detail_cookie, *details = details_format.unpack(data)
+        if detail_cookie != cookie:
+            raise RuntimeError(f"{action}: stale LCD details")
+        return details
     raise RuntimeError(f"{action}: timed out waiting for the firmware result")
+
+
+def print_pace_status(status):
+    flags = status["flags"]
+    enabled = bool(flags & LCD_PACE_ENABLED)
+    period = status["period"]
+    source = ("authored 60 fps" if not enabled else
+              "measured TE" if flags & LCD_PACE_MEASURED else "nominal TE")
+    print(f"lcd-pacing: {'on' if enabled else 'off'}")
+    print(f"period: {period} us ({1e6 / period:.3f} Hz, {source})" if period
+          else "period: unknown")
+    print(f"TE phase: {'known' if flags & LCD_PACE_PHASED else 'unknown'}")
+    divisor = status["divisor"]
+    if not divisor:
+        print("last animation: none")
+        return
+    rate = {1: "full", 2: "half"}.get(divisor, f"1/{divisor}")
+    print(f"last animation: {rate} rate")
+    print(f"shown: {status['shown']} frames")
+    print(f"missed: {status['missed']} frames")
+    print(f"wake offset: {status['offset']} us after TE")
+    print(f"cost: {status['cost']} us per frame (average)")
+    print(f"dma: {status['dma']} us (longest)")
 
 
 def execute(serial, action, argument=None, *, value=None, yes=False, json_output=False,
@@ -635,8 +731,13 @@ def execute(serial, action, argument=None, *, value=None, yes=False, json_output
                 error = result["command_error"]
                 if error:
                     detail = PLAYBACK_COMMAND_ERRORS.get(error, f"error {error}")
+                    if action == "probe-video" and error == errno.EIO:
+                        detail = f"decode={result['playback_error']} (see player log)"
                     raise RuntimeError(f"{action}: {detail}")
-                print(f"{action}: processed")
+                if action == "probe-video":
+                    print(f"{action}: frames={result['playback_error']}")
+                else:
+                    print(f"{action}: processed")
                 return
             if reply[2] != initial[2] and reply[2] != expected_sequence:
                 raise RuntimeError("Playback result superseded by another shell command")
@@ -658,7 +759,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--serial", required=True, help="USB serial number of the iPod")
     actions = ("status", "debug-list", "debug", *COMMANDS,
-               "next", "prev", "open-lyrics", "playback-status", "log-fetch",
+               "next", "prev", "open-lyrics", "probe-video", "playback-status", "log-fetch",
                "record-info", "record-start", "record-stop", "record-fetch",
                "plugin-launch", "plugin-status", "plugin-exit", "screenshot",
                *SETTINGS_REQUESTS, *LCD_COMMANDS, "ui-perf")

@@ -818,6 +818,10 @@ class RufinLibrary:
                 return None
             return self.generation, len(self.native_albums), self.album_art_keys(self.native_albums)
 
+    def album_art_order(self):
+        with self.lock:
+            return tuple(row['art'] for row in self.native_albums or () if row.get('art') not in (None, '-'))
+
     @staticmethod
     def album_art_keys(rows):
         return {row['art'] for row in rows if row.get('art') not in (None, '-')}
