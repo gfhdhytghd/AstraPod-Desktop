@@ -99,6 +99,7 @@ class DaemonRecovery(unittest.TestCase):
         daemon.stopping=threading.Event();daemon.args=types.SimpleNamespace(port='/fake/tty')
         daemon.cider=Mock();daemon.cider.check_liveness.side_effect=hrcider.SessionExpired('stale application')
         daemon.clock_sync=Mock();daemon.usage_keys=Mock();daemon.reset_session=Mock()
+        daemon.agents=types.SimpleNamespace(control="herdr")
         daemon.pump_reads=Mock();daemon.adopt_foreground=Mock();daemon.flush_replies=Mock();daemon.push=Mock()
         old=Mock();old.opened=True;old.frames=collections.deque();old_port=Mock()
         daemon.link=old;daemon.port=old_port
@@ -106,7 +107,10 @@ class DaemonRecovery(unittest.TestCase):
         def opened():
             replacement.opened=True;daemon.stopping.set()
         replacement.open.side_effect=opened
-        with patch.object(herdremote.podlink,'serial_port',return_value=new_port) as serial_open, patch.object(herdremote.podlink,'Link',return_value=replacement),patch.object(herdremote.time,'sleep'):
+        with patch.object(herdremote.os.path, "exists", return_value=True), \
+             patch.object(herdremote.podlink, "serial_port", return_value=new_port) as serial_open, \
+             patch.object(herdremote.podlink, "Link", return_value=replacement), \
+             patch.object(herdremote.time, "sleep"):
             daemon.run_loop()
         serial_open.assert_called_once_with('/fake/tty',2)
         old_port.close.assert_called_once();daemon.cider.disconnect.assert_called_once()
@@ -114,4 +118,4 @@ class DaemonRecovery(unittest.TestCase):
         replacement.open.assert_called_once();daemon.reset_session.assert_called()
         self.assertIs(daemon.link,replacement)
         self.assertEqual((replacement.keepalive_interval,replacement.keepalive_timeout,replacement.nonce_keepalive),(1.,3.,True))
-        replacement.send.assert_called() # new protocol hello
+        replacement.send.assert_any_call(herdremote.podlink.TEXT, b"M\therdr")

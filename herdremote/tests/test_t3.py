@@ -315,6 +315,70 @@ class PlayerProtocol(unittest.TestCase):
         self.daemon.configure_agents(hragent.config({"AGENT_CONTROL": "t3"}))
         self.command("tc\t1")
 
+    def start_player_handshake(self):
+        self.daemon.send.reset_mock()
+        self.command("hr\t1")
+        self.assertEqual(self.rows("M"), [[["M", "t3"]]])
+
+    def assert_waiting_for_tc(self):
+        self.daemon.send.reset_mock()
+        for command in ("sub\tw1\ttab1", "det\tpane1", "ks\tpane1", "us"):
+            self.command(command)
+        self.daemon.push()
+        self.daemon.send.assert_not_called()
+
+    def test_player_waits_for_delayed_t3_capability(self):
+        self.daemon.configure_agents(hragent.config({"AGENT_CONTROL": "t3"}))
+        self.start_player_handshake()
+        self.assert_waiting_for_tc()
+        self.command("tc\t1")
+        ask = request("ask")
+        self.command("qx\t1")
+        self.install((thread("waiting", pendingRuntimeRequest=ask),),
+                     {"waiting": detail(requests=[ask], items=[user_input("ask")])})
+        self.daemon.push()
+        self.assertEqual(self.rows("W")[-1][:2], [["W", "1"], ["#", "T3"]])
+        self.assertTrue(self.rows("Q")[-1][0][1].startswith("t3q"))
+
+    def test_player_without_t3_capability_receives_no_snapshot(self):
+        self.daemon.configure_agents(hragent.config({"AGENT_CONTROL": "t3"}))
+        with patch.object(herdremote.time, "monotonic", return_value=100):
+            self.start_player_handshake()
+        with patch.object(herdremote.time, "monotonic", return_value=110):
+            with self.assertLogs(herdremote.log, "INFO") as events:
+                self.assert_waiting_for_tc()
+            self.assertIn("T3 needs newer firmware", events.output[0])
+            self.assert_waiting_for_tc()
+
+    def test_reconnect_requires_fresh_t3_capability(self):
+        self.enable_t3()
+        self.install((thread("running"),))
+        self.daemon.push()
+        self.assertEqual(self.rows("W")[-1][1], ["#", "T3"])
+        self.daemon.reset_session()
+        self.command("tc\t1")  # an unsolicited capability does not open a session
+        self.start_player_handshake()
+        self.assert_waiting_for_tc()
+        self.command("tc\t1")
+        self.install()
+        self.daemon.push()
+        self.assertEqual(self.rows("W")[-1][1], ["#", "T3"])
+
+    def test_mode_reload_clears_old_source_before_snapshot(self):
+        self.daemon.sent_questions["legacy-question"] = b"legacy"
+        self.daemon.results.put(("7", True, "Legacy answer"))
+        self.daemon.subscribed = "w1"
+        self.daemon.detail_pane = "pane1"
+        self.daemon.send.reset_mock()
+        self.daemon.configure_agents(hragent.config({"AGENT_CONTROL": "t3"}))
+        self.assertEqual(self.rows("M"), [[["M", "t3"]]])
+        self.assert_waiting_for_tc()
+        self.command("tc\t1")
+        self.install()
+        self.daemon.push()
+        self.assertFalse(self.rows("A") or self.rows("D") or self.rows("X") or self.rows("R"))
+        self.assertEqual(self.rows("W")[-1][1], ["#", "T3"])
+
     def test_exclusive_sections_filters_focus_and_detail(self):
         self.daemon.model["workspaces"] = [
             dict(id=f"w{i}", label="界" * 30, focused=False, working=0, waiting=0,
@@ -524,7 +588,8 @@ class PlayerProtocol(unittest.TestCase):
         daemon.push()
         qids = {frame[1][1]: frame[0][1] for frame in self.rows("Q")[1:]}
         self.assertNotIn("herdr-q", [frame[0][1] for frame in self.rows("Q")[1:]])
-        self.assertIn([["X", "herdr-q"]], self.rows("X"))
+        self.assertIn([["M", "t3"]], self.rows("M"))
+        self.assertNotIn([["X", "herdr-q"]], self.rows("X"))
         aid = qids["Run a command?"]
         approve = next(q for q in self.rows("Q") if q[0][1] == aid)
         self.assertEqual(approve[2:], [["o", "1", "Deny", "-"], ["o", "2", "Always", "-"]])

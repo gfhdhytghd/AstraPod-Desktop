@@ -73,6 +73,10 @@ def _fit(head, rows, max_message=MAX_MESSAGE):
             head = head[:-1] + [str(len(rows))]
 
 
+def agent_mode(control):
+    return encode([("M", control)])
+
+
 def hello(daemon_version):
     return encode([["HR", str(VERSION), clean(daemon_version, 32)]])
 

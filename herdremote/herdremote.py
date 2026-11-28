@@ -54,6 +54,7 @@ DEVICE = dict(vid=0x05AC, pid=0x1261, manufacturer="PodBox",
               serial="2AA0000000000360")
 REFRESH_SECONDS = 1.0
 TICK_SECONDS = 2.0
+T3_CAPABILITY_SECONDS = 1.0
 CONFIRM_SECONDS = 5.0
 DETAIL_SECONDS = 1.0
 DETAIL_VISIBLE_LINES = 5
@@ -248,6 +249,7 @@ class Daemon:
         self.sent_questions = {}
         self.question_ext = False
         self.t3_player = False
+        self.t3_capability_deadline = None
         self.t3_focus_pending = None
         self.agents.reset()
         self.custom_pending = {}
@@ -301,6 +303,14 @@ class Daemon:
         self.herdr_ok = False
         self.desktop.focused_tab = None
         self.desktop.dismissed.clear()
+        self.pending_usage = False
+        self.sent_questions.clear()
+        self.sent_status = None
+        if self.sent_ws is not None:
+            self.sent_ws = b""
+            self.t3_capability_deadline = time.monotonic() + T3_CAPABILITY_SECONDS
+        if self.link is not None:
+            self.send(hrproto.agent_mode(self.agents.control))
 
     def update_herdr_watcher(self):
         if self.watcher is not None:
@@ -559,6 +569,7 @@ class Daemon:
         self.link_serial = DEVICE["serial"] if not self.args.port else None
         self.reset_session()
         self.send(hrproto.hello(VERSION))
+        self.send(hrproto.agent_mode(self.agents.control))
         self.send(hrhandoff.CAPABILITY)
         self.clock_sync.poll(self.send)
         return True
@@ -605,7 +616,9 @@ class Daemon:
         if self.sent_ws is None:
             return
         while not self.results.empty():
-            self.send(hrproto.result(*self.complete_answer(self.results.get(), self.model)))
+            result = self.results.get()
+            if self.agents.control == "herdr":
+                self.send(hrproto.result(*self.complete_answer(result, self.model)))
         for result in self.keys.replies():
             self.send(hrproto.result(*result))
             target = self.key_details.pop(result[0], None)
@@ -618,12 +631,18 @@ class Daemon:
         """Send whatever the player's picture lacks."""
         if self.sent_ws is None or self.foreground == 2:
             return  # no Agents client has introduced itself
+        t3_mode = self.agents.control == "t3"
+        if t3_mode and not self.t3_player:
+            if (self.t3_capability_deadline is not None
+                    and time.monotonic() >= self.t3_capability_deadline):
+                log.info("T3 needs newer firmware: the player did not advertise tc")
+                self.t3_capability_deadline = None
+            return
         self.flush_detail()
         self.flush_replies()
-        t3_mode = self.agents.control == "t3"
         if not t3_mode and not self.model_time:
             return  # do not present an empty startup model while a read is pending
-        picture = self.agents.client.snapshot() if self.player_t3 else ({}, {}, {})
+        picture = self.agents.client.snapshot() if t3_mode else ({}, {}, {})
         limit = self.detail_limit()
         spaces = self.agents.workspaces(picture) if t3_mode else self.model["workspaces"]
         ws = hrproto.workspaces(spaces, limit)
@@ -637,7 +656,7 @@ class Daemon:
             self.send(st)
             self.sent_status = st
         if self.subscribed:
-            if hragent.PROJECT.fullmatch(self.subscribed):
+            if t3_mode:
                 tabs, rows = self.agents.tab_rows(picture, self.subscribed, self.subscribed_tab)
             else:
                 tabs = self.model["tabs"].get(self.subscribed, [])
@@ -689,7 +708,8 @@ class Daemon:
                 and hragent.THREAD.fullmatch(self.detail_pane)):
             self.send_detail(self.agents.detail(picture, self.detail_pane, limit))
             self.next_detail = now + DETAIL_SECONDS
-        elif self.foreground in (None, 1) and self.reader is None and self.detail_pane and now >= due:
+        elif (not t3_mode and self.foreground in (None, 1) and self.reader is None
+              and self.detail_pane and now >= due):
             # Share one deadline across switches: repeated det cannot bypass
             # the read/send limit. Never read a pane absent from the snapshot.
             self.detail_fast_due = None
@@ -730,11 +750,18 @@ class Daemon:
         if name == "hr":
             self.reset_session()
             self.sent_ws = b""
+            self.t3_capability_deadline = time.monotonic() + T3_CAPABILITY_SECONDS
+            if self.link is not None:
+                self.send(hrproto.hello(VERSION))
+                self.send(hrproto.agent_mode(self.agents.control))
         elif name == "qx":
             self.question_ext = True
             self.sent_questions.clear()
         elif name == "tc":
             self.t3_player = self.sent_ws is not None
+            self.t3_capability_deadline = None
+        elif self.agents.control == "t3" and not self.t3_player:
+            return
         elif name == "qi":
             if args[1].startswith("t3q"):
                 try:
@@ -745,6 +772,8 @@ class Daemon:
                 self.custom_command(*args)
         elif name == "ks":
             target = args[0]
+            if self.agents.control == "t3" and not hragent.THREAD.fullmatch(target):
+                return
             if hragent.THREAD.fullmatch(target):
                 row = self.agents.client.snapshot()[1].get(self.agents.threads.get(target))
                 valid = self.player_t3 and row is not None
