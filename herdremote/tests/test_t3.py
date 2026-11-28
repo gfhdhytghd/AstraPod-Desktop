@@ -502,6 +502,43 @@ class PlayerProtocol(unittest.TestCase):
         self.assertNotIn("Thread archived-project", [row[4] for row in agents[1:]])
         self.assertFalse([tabs for tabs in self.rows("T") if len(tabs[0]) == 7])
 
+    def test_thread_lists_only_show_main_threads_and_select_the_main_thread(self):
+        main = thread(SID, title="Main", lineage=dict(parentThreadId=None, relationshipToParent=None))
+        opener, (pane,) = self.setup_focus(main)
+        rows = [
+            main,
+            thread("legacy"),
+            thread("child", status="running", lineage=dict(parentThreadId=SID,
+                                                          relationshipToParent="subagent")),
+            thread("fork", lineage=dict(parentThreadId=SID, relationshipToParent="fork")),
+            thread("delegated", lineage=dict(relationshipToParent="subagent")),
+            thread("archived-child", archivedAt=UTC, lineage=dict(parentThreadId=SID)),
+        ]
+        self.install(rows, {SID: detail(messages=[message("a", "assistant", "Main answer")]),
+                            "child": detail(messages=[message("b", "assistant", "Child answer")])})
+        project_id = self.daemon.agents.projects.alias("project")
+        legacy_pane = self.daemon.agents.threads.alias("legacy")
+        for workspace in (project_id, "t3"):
+            for tab in ("active", "all"):
+                with self.subTest(workspace=workspace, tab=tab):
+                    self.command(f"sub\t{workspace}\t{tab}")
+                    self.daemon.push()
+                    agents = self.rows("A")[-1]
+                    self.assertEqual(agents[0], ["A", workspace, "2"])
+                    self.assertEqual([(row[0], row[4]) for row in agents[1:]],
+                                     [(pane, "Main"), (legacy_pane, "Thread legacy")])
+        selected = next(row[0] for row in agents[1:] if row[4] == "Main")
+        self.command(f"det\t{selected}")
+        self.daemon.push()
+        self.assertEqual(self.rows("D")[-1][0][1:6],
+                         [pane, "-1", "Main", "Idle · gpt-6.2-sol", "Main answer"])
+        self.command(f"fp\t1\t{selected}")
+        self.daemon.flush_replies()
+        self.daemon.t3_focus_job[0].result(timeout=3)
+        self.daemon.flush_replies()
+        self.assertEqual(self.rows("R")[-1], [["R", "1", "ok", "Focused Main"]])
+        self.assertEqual(opener.call_args.args[0], ["xdg-open", f"t3code://threads/{SID}/{SID}"])
+
     def test_thread_list_needs_a_t3_player(self):
         self.install((thread("running", status="running"),))
         self.command("sub\tt3\tactive")

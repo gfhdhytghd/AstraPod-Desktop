@@ -64,16 +64,21 @@ def rows_for(threads, project, tab):
 
 
 def flat_rows(projects, threads, tab):
-    """Every live project's threads as one list, in rows_for's order."""
+    """Every live project's main threads as one list, in rows_for's order."""
     live = {key for key, row in projects.items() if not row.get("archivedAt")}
     return ordered((row for row in threads.values() if row["projectId"] in live), tab)
+
+
+def main_thread(row):
+    lineage = row.get("lineage") or {}
+    return not lineage.get("parentThreadId") and lineage.get("relationshipToParent") != "subagent"
 
 
 def ordered(rows, tab):
     """All: newest first. Active: waiting (oldest request first), then
     running, then the rest, each newest first; settled, snoozed and archived
     threads are left out unless they wait."""
-    rows = sorted((row for row in rows if not row.get("deletedAt")),
+    rows = sorted((row for row in rows if not row.get("deletedAt") and main_thread(row)),
                   key=lambda row: (-instant(row["updatedAt"]), row["id"]))
     if tab == "all":
         return rows
