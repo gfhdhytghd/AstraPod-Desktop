@@ -5,7 +5,7 @@ from unittest.mock import Mock
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import hrcider
 from hrcider_cache import Cache,art_id
-from hrcider_store import Ledger,Planner,digest_of,item_hash,offer_records,parse_rows,LIST_END
+from hrcider_store import Ledger,Planner,digest_of,item_hash,offer_records,parse_rows,burst_frames,LIST_END
 
 def native(tier,fill):
     dim={'L':240,'M':128,'S':56,'XS':32}[tier]
@@ -23,6 +23,41 @@ class Base(unittest.TestCase):
     def tearDown(self):self.cache.close();self.tmp.cleanup()
 
 class Wire(unittest.TestCase):
+    def test_burst_packs_and_reassembles_small_and_large_covers(self):
+        items = [('1'*64, 'XS', native('XS', 1)),
+                 ('2'*64, 'M', native('M', 2)),
+                 ('3'*64, 'S', native('S', 3))]
+        frames = list(burst_frames(9, 17, items, 16364))
+        self.assertEqual(len(frames[0]), 16364)
+        self.assertEqual(len(frames[-1]), 12)
+        chunks = {}
+        for frame in frames:
+            self.assertEqual(struct.unpack_from('<4sII', frame), (b'CFS1', 9, 17))
+            pos = 12
+            while pos < len(frame):
+                key, tier, total, offset, count = struct.unpack_from('<32sBHHH', frame, pos)
+                buf = chunks.setdefault(key.hex(), bytearray())
+                self.assertEqual(offset, len(buf))
+                self.assertLessEqual(offset + count, total)
+                pos += 39
+                buf.extend(frame[pos:pos + count])
+                pos += count
+            self.assertEqual(pos, len(frame))
+        self.assertEqual(chunks, {key: raw for key, _, raw in items})
+
+    def test_burst_yields_to_foreground_and_reserves_credit(self):
+        scheduler = hrcider.Scheduler()
+        scheduler.reset(9, 32768)
+        burst = b'CFS1' + bytes(16360)
+        scheduler.push(5, 3, burst, 12, bulk=True)
+        scheduler.grant(20000)
+        self.assertIsNone(scheduler.next_frame())
+        scheduler.push(3, 3, b'foreground', 14, bulk=True)
+        self.assertEqual(scheduler.next_frame(), (3, b'foreground'))
+        scheduler.grant(20000)
+        self.assertIsNone(scheduler.next_frame(allow_fill=False))
+        self.assertEqual(scheduler.next_frame(), (3, burst))
+
     def test_item_hash_matches_firmware(self):
         # Value computed by the production cs_item_hash() in cider_store.c.
         self.assertEqual(item_hash(bytes(range(1,9)),2,0xdeadbeef),1241701291)
@@ -65,6 +100,14 @@ class LedgerTests(Base):
 class PlannerTests(Base):
     def planner(self,cache=None):
         led=Ledger(cache or self.cache);return led,Planner(cache or self.cache,led)
+    def test_burst_fills_neighbours_and_releases_interrupted_offers(self):
+        _, planner = self.planner()
+        keys = self.ids
+        items = planner.burst(keys, [keys[5]], 3 * 2560)
+        self.assertEqual(items, [(keys[i], 'XS') for i in (5, 4, 6)])
+        planner.release(items)
+        self.assertEqual(planner.burst(keys, [keys[5]], 3 * 2560), items)
+
     def test_offers_missing_xs_then_m_then_s_and_cools_down(self):
         led,pl=self.planner()
         a=pl.next(5,now=0);self.assertTrue(all(t=='XS' for _,t in a));self.assertEqual(len(a),5)

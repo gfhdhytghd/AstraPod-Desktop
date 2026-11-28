@@ -24,7 +24,7 @@ import hrspectrum
 from hrcider_cache import Cache, Index, art_id, canonical_art_url
 from hrcider_volume import MonitorVolume
 from hrcider_library import Library, ROOT, page_error
-from hrcider_store import Ledger, Planner, offer_records, parse_rows
+from hrcider_store import BURST_COVERS, BURST_MAX, Ledger, Planner, burst_frames, offer_records, parse_rows
 from hrcider_workers import WorkerErrors, survive
 
 log = logging.getLogger('herdremote.cider')
@@ -687,10 +687,13 @@ class Scheduler:
         with self.lock:
             self.live.pop(request,None)
             self.heap=[v for v in self.heap if v[6]!=request];heapq.heapify(self.heap)
-    def next_frame(self):
+    def next_frame(self, allow_fill=True):
         with self.lock:
             if not self.heap:return None
             item=self.heap[0];priority,distance,order,serial,kind,payload,request,bulk=item
+            if priority == 5 and (not allow_fill or
+                                  self.credit - len(payload) < min(CHUNK, self.window - len(payload))):
+                return None
             if bulk and len(payload)>self.credit:return None
             heapq.heappop(self.heap)
             if bulk:self.credit-=len(payload);self.sent_bytes+=len(payload)
@@ -822,6 +825,9 @@ class Bridge:
         self.cache=cache or Cache();self.scheduler=Scheduler();self.lock=threading.RLock()
         self.stop=threading.Event();self.requests={};self.jobs=queue.PriorityQueue(32);self.controls=queue.Queue(16)
         self.fill_jobs=queue.PriorityQueue(32)
+        self.burst_jobs = queue.Queue(BURST_COVERS)
+        self.burst = None
+        self.bulk_max = 4096
         self.worker_errors=WorkerErrors()
         self.state=None;self.available=False;self.reason='Starting';self.state_seq=0;self.last_state=0
         self.opened=False;self.state_dirty=False;self.library_sent=0;self.wake=threading.Event();self.failures=0;self.templates={};self.generation=0;self.threads=[]
@@ -867,6 +873,7 @@ class Bridge:
                     (self._neighbors,'cider-neighbors')]
         if self.rufin is not None:
             workers.append((self._rufin_inventory,'rufin-inventory'))
+            workers.extend((self._burst_work, f'rufin-fill-{i}') for i in range(3))
         for target,name in workers:
             t=threading.Thread(target=target,name=name,daemon=True);t.start();self.threads.append(t)
         if self.realtime:
@@ -889,6 +896,7 @@ class Bridge:
     def disconnect(self):
         self.handoff.disconnect()
         with self.lock:
+            self._cancel_burst()
             self.spectrum.reset(time.monotonic())
             self.spectrum.close()
             self.warm_window.clear();self.warm_queue.clear();self.neighbors=None;self.capabilities=frozenset()
@@ -902,7 +910,7 @@ class Bridge:
             return True
         try:
             fields=payload.decode().split('\t');name=fields[0]
-            if name not in ('ci','cg','cr','cx','cc','cp','ct','cb','cq','cw','ls','la','lw','lv','ld','lf','lr','ch','cs'):return False
+            if name not in ('ci','cg','cr','cx','cc','cp','ct','cb','cq','cw','ls','la','lw','lv','lb','ld','lf','lr','ch','cs'):return False
             if name=='lv':fields=payload.decode().split('\n',1)[0].split('\t')
             with self.lock:
                 if name=='ci':
@@ -918,6 +926,7 @@ class Bridge:
                     self.capabilities=frozenset(normalized)&{'cn18','neighbors','warm','play-ack','localstore','modes5','loading','localdiag','live','remote-name',hrspectrum.CAPABILITY}
                     self.spectrum.reset(time.monotonic())
                     window=int(fields[2]);self.volume_delta=0;self.volume_set=None;self.generation=secrets.randbelow(0xfffffffe)+1;self.scheduler.reset(self.generation,window)
+                    self._cancel_burst()
                     self.seek_refresh=None
                     self.warm_window.clear();self.warm_queue.clear();self.warm_jobs.clear();self.neighbors=None
                     self.offer_pairs.clear();self.ledger.pending=None;self.ledger.synced=False;self.planner.reset()
@@ -928,6 +937,8 @@ class Bridge:
                     # The store protocol is opt-in on both sides: no CF, no ls/lw/la/lv.
                     if 'localstore' in self.capabilities:
                         self.scheduler.push(1,2,f'CF\t{self.generation}\tlocalstore'.encode())
+                        if self.rufin is not None:
+                            self.scheduler.push(1,2,f'CF\t{self.generation}\tartbulk1'.encode())
                         log.info('localstore CF queued gen=%d',self.generation)
                     if 'localdiag' in self.capabilities:self.scheduler.push(1,2,f'CF\t{self.generation}\tlocaldiag'.encode())
                     if hrspectrum.CAPABILITY in self.capabilities:
@@ -956,6 +967,8 @@ class Bridge:
                 elif name=='cg' and len(fields)==3:self.scheduler.grant(int(fields[2]))
                 elif name=='cx' and len(fields)==3:
                     req=int(fields[2])
+                    if self.burst is not None and req in (0, self.burst['request']):
+                        self._cancel_burst()
                     if req==0:
                         self.requests.clear();self._drop_jobs()
                         for r in {item[6] for item in self.scheduler.heap if item[4]==3}:
@@ -1052,6 +1065,7 @@ class Bridge:
                     if timing:
                         start,key,tier,ready=timing
                         log.info('art device ack gen=%d req=%d tier=%s bytes=%d request_ready_ms=%.1f request_ack_ms=%.1f ready_ack_ms=%.1f',self.generation,req,tier,count,(ready-start)*1000 if ready else -1,(time.monotonic()-start)*1000,(time.monotonic()-ready)*1000 if ready else -1)
+                elif name=='lb' and len(fields)==4: self._request_burst(int(fields[2]), int(fields[3]))
                 elif name in ('ls','la','lw','lv'):self._store_command(name,fields,payload)
                 elif name=='ct':self.index.request()
             return True
@@ -1095,6 +1109,78 @@ class Bridge:
             for record in offer_records(gen,pairs):self.scheduler.push(4,2,record)
             self.offer_pairs=set(pairs)|set(list(self.offer_pairs)[-8:])
             self._schedule_warm()
+    def _cancel_burst(self):
+        if self.burst is not None:
+            self.scheduler.cancel(self.burst['request'])
+            self.planner.release(self.burst['pairs'])
+            self.burst = None
+        while True:
+            try:
+                self.burst_jobs.get_nowait()
+            except queue.Empty:
+                break
+
+    def _request_burst(self, request, budget):
+        if (not 0 < request <= 0xffffffff or not 0 <= budget <= self.store_capacity
+                or 'localstore' not in self.capabilities):
+            raise ValueError('Invalid artwork burst')
+        self._cancel_burst()
+        keys = self._rufin_catalog_keys()
+        pairs = []
+        limit = min(self.bulk_max, self.scheduler.window)
+        if keys and self.ledger.synced and self.available and limit >= 4096:
+            order = dict.fromkeys(self.rufin_library.album_art_order())
+            known = set(keys)
+            order = [key for key in order if key in known]
+            ordered_set = set(order)
+            order.extend(key for key in keys if key not in ordered_set)
+            anchors = [self.state.get('art')] if self.state else []
+            if self.neighbors:
+                anchors.extend(self.neighbors[2:])
+            pairs = self.planner.burst(order, anchors, budget)
+        burst = dict(generation=self.generation, request=request, pairs=pairs, results={}, limit=limit)
+        self.burst = burst
+        if not pairs:
+            self._send_burst(burst)
+        for pair in pairs:
+            self.burst_jobs.put_nowait((burst, pair))
+
+    def _send_burst(self, burst):
+        items = [(*pair, burst['results'][pair]) for pair in burst['pairs']
+                 if burst['results'][pair] is not None]
+        for frame in burst_frames(burst['generation'], burst['request'], items, burst['limit']):
+            self.scheduler.push(5, 3, frame, burst['request'], bulk=True)
+        burst['results'].clear()
+        log.info('localstore burst gen=%d req=%d covers=%d bytes=%d', burst['generation'],
+                 burst['request'], len(items), sum(len(raw) for _, _, raw in items))
+
+    @survive()
+    def _burst_work(self):
+        while not self.stop.is_set():
+            try:
+                burst, pair = self.burst_jobs.get(timeout=.2)
+            except queue.Empty:
+                continue
+            with self.lock:
+                if self.burst is not burst:
+                    continue
+            key, tier = pair
+            try:
+                raw = self.artwork(key, tier)
+            except Exception as error:
+                raw = None
+                if not isinstance(error, (OSError, ValueError)):
+                    self.worker_errors.note('_burst_work', error)
+                with self.lock:
+                    if self.burst is burst:
+                        self.planner.failed(key, tier, all_tiers=isinstance(error, ArtworkVariantUnavailable))
+            with self.lock:
+                if self.burst is not burst:
+                    continue
+                burst['results'][pair] = raw
+                if len(burst['results']) == len(burst['pairs']):
+                    self._send_burst(burst)
+
     def _drop_jobs(self,request=None):
         for jobs in (self.jobs, self.fill_jobs):
             with jobs.mutex:
@@ -1128,6 +1214,7 @@ class Bridge:
         library.lyrics.select('')
         self.client=client;self.library=library;self.remote_epoch+=1
         self.rufin_catalog=None
+        self._cancel_burst()
         self.planner.reset();self.offer_pairs.clear();self.progress_at=0
         self.seek_refresh=None
         self.switch_deferred=False;self.failures=0;self.neighbors=None;self.warm_queue.clear()
@@ -1781,11 +1868,12 @@ class Bridge:
                     time.monotonic()-self.live_pending[1]>=3.0):
                 raise SessionExpired('Cider application liveness timeout gen='+str(self.generation))
 
-    def poll(self,send,spectrum_delay=lambda: .010):
+    def poll(self,send,spectrum_delay=lambda: .010, max_message=4096):
         self.handoff.poll(lambda payload: send(2, payload))
         with self.lock:
             self.check_liveness()
             if not self.opened:return
+            self.bulk_max = min(max_message, BURST_MAX)
             now=time.monotonic()
             if self.state_dirty:self._state()
             # CA must announce the generation before its first challenge.
@@ -1816,12 +1904,15 @@ class Bridge:
                     self.scheduler.push(1,2,f'CG\t{self.generation}\t{library}'.encode())
                 self.library_sent=library
             sent = False
+            allow_fill = self.burst is None or spectrum_delay() is not None
             for _ in range(4):
-                frame=self.scheduler.next_frame()
+                frame=self.scheduler.next_frame(allow_fill=allow_fill)
                 if not frame:break
                 if frame[0]==2 and frame[1].startswith(b'CP\t') and 'neighbors' not in self.capabilities:continue
                 send(*frame)
                 sent = True
+                if frame[0] == 3 and frame[1][:4] == b'CFS1':
+                    break  # recheck input before writing another bulk frame
             if hrspectrum.CAPABILITY in self.capabilities or self.spectrum.process is not None:
                 playing = self.available and bool(self.state and self.state.get('rate'))
                 frame = self.spectrum.poll(time.monotonic(), self.generation, playing,

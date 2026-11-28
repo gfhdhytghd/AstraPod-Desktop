@@ -155,3 +155,13 @@ AstraPod Desktop is licensed under GPL-2.0-or-later. See [LICENSE](LICENSE).
 [plugins]: docs/input-plugins.md
 [cider]: https://github.com/gfhdhytghd/AstraPod-Cider
 [extras-format]: https://github.com/gfhdhytghd/AstraPod/blob/master/docs/podbox/extras-data-format.md
+
+### Rufin Cover Flow background cache
+
+The desktop keeps the bounded source images and rendered XS, S, M and L
+artwork. With compatible firmware, HerdRemote advertises `artbulk1`;
+a connected idle iPod can request up to six XS, M or S covers per burst.
+The host prepares three covers in parallel and packs fragments into
+messages up to 16364 bytes. Foreground requests retain priority, and the
+player confirms each cover only after it enters the local store. Older
+firmware uses its existing per-cover store requests.

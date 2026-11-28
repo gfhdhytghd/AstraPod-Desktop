@@ -14,7 +14,36 @@ import zlib
 TIERS = {'L': 0, 'M': 1, 'S': 2, 'XS': 3}
 NAMES = {v: k for k, v in TIERS.items()}
 LIST_END = 4096 << 5          # player cursor value that ends a listing
+FILL_BYTES = {'XS': 2560, 'M': 33280, 'S': 6656}
 FILL_ORDER = ('XS', 'M', 'S')  # whole library, cheapest browse tier first
+
+
+BURST_COVERS = 6
+BURST_MAX = 16364
+_BURST_HEADER = struct.Struct('<4sII')
+_BURST_ITEM = struct.Struct('<32sBHHH')
+
+
+def burst_frames(generation, request, items, limit):
+    """Pack consecutive cover fragments and terminate with a header-only frame."""
+    header = _BURST_HEADER.pack(b'CFS1', generation, request)
+    frame = bytearray(header)
+    for key, tier, raw in items:
+        binary_key = bytes.fromhex(key)
+        offset = 0
+        while offset < len(raw):
+            room = limit - len(frame) - _BURST_ITEM.size
+            if room <= 0:
+                yield bytes(frame)
+                frame = bytearray(header)
+                room = limit - len(frame) - _BURST_ITEM.size
+            count = min(room, len(raw) - offset)
+            frame.extend(_BURST_ITEM.pack(binary_key, TIERS[tier], len(raw), offset, count))
+            frame.extend(raw[offset:offset + count])
+            offset += count
+    if len(frame) > len(header):
+        yield bytes(frame)
+    yield header
 
 
 def item_hash(k8, tier, crc):
@@ -181,6 +210,31 @@ class Planner:
                 self.offered[pair] = now
         return out
 
+
+    def burst(self, keys, anchors, budget, count=BURST_COVERS):
+        """Select missing previews first, with catalogue neighbours first per tier."""
+        now = time.monotonic()
+        positions = {key: i for i, key in enumerate(keys)}
+        pivot = next((positions[key] for key in anchors if key in positions), 0)
+        ordered = sorted(keys, key=lambda key: abs(positions[key] - pivot))
+        with self.lock:
+            self.offered = {pair: t for pair, t in self.offered.items() if now - t < self.recent}
+            out = []
+            for tier in FILL_ORDER:
+                for key in ordered:
+                    if budget >= FILL_BYTES[tier] and self.eligible(key, tier, now):
+                        budget -= FILL_BYTES[tier]
+                        pair = (key, tier)
+                        self.offered[pair] = now
+                        out.append(pair)
+                        if len(out) == count:
+                            return out
+            return out
+
+    def release(self, pairs):
+        with self.lock:
+            for pair in pairs:
+                self.offered.pop(pair, None)
 
     def progress(self, initial=False, capacity=1 << 30, with_generation=False, keys=None):
         """Completion requires device ACKs with the rendered CRC for every tier.
