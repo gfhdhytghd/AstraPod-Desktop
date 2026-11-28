@@ -42,6 +42,16 @@ PodLink Shell uses a separate USB endpoint and can run while HerdRemote is
 connected. See the [Apple IR setup][ir] and the [Cider bridge setup][cider]
 for those optional integrations.
 
+On LCD type 1 firmware, `podlink_shell.py` supports `lcd-timing` and
+`lcd-te-sync` without opening a device menu. `lcd-pacing on|off|get` switches
+the UI animation clock between the panel refresh and 60 fps on any LCD, and
+`lcd-pacing status` prints the refresh period and the last animation's rate,
+frames and timings. Run `lcd-diag` to save a report, then use `log-fetch` to
+download it. `lcd-diag survey` also samples every GPIO and LCD signal for one
+second, and the player's screen stops for that second.
+Use `ui-perf OUTPUT` to fetch an existing UI performance log.
+See the [PodLink Shell guide][shell] for command arguments and paths.
+
 For plugin launch, screen capture and device checks, see the
 [iPod plugin smoke test](docs/plugin-smoke.md).
 

@@ -283,3 +283,195 @@ def test_settings_cli_requires_full_confirmation_option(settings_player, monkeyp
         shell.main()
     assert error.value.code == 2
     assert not settings_player.commands
+
+
+class PlaybackPlayer(Player):
+    def __init__(self):
+        super().__init__(1)
+        self.operation = 0
+        self.error = 0
+        self.path = "/Music/世界.m4a".encode()
+
+    def ctrl_transfer(self, direction, request, value, index, data, *, timeout):
+        if index != 0x4954:
+            return super().ctrl_transfer(direction, request, value, index, data, timeout=timeout)
+        assert (request, timeout) == (0x5D, 1000)
+        if direction == 0x40:
+            self.commands.append((value, data))
+            self.operation = value
+            return len(data)
+        assert (direction, value, data) == (0xC0, 0, 328)
+        return struct.pack("<IIIi6Ii24s260s", 1, len(self.commands), self.operation,
+                           self.error, 1, 6237, 50000, 21, 48000, 24, 0, b"ALAC",
+                           self.path)
+
+
+def test_playback_commands_and_status(monkeypatch, capsys):
+    player = PlaybackPlayer()
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    shell.execute("serial", "play", player.path.decode(), start_ms=1000)
+    shell.execute("serial", "open-lyrics")
+    shell.execute("serial", "seek", "6237")
+    shell.execute("serial", "next")
+    shell.execute("serial", "prev")
+    assert player.commands == [
+        (1, struct.pack("<I", 1000) + player.path),
+        (5, b""), (2, struct.pack("<I", 6237)), (3, b""), (4, b""),
+    ]
+    capsys.readouterr()
+    shell.execute("serial", "playback-status", json_output=True)
+    status = json.loads(capsys.readouterr().out)
+    assert (status["state"], status["path"], status["codec"]) == (
+        "playing", player.path.decode(), "ALAC"
+    )
+    assert (status["elapsed_ms"], status["length_ms"], status["frequency_hz"],
+            status["bits_per_sample"], status["playback_error"]) == (6237, 50000, 48000, 24, 0)
+
+
+def test_playback_validation_and_firmware_error(monkeypatch):
+    player = PlaybackPlayer()
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    with pytest.raises(ValueError, match="absolute iPod path"):
+        shell.execute("serial", "play", "Music/track.m4a")
+    with pytest.raises(ValueError, match="Playback position"):
+        shell.execute("serial", "seek", "-1")
+    assert not player.commands
+    player.error = 2
+    with pytest.raises(RuntimeError, match="play: file not found"):
+        shell.execute("serial", "play", "/Music/absent.m4a")
+
+
+def test_log_fetch_borrows_existing_download(monkeypatch):
+    calls = []
+    monkeypatch.setattr(shell, "record_fetch", lambda *args: calls.append(args))
+    shell.execute("serial", "log-fetch", "/.rockbox/crumbs-last.txt", value="crumbs.txt")
+    assert calls == [("serial", "/.rockbox/crumbs-last.txt", "crumbs.txt")]
+
+
+class LCDPlayer:
+    def __init__(self, value=0, error=0):
+        self.value = value
+        self.error = error
+        self.writes = []
+        self.reads = 0
+
+    def ctrl_transfer(self, direction, request, value, index, data, *, timeout):
+        assert (request, index, timeout) == (0x5D, 0x4955, 1000)
+        if direction == 0x40:
+            self.cookie, argument = struct.unpack("<IB", data)
+            assert self.cookie
+            self.writes.append((value, argument))
+            return len(data)
+        assert (direction, value, data) == (0xC0, 0, 16)
+        self.reads += 1
+        if self.reads == 1:
+            return struct.pack("<4I", 1, self.cookie ^ 1, 5, 0)
+        return struct.pack("<4I", 1, self.cookie, self.error, self.value)
+
+
+@pytest.mark.parametrize(("command", "argument", "opcode", "option", "value", "output"), [
+    ("lcd-timing", None, 1, 0, 0x33, "LCD_PHTIME=0x33"),
+    ("lcd-timing", "0x21", 1, 0x21, 0x21, "LCD_PHTIME=0x21"),
+    ("lcd-timing", "0x00", 1, 0xFF, 0, "LCD_PHTIME=0x00"),
+    ("lcd-dma-burst", "8", 5, 8, 8, "lcd-dma-burst: 8"),
+    ("lcd-dma-width", "32", 6, 32, 32, "lcd-dma-width: 32"),
+    ("lcd-boost", "get", 7, 2, 0, "lcd-boost: off"),
+    ("lcd-bench", "band", 8, 1, 0, "lcd-bench: band measured"),
+    ("lcd-pio", "on", 9, 1, 1, "lcd-pio: on"),
+    ("lcd-te-sync", "on", 2, 1, 1, "lcd-te-sync: on"),
+    ("lcd-te-sync", "get", 2, 2, 0, "lcd-te-sync: off"),
+    ("lcd-async", "off", 11, 0, 0, "lcd-async: off"),
+    ("lcd-async", "on", 11, 1, 1, "lcd-async: on"),
+    ("lcd-async", "get", 11, 2, 1, "lcd-async: on"),
+    ("lcd-pacing", "off", 3, 0, 0, "lcd-pacing: off"),
+    ("lcd-pacing", "get", 3, 2, 1, "lcd-pacing: on"),
+    ("lcd-diag", None, 4, 0, 0, "lcd-diag: saved /.rockbox/lcd-te-diag.txt"),
+    ("lcd-diag", "survey", 4, 1, 0, "lcd-diag: saved /.rockbox/lcd-te-diag.txt"),
+])
+def test_lcd_command_waits_for_its_result(monkeypatch, capsys, command, argument,
+                                          opcode, option, value, output):
+    player = LCDPlayer(value)
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    shell.execute("serial", command, argument)
+    assert player.writes == [(opcode, option)]
+    assert player.reads == 2
+    assert capsys.readouterr().out.strip() == output
+
+
+@pytest.mark.parametrize(("command", "argument"), [
+    ("lcd-timing", "0xff"),
+    ("lcd-dma-burst", "2"),
+    ("lcd-dma-width", "8"),
+    ("lcd-bench", None),
+    ("lcd-pio", "4"),
+    ("lcd-te-sync", "toggle"),
+    ("lcd-pacing", None),
+    ("lcd-pacing", "toggle"),
+    ("lcd-diag", "extra"),
+])
+def test_lcd_rejects_invalid_options_before_usb(monkeypatch, command, argument):
+    monkeypatch.setattr(shell, "find_player", lambda serial: pytest.fail("unexpected USB lookup"))
+    with pytest.raises(ValueError):
+        shell.execute("serial", command, argument)
+
+
+class PaceStatusPlayer(LCDPlayer):
+    def __init__(self, fields):
+        super().__init__()
+        self.fields = fields
+
+    def ctrl_transfer(self, direction, request, value, index, data, *, timeout):
+        if direction == 0x40:
+            self.value = self.fields[data[4]]
+        return super().ctrl_transfer(direction, request, value, index, data, timeout=timeout)
+
+
+def test_lcd_pacing_status_reads_every_field(monkeypatch, capsys):
+    # period, divisor, shown, missed, offset, cost, dma, flags
+    player = PaceStatusPlayer([14934, 2, 118, 3, 1250, 16100, 15800, 0b111])
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    shell.execute("serial", "lcd-pacing", "status")
+    assert player.writes == [(10, field) for field in range(8)]
+    assert capsys.readouterr().out.splitlines() == [
+        "lcd-pacing: on",
+        "period: 14934 us (66.961 Hz, measured TE)",
+        "TE phase: known",
+        "last animation: half rate",
+        "shown: 118 frames",
+        "missed: 3 frames",
+        "wake offset: 1250 us after TE",
+        "cost: 16100 us per frame (average)",
+        "dma: 15800 us (longest)",
+    ]
+
+
+def test_lcd_pacing_status_without_animation(monkeypatch, capsys):
+    player = PaceStatusPlayer([16667, 0, 0, 0, 0, 0, 0, 0])
+    monkeypatch.setattr(shell, "find_player", lambda serial: player)
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    shell.execute("serial", "lcd-pacing", "status")
+    assert capsys.readouterr().out.splitlines() == [
+        "lcd-pacing: off",
+        "period: 16667 us (59.999 Hz, authored 60 fps)",
+        "TE phase: unknown",
+        "last animation: none",
+    ]
+
+
+def test_lcd_diag_reports_write_failure(monkeypatch, capsys):
+    monkeypatch.setattr(shell, "find_player", lambda serial: LCDPlayer(error=5))
+    monkeypatch.setattr(shell.time, "sleep", lambda seconds: None)
+    with pytest.raises(RuntimeError, match="could not save lcd-te-diag.txt"):
+        shell.execute("serial", "lcd-diag")
+    assert capsys.readouterr().out == ""
+
+
+def test_ui_perf_uses_log_fetch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(shell, "record_fetch", lambda *args: calls.append(args))
+    shell.execute("serial", "ui-perf", "capture.txt")
+    assert calls == [("serial", "/.rockbox/ui-perf.txt", "capture.txt")]
