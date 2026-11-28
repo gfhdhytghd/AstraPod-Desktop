@@ -11,6 +11,7 @@ import hrt3
 import podlink_settings
 
 PROJECT = re.compile(r"t3p[0-9]+\Z")
+FLAT = "t3"  # the workspace ID of the thread list across projects
 THREAD = re.compile(r"t3t[0-9]+\Z")
 DEFAULT_APPROVALS = (("decline", "Decline"), ("acceptForSession", "Always allow this session"),
                      ("accept", "Approve"))
@@ -59,8 +60,20 @@ def status(row):
 
 
 def rows_for(threads, project, tab):
-    rows = sorted((row for row in threads.values() if row["projectId"] == project
-                   and not row.get("deletedAt")),
+    return ordered((row for row in threads.values() if row["projectId"] == project), tab)
+
+
+def flat_rows(projects, threads, tab):
+    """Every live project's threads as one list, in rows_for's order."""
+    live = {key for key, row in projects.items() if not row.get("archivedAt")}
+    return ordered((row for row in threads.values() if row["projectId"] in live), tab)
+
+
+def ordered(rows, tab):
+    """All: newest first. Active: waiting (oldest request first), then
+    running, then the rest, each newest first; settled, snoozed and archived
+    threads are left out unless they wait."""
+    rows = sorted((row for row in rows if not row.get("deletedAt")),
                   key=lambda row: (-instant(row["updatedAt"]), row["id"]))
     if tab == "all":
         return rows
@@ -155,14 +168,16 @@ class Agents:
 
     def select_threads(self, projects, threads, selection):
         project, tab, detail = selection
-        visible = rows_for(threads, project, tab)[:hrproto.MAX_AGENTS] if project in projects else ()
+        visible = (flat_rows(projects, threads, tab) if project == FLAT else
+                   rows_for(threads, project, tab) if project in projects else ())
+        visible = visible[:hrproto.MAX_AGENTS]
         return [row["id"] for row in visible if row["latestVisibleMessage"] is not None
                 and row["latestVisibleMessage"]["role"] != "assistant"] + (
                     [detail] if detail in threads else [])
 
     def watch(self, desktop, player, workspace, tab, pane):
         self.client.watch(self.control == "t3" and (desktop or player), (
-            self.projects.get(workspace) if player else None,
+            (FLAT if workspace == FLAT else self.projects.get(workspace)) if player else None,
             tab if player else None,
             self.threads.get(pane) if player else None))
 
@@ -193,6 +208,13 @@ class Agents:
                 [hrproto.STATUS_CODES[status(row)] for row in rows])))
         rows = rows_for(threads, project, tab)[:hrproto.MAX_AGENTS]
         return tabs, [self.agent_row(row, details.get(row["id"], {})) for row in rows]
+
+    def thread_rows(self, picture, tab):
+        """The thread list across projects; the title field names the project."""
+        projects, threads, details = picture
+        rows = flat_rows(projects, threads, tab)[:hrproto.MAX_AGENTS]
+        return [dict(self.agent_row(row, details.get(row["id"], {})),
+                     title=projects[row["projectId"]]["title"]) for row in rows]
 
     def agent_row(self, row, detail):
         last = next((m["text"] for m in reversed(assistant_messages(detail))

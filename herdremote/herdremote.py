@@ -655,7 +655,13 @@ class Daemon:
         if st != self.sent_status:
             self.send(st)
             self.sent_status = st
-        if self.subscribed:
+        if self.subscribed == hragent.FLAT:
+            payload = hrproto.agents(self.subscribed,
+                                     self.agents.thread_rows(picture, self.subscribed_tab), limit)
+            if payload != self.sent_agents:
+                self.send(payload)
+                self.sent_agents = payload
+        elif self.subscribed:
             if t3_mode:
                 tabs, rows = self.agents.tab_rows(picture, self.subscribed, self.subscribed_tab)
             else:
@@ -754,6 +760,7 @@ class Daemon:
             if self.link is not None:
                 self.send(hrproto.hello(VERSION))
                 self.send(hrproto.agent_mode(self.agents.control))
+                self.send(hrproto.thread_list())
         elif name == "qx":
             self.question_ext = True
             self.sent_questions.clear()
@@ -789,7 +796,8 @@ class Daemon:
                 self.send(hrproto.result(args[0], False, str(error)))
         elif name == "sub":
             if args[0] != "-":
-                t3_project = bool(hragent.PROJECT.fullmatch(args[0]))
+                t3_project = (bool(hragent.PROJECT.fullmatch(args[0])) or
+                              args[0] == hragent.FLAT)
                 if t3_project:
                     if not self.player_t3 or len(args) != 2 or args[1] not in ("active", "all"):
                         return
