@@ -40,12 +40,12 @@ RESIDENT_WINDOW = 128 * 1024
 
 
 class HTTPStatusError(OSError):
-    def __init__(self, code, message=''):
+    def __init__(self, code, message='', *, service='Cider'):
         self.code = code
         # Only a known static diagnosis may cross into page logs. Arbitrary
         # server bodies can contain URLs, credentials or private query values.
         self.cider_message = message if message == 'Network connection unavailable' else ''
-        super().__init__('Cider HTTP '+str(code))
+        super().__init__(f'{service} HTTP {code}')
 
 
 class SessionExpired(RuntimeError):
@@ -847,7 +847,7 @@ class Bridge:
         self.art_locks=WeakValueDictionary()
         self.art_locks_mutex=threading.Lock()
         self.prefetch=queue.Queue(10)
-        self.warm_window=set();self.warm_queue=set();self.warm_jobs={};self.neighbors=None
+        self.warm_window={};self.warm_queue=set();self.warm_jobs={};self.neighbors=None
         self.capabilities=frozenset();self.loading=Loading()
         self.client.rpc_observer=self._rpc_event
         self.ledger=Ledger(self.cache);self.planner=Planner(self.cache,self.ledger);self.offer_pairs=set();self.art_times={};self.progress_at=0;self.store_capacity=1<<30;self.inventory_pages=0
@@ -1036,7 +1036,7 @@ class Bridge:
                     tier=fields[2];keys=fields[3].split(',') if fields[3] else []
                     if tier not in SIZES or len(keys)>7 or any(not re.fullmatch('[0-9a-f]{64}',k) for k in keys):
                         raise ValueError('Invalid visible art window')
-                    self.warm_window={(key,tier) for key in keys};self._schedule_warm()
+                    self.warm_window=dict.fromkeys((key,tier) for key in keys);self._schedule_warm()
                 elif name=='ld' and len(fields)==15:
                     if 'localdiag' not in self.capabilities:raise ValueError('Unadvertised diagnostics')
                     values=list(map(int,fields[2:]))
@@ -1437,6 +1437,15 @@ class Bridge:
                     if lyric_args.get('lrc')=='1' and self.state and self.state['id']!=lyric_args.get('track'):
                         page.update(total=offset+1,items=[{'id':'lyric-wait'}])
                     self.scheduler.push(2,2,native_page_frame(generation,req,page),bulk=True)
+                    # Use the page's trip over PodLink to fetch the first previews.
+                    # A visible window from the iPod always takes precedence.
+                    if (rufin and query == 'albums?format=panel' and offset == 0
+                            and 'warm' in self.capabilities and not self.warm_window
+                            and not page['stale']):
+                        keys = (row.get('art', '') for row in page['items'][:7])
+                        self.warm_window = dict.fromkeys((key, 'XS') for key in keys
+                                                         if re.fullmatch('[0-9a-f]{64}', key))
+                        self._schedule_warm()
                     log.info('page ready gen=%d req=%d kind=%s offset=%d rows=%d stale=%s ms=%.1f',generation,req,kind,offset,len(page['items']),bool(page['stale']),1000*(time.monotonic()-started))
     @survive()
     def _volume_worker(self):
@@ -1632,7 +1641,8 @@ class Bridge:
             return uris[0]
         return uri if uri!=template else None
     def _schedule_warm(self):
-        desired=self.warm_window|self.warm_queue|self.offer_pairs
+        background=self.warm_queue|self.offer_pairs
+        desired=set(self.warm_window)|background
         while True:
             try:
                 generation,pair=self.prefetch.get_nowait()
@@ -1640,7 +1650,7 @@ class Bridge:
             except queue.Empty:break
         for pair in list(self.warm_jobs):
             if pair not in desired:self.warm_jobs.pop(pair,None)
-        for pair in sorted(desired,key=lambda pair:(pair not in self.warm_window,pair)):
+        for pair in (*self.warm_window, *sorted(background.difference(self.warm_window))):
             if pair not in self.warm_jobs:
                 try:self.prefetch.put_nowait((self.generation,pair))
                 except queue.Full:break  # bounded background work, retried next window
@@ -1654,10 +1664,10 @@ class Bridge:
     def _warm(self,generation,pair):
         key,tier=pair
         with self.lock:
-            if generation!=self.generation or not self.opened or pair not in self.warm_window|self.warm_queue|self.offer_pairs:return
+            if generation!=self.generation or not self.opened or not (pair in self.warm_window or pair in self.warm_queue or pair in self.offer_pairs):return
         try:
             with self.lock:
-                if generation!=self.generation or pair not in self.warm_window|self.warm_queue|self.offer_pairs:return
+                if generation!=self.generation or not (pair in self.warm_window or pair in self.warm_queue or pair in self.offer_pairs):return
             self.artwork(key,tier)
         except Exception as error:
             if not isinstance(error,(OSError,ValueError,TimeoutError)):self.worker_errors.note('_warm',error)

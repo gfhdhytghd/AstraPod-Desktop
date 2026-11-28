@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import hrcider
 
@@ -53,6 +53,42 @@ class Prefetch(unittest.TestCase):
         for key in keys:self.bridge.artwork(key,'M')
         self.assertEqual(len(entered),4)
         print(f'prefetch: 4 concurrent cold originals, XS/M reuse, total_ms={(time.monotonic()-started)*1000:.1f}')
+    def test_durable_prefetch_write_does_not_block_existing_cover(self):
+        pixels = hrcider.render(self.raw, 'XS')
+        self.cache.put_art('a'*64, 'XS', pixels)
+        syncing, release, read = threading.Event(), threading.Event(), threading.Event()
+        received = []
+
+        def sync(_fd):
+            syncing.set()
+            release.wait(4)
+
+        def fetch():
+            received.append(self.cache.get_art('a'*64, 'XS'))
+            read.set()
+
+        writer = threading.Thread(target=self.cache.put_art, args=('b'*64, 'XS', pixels))
+        reader = threading.Thread(target=fetch)
+        with patch('hrcider_cache.os.fsync', side_effect=sync):
+            writer.start()
+            try:
+                self.assertTrue(syncing.wait(2))
+                reader.start()
+                self.assertTrue(read.wait(1), 'cached cover waited behind unrelated fsync')
+            finally:
+                release.set()
+                writer.join(3)
+                if reader.ident is not None:
+                    reader.join(3)
+        self.assertEqual(received, [pixels])
+        self.assertEqual(self.cache.get_art('b'*64, 'XS'), pixels)
+
+    def test_visible_window_preserves_device_priority(self):
+        keys = ['c'*64, 'a'*64, 'b'*64]
+        self.bridge.command(('cw\t7\tXS\t'+','.join(keys)).encode())
+        self.assertEqual([self.bridge.prefetch.get_nowait()[1] for _ in keys],
+                         [(key, 'XS') for key in keys])
+
     def test_rapid_visible_windows_keep_queue_bounded(self):
         for i in range(2000):
             keys=[f'{(i*7+j):064x}' for j in range(7)]

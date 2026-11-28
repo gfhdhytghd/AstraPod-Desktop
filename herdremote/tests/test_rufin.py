@@ -147,6 +147,8 @@ class Rufin(BaseHTTPRequestHandler):
                 return self.reply(200, s.lyrics)
             return self.reply(200, {'state': 'ready', 'document': {'lines': [{'text': 'la la'}, {'text': 'second'}]}})
         if path == '/api/artwork':
+            if getattr(s, 'artwork_status', 200) != 200:
+                return self.reply(s.artwork_status)
             from PIL import Image
             out = io.BytesIO()
             Image.new('RGB', (int(qs.get('size', 600)) + s.oversize, 200), (200, 40, 40)).save(out, 'PNG')
@@ -716,6 +718,44 @@ class Priority(unittest.TestCase):
         call = [c for c in self.server.calls if c[1].startswith('/api/artwork')][-1]
         self.assertEqual(call[3], 'Bearer ' + TOKEN)
         self.assertIn('size=240', call[1])
+
+    def test_rufin_missing_art_shares_backoff_across_cover_tiers(self):
+        self.open()
+        self.bridge._select_remote(0)
+        key = self.bridge.rufin_library.art('local:album/7')
+        self.server.artwork_status = 404
+        with mock.patch.object(hrrufin.time, 'monotonic', return_value=1000):
+            for tier in ('XS', 'M', 'S', 'XS'):
+                with self.assertRaises(hrcider.HTTPStatusError):
+                    self.bridge.artwork(key, tier)
+        calls = [c for c in self.server.calls if c[1].startswith('/api/artwork')]
+        self.assertEqual(len(calls), 1)
+        self.server.artwork_status = 200
+        with mock.patch.object(hrrufin.time, 'monotonic', return_value=1100):
+            self.assertEqual(len(self.bridge.artwork(key, 'XS')), 2060)
+
+    def test_rufin_transient_art_failure_can_retry(self):
+        self.open()
+        self.bridge._select_remote(0)
+        key = self.bridge.rufin_library.art('local:album/7')
+        self.server.artwork_status = 503
+        with self.assertRaises(hrcider.HTTPStatusError):
+            self.bridge.artwork(key, 'XS')
+        self.server.artwork_status = 200
+        self.assertEqual(len(self.bridge.artwork(key, 'XS')), 2060)
+
+    def test_cover_flow_initial_page_prewarms_rufin_previews(self):
+        gen = self.open()
+        self.bridge._select_remote(0)
+        self.rufin.ensure()
+        self.bridge.rufin_library.refresh()
+        thread = threading.Thread(target=self.bridge._pages, daemon=True)
+        self.bridge.threads.append(thread)
+        thread.start()
+        self.bridge.command(f'cq\t{gen}\t11\t0\t50\talbums?format=panel'.encode())
+        first = self.bridge.prefetch.get(timeout=1)
+        key = self.bridge.rufin_library.art('local:album/1')
+        self.assertEqual(first, (gen, (key, 'XS')))
 
     def test_pages_through_the_bridge_carry_the_wire_generation(self):
         gen = self.open()
