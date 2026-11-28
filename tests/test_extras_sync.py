@@ -445,3 +445,153 @@ def test_keyring_uses_stdin_for_password(monkeypatch):
     assert extras_storage.secret("account-id") == "fixture-password"
     assert "fixture-password" not in calls[0][0]
     assert calls[0][1]["input"] == "fixture-password"
+
+
+def test_import_multiple_ics_edit_and_round_trip(player, tmp_path):
+    from astrapod_desktop import local_calendar as local
+
+    root, _disk, store = player
+    text = """BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Import fixture//EN
+BEGIN:VTIMEZONE
+TZID:Fixture/Import
+BEGIN:STANDARD
+DTSTART:19700101T000000
+TZOFFSETFROM:+0800
+TZOFFSETTO:+0800
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:series
+DTSTAMP:20261101T000000Z
+DTSTART;TZID=Fixture/Import:20261121T090000
+DTEND;TZID=Fixture/Import:20261121T100000
+RRULE:FREQ=WEEKLY;COUNT=4
+EXDATE;TZID=Fixture/Import:20261128T090000
+EXDATE;TZID=Fixture/Import:20261205T090000
+SUMMARY:中文会议，第一行
+ 折叠续行
+X-FIXTURE:retained
+END:VEVENT
+END:VCALENDAR
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Another fixture//EN
+BEGIN:VTODO
+UID:task
+DTSTAMP:20261119T000000Z
+DUE;VALUE=DATE:20261130
+SUMMARY:全天待办
+STATUS:NEEDS-ACTION
+END:VTODO
+END:VCALENDAR
+"""
+    first = tmp_path / "mixed.ics"
+    first.write_bytes(b"\xef\xbb\xbf" + text.replace("\n", "\r\n").encode())
+    second = tmp_path / "allday.ics"
+    second.write_text("""BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Third fixture//EN
+BEGIN:VEVENT
+UID:holiday
+DTSTAMP:20261119T000000Z
+DTSTART;VALUE=DATE:20261126
+DTEND;VALUE=DATE:20261127
+SUMMARY:休假
+END:VEVENT
+END:VCALENDAR
+""")
+    items, conflicts = local.import_files(store, [first, second])
+    assert not conflicts and set(items) == {"series", "task", "holiday"}
+    series_before = items["series"]
+    item = ics.parse(series_before).walk("VEVENT")[0]
+    assert str(item["SUMMARY"]) == "中文会议，第一行折叠续行"
+    assert len(item["EXDATE"]) == 2
+    assert ics.parse(series_before).walk("VTIMEZONE")
+    series_after = local.edit(series_before, "", {"SUMMARY": "更新后的会议", "LOCATION": "办公室",
+                                                   "DTEND": "2026-11-21T10:30"})
+    items = local.save(store, "series", series_before, series_after)
+    task_after = local.edit(items["task"], "", {"STATUS": "COMPLETED"})
+    items = local.save(store, "task", items["task"], task_after)
+
+    output = root / "export.ics"
+    local.export_file(output, ics.merge(items, name="本地日历"))
+    exported = output.read_bytes()
+    assert ics.split(exported) == items
+    assert b"DTEND;TZID=Fixture/Import:20261121T103000" in exported
+    assert b"RRULE:" in exported and exported.count(b"EXDATE;") == 2
+    assert b"DTSTART;VALUE=DATE:20261126" in exported
+    assert b"DTEND;VALUE=DATE:20261127" in exported and b"DUE;VALUE=DATE:20261130" in exported
+    assert b"STATUS:COMPLETED" in exported and b"PERCENT-COMPLETE:100" in exported
+    assert b"SEQUENCE:1" in exported and b"X-FIXTURE:retained" in exported
+    assert local.import_files(Store(tmp_path / "another-library"), [output])[0] == items
+
+
+def test_local_calendar_sync_conflict_deletion_and_inbox(player, tmp_path):
+    from astrapod_desktop import local_calendar as local
+
+    root, disk, store = player
+    source = tmp_path / "local.ics"
+    source.write_text(entry("first", "original", "21"))
+    imported, _ = local.import_files(store, [source])
+    target = root / "Calendars" / "AstraPod-Local.ics"
+
+    def sync(account="account", **destinations):
+        with store.locked():
+            return calendar_sync.sync(None, store, disk, "player", account, [local.LOCAL], destinations)
+
+    assert sync() == (1, 0, [])
+    assert ics.split(target.read_bytes()) == imported
+    target.write_text(entry("first", "device change", "22"))
+    assert sync("other-account") == (1, 0, [])
+    assert "device change" in local.load(store)["first"]
+    current = local.load(store)["first"]
+    edited = local.edit(current, "", {"SUMMARY": "desktop winner"})
+    local.save(store, "first", current, edited)
+    target.write_text(entry("first", "competing device edit", "23"))
+    # Give the desktop edit a fixed revision newer than the device fixture.
+    local.save(store, "first", edited, ics.split(entry("first", "desktop winner", "27"))["first"])
+    inbox = target.with_name("AstraPod.ics")
+    inbox.write_text(entry("device-task", "inbox task", "25", kind="VTODO"))
+    _, pending, conflicts = sync(VTODO=local.LOCAL.url)
+    assert pending == 0 and len(conflicts) == 1
+    assert "competing device edit" in next(store.root.glob("conflict-*.ics")).read_text()
+    assert set(local.load(store)) == {"first", "device-task"}
+    assert ics.split(inbox.read_bytes()) == {}
+    assert "desktop winner" in target.read_text()
+
+    keep = {"device-task": local.load(store)["device-task"]}
+    target.write_bytes(ics.merge(keep))
+    assert sync() == (1, 0, [])
+    assert local.load(store) == keep
+
+
+def test_local_reimport_keeps_split_series_and_archives_old_revision(player, tmp_path):
+    from astrapod_desktop import local_calendar as local
+
+    _, _, store = player
+    initial = tmp_path / "series.ics"
+    exception = entry("shared", "exception", "22").replace(
+        "DTSTART:", "RECURRENCE-ID:20261128T120000Z\r\nDTSTART:")
+    initial.write_text(entry("shared", "original", "22") + exception)
+    items, _ = local.import_files(store, [initial])
+    assert len(list(local.entries(items))) == 2
+    updated = tmp_path / "updated.ics"
+    updated.write_text(entry("shared", "new master", "23"))
+    items, conflicts = local.import_files(store, [updated])
+    assert len(list(local.entries(items))) == 2 and len(conflicts) == 1
+    assert "SUMMARY:new master" in items["shared"] and "SUMMARY:exception" in items["shared"]
+    assert "SUMMARY:original" in (store.root / conflicts[0]).read_text()
+
+
+def test_export_caldav_calendar_to_ics(dav, player):
+    from astrapod_desktop import local_calendar as local
+
+    model, client = dav
+    root, _, _ = player
+    model.save(model.collection + "task.ics", entry("task", "export me", kind="VTODO"))
+    (collection,) = client.discover()
+    path = root / "exported.ics"
+    local.export_file(path, calendar_sync.export_dav(client, collection))
+    assert set(ics.split(path.read_bytes())) == {"one", "task"}

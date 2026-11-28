@@ -1,4 +1,4 @@
-"""CalDAV and local contacts, synced through the existing Disk Mode lane."""
+"""CalDAV, local calendars and contacts over the existing Disk Mode lane."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .. import calendar_sync, contact_format, contact_sync
+from .. import calendar_format, calendar_sync, contact_format, contact_sync, local_calendar
 from ..caldav import Client, Collection, KINDS
 from ..extras_storage import PlayerDisk, Store, fingerprint, secret
 from ..qt import QtCore, QtGui, QtWidgets, Qt
@@ -16,6 +16,91 @@ from .sync import disk_mode_option
 
 ACCOUNT = "caldav.json"
 USER_ROLE = Qt.ItemDataRole.UserRole
+
+
+class CalendarEntryDialog(QtWidgets.QDialog):
+    def __init__(self, entries, parent):
+        super().__init__(parent)
+        self.setWindowTitle("本地日历")
+        self.resize(480, 380)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.items = QtWidgets.QListWidget()
+        self.items.setAccessibleName("本地日程与待办")
+        for uid, recurrence, component in entries:
+            title = str(component.get("SUMMARY", "未命名"))
+            kind = "待办" if component.name == "VTODO" else "日程"
+            stamp = component.get("RECURRENCE-ID") or component.get("DTSTART") or component.get("DUE")
+            date = getattr(stamp, "dt", None)
+            suffix = f" · {date.isoformat()}" if date is not None else ""
+            row = QtWidgets.QListWidgetItem(f"{title} · {kind}{suffix}")
+            row.setData(USER_ROLE, (uid, recurrence))
+            self.items.addItem(row)
+        layout.addWidget(self.items, 1)
+        actions = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        edit = actions.addButton("编辑条目", QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        self.items.currentItemChanged.connect(lambda current, _old: edit.setEnabled(current is not None))
+        edit.setEnabled(self.items.count() > 0)
+        actions.accepted.connect(self.accept)
+        actions.rejected.connect(self.reject)
+        self.items.itemDoubleClicked.connect(lambda _item: self.accept())
+        layout.addWidget(actions)
+        if self.items.count():
+            self.items.setCurrentRow(0)
+
+
+class CalendarEditDialog(QtWidgets.QDialog):
+    def __init__(self, component, parent):
+        super().__init__(parent)
+        todo = component.name == "VTODO"
+        self.setWindowTitle("编辑待办" if todo else "编辑日程")
+        self.resize(510, 340)
+        fields = [("SUMMARY", "标题"), ("DTSTART", "开始")]
+        fields.append(("DUE", "截止") if todo else ("DTEND", "结束"))
+        fields.append(("STATUS", "状态") if todo else ("LOCATION", "地点"))
+        fields.append(("DESCRIPTION", "备注"))
+        self.editors = {}
+        self.initial = {}
+        form = QtWidgets.QFormLayout(self)
+        for field, title in fields:
+            value = component.get(field)
+            stamp = getattr(value, "dt", None)
+            text = stamp.isoformat() if stamp is not None else str(value or "")
+            if field == "STATUS":
+                editor = QtWidgets.QComboBox()
+                for status, caption in (("", "未设置"), ("NEEDS-ACTION", "未完成"),
+                                        ("IN-PROCESS", "进行中"), ("COMPLETED", "已完成"),
+                                        ("CANCELLED", "已取消")):
+                    editor.addItem(caption, status)
+                if editor.findData(text) < 0:
+                    editor.addItem(text, text)
+                editor.setCurrentIndex(editor.findData(text))
+            elif field == "DESCRIPTION":
+                editor = QtWidgets.QPlainTextEdit(text)
+            else:
+                editor = QtWidgets.QLineEdit(text)
+                if field in ("DTSTART", "DTEND", "DUE"):
+                    editor.setPlaceholderText("YYYY-MM-DD 或 YYYY-MM-DDTHH:MM")
+            self.editors[field] = editor
+            self.initial[field] = text
+            form.addRow(title, editor)
+        actions = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Save | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        actions.accepted.connect(self.accept)
+        actions.rejected.connect(self.reject)
+        form.addRow(actions)
+
+    def changes(self):
+        result = {}
+        for field, editor in self.editors.items():
+            if isinstance(editor, QtWidgets.QComboBox):
+                value = editor.currentData()
+            elif isinstance(editor, QtWidgets.QPlainTextEdit):
+                value = editor.toPlainText()
+            else:
+                value = editor.text()
+            if value != self.initial[field]:
+                result[field] = value
+        return result
 
 
 class ContactDialog(QtWidgets.QDialog):
@@ -126,7 +211,16 @@ class ExtrasPage(Page):
         self.calendars = QtWidgets.QListWidget()
         self.calendars.setAccessibleName("选择要同步的日历")
         self.calendars.itemChanged.connect(self._selected)
+        self.calendars.currentItemChanged.connect(self._buttons)
         layout.addWidget(self.calendars, 1)
+        files = QtWidgets.QHBoxLayout()
+        self.import_ics = button("导入 ICS", "secondary", slot=self.import_calendars)
+        self.edit_ics = button("编辑本地日历", "secondary", slot=self.edit_local_calendar)
+        self.export_ics = button("导出 ICS", "secondary", slot=self.export_calendar)
+        for action in (self.import_ics, self.edit_ics, self.export_ics):
+            files.addWidget(action)
+        files.addStretch()
+        layout.addLayout(files)
         destinations = QtWidgets.QFormLayout()
         self.targets = {kind: QtWidgets.QComboBox() for kind in KINDS}
         destinations.addRow("设备新日程", self.targets["VEVENT"])
@@ -186,8 +280,16 @@ class ExtrasPage(Page):
         ready = self.demo is not None or (disk.mode == "disk" and disk.player is not None)
         busy = self.loading or self.window_.busy or disk.transition
         self.discover_button.setEnabled(not busy and all(self._identity()))
-        self.calendar_sync.setEnabled(not busy and ready and self._same_account()
-                                      and not self.password.text() and bool(self._selected_urls()))
+        selected = self._selected_urls()
+        remote_ready = self._same_account() and not self.password.text()
+        includes_remote = bool(selected - {local_calendar.LOCAL.url})
+        self.calendar_sync.setEnabled(not busy and ready and bool(selected)
+                                      and (remote_ready or not includes_remote))
+        current = self._current_calendar()
+        is_local = current is not None and current.url == local_calendar.LOCAL.url
+        self.import_ics.setEnabled(not busy)
+        self.edit_ics.setEnabled(not busy and is_local)
+        self.export_ics.setEnabled(not busy and current is not None and (is_local or remote_ready))
         self.contact_sync.setEnabled(not busy and ready)
         self.import_button.setEnabled(not busy)
         self.new_button.setEnabled(not busy)
@@ -199,18 +301,28 @@ class ExtrasPage(Page):
         return {item.data(USER_ROLE) for i in range(self.calendars.count())
                 if (item := self.calendars.item(i)).checkState() == Qt.CheckState.Checked}
 
+    def _current_calendar(self):
+        item = self.calendars.currentItem()
+        url = item.data(USER_ROLE) if item is not None else None
+        return next((calendar for calendar in self.collections if calendar.url == url), None)
+
     def _show_collections(self, collections):
-        self.collections = collections
+        previous = self._current_calendar()
+        self.collections = [local_calendar.LOCAL, *collections]
         selected = set(self.account.get("selected", ()))
         with QtCore.QSignalBlocker(self.calendars):
             self.calendars.clear()
-            for calendar in collections:
+            for calendar in self.collections:
                 types = "、".join("日程" if code == "VEVENT" else "待办" for code in calendar.kinds)
                 item = QtWidgets.QListWidgetItem(f"{calendar.name} · {types}")
                 item.setData(USER_ROLE, calendar.url)
                 item.setCheckState(Qt.CheckState.Checked if calendar.url in selected
                                    else Qt.CheckState.Unchecked)
                 self.calendars.addItem(item)
+                if previous is not None and previous.url == calendar.url:
+                    self.calendars.setCurrentItem(item)
+            if self.calendars.currentItem() is None:
+                self.calendars.setCurrentRow(0)
         self._selected(self.account.get("targets", {}))
 
     def _selected(self, previous=None):
@@ -250,6 +362,10 @@ class ExtrasPage(Page):
         password = self.password.text()
         same = self._same_account()
         config = self.account.copy() if same else {}
+        checked = self._selected_urls()
+        config["selected"] = sorted(checked if same else checked & {local_calendar.LOCAL.url})
+        config["targets"] = {kind: picker.currentData() for kind, picker in self.targets.items()
+                             if same or picker.currentData() == local_calendar.LOCAL.url}
         account_id = fingerprint(url, user)
 
         def work():
@@ -293,6 +409,72 @@ class ExtrasPage(Page):
             with mounted_media(volume) as disk:
                 yield PlayerDisk(disk), player[1]
 
+    def import_calendars(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self, "导入日历文件", "", "iCalendar (*.ics *.ICS)")
+        if not paths:
+            return
+
+        def done(result):
+            items, conflicts = result
+            self.calendars.setCurrentRow(0)
+            self._report(f"导入完成。本地日历有 {len(items)} 组条目。", conflicts)
+
+        self._run("正在导入 ICS…", lambda: local_calendar.import_files(self.store, paths), done)
+
+    def edit_local_calendar(self):
+        try:
+            items = local_calendar.load(self.store)
+            entries = list(local_calendar.entries(items))
+        except (OSError, ValueError) as error:
+            self._failed(error)
+            return
+        if not entries:
+            self.status.setText("本地日历为空。请导入 ICS 文件或同步设备条目。")
+            return
+        chooser = CalendarEntryDialog(entries, self)
+        if chooser.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        uid, recurrence = chooser.items.currentItem().data(USER_ROLE)
+        component = next(item for key, instance, item in entries if (key, instance) == (uid, recurrence))
+        dialog = CalendarEditDialog(component, self)
+        while dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            try:
+                updated = local_calendar.edit(items[uid], recurrence, dialog.changes())
+            except ValueError as error:
+                QtWidgets.QMessageBox.warning(self, "无法保存日历条目", str(error))
+                continue
+            if updated != items[uid]:
+                self._run("正在保存条目…",
+                          lambda: local_calendar.save(self.store, uid, items[uid], updated),
+                          lambda _result: self.status.setText("本地日历条目已保存。"))
+            break
+
+    def export_calendar(self):
+        collection = self._current_calendar()
+        if collection is None or not self.export_ics.isEnabled():
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "导出日历文件", "calendar.ics", "iCalendar (*.ics)")
+        if not path:
+            return
+        if not path.lower().endswith(".ics"):
+            # Confirm the final filename, including its suffix, in the save dialog.
+            self.status.setText("请输入以 .ics 结尾的文件名。")
+            return
+        url, user = self._identity()
+
+        def work():
+            with self.store.locked():
+                if collection.url == local_calendar.LOCAL.url:
+                    data = calendar_format.merge(local_calendar.load(self.store), name=collection.name)
+                else:
+                    client = DemoCalendar() if self.demo else Client(url, user, secret(fingerprint(url, user)))
+                    data = calendar_sync.export_dav(client, collection)
+                local_calendar.export_file(path, data)
+
+        self._run("正在导出 ICS…", work, lambda _result: self.status.setText("日历已导出。"))
+
     def sync_calendars(self):
         if not self.calendar_sync.isEnabled():
             return
@@ -300,7 +482,8 @@ class ExtrasPage(Page):
         calendars = [calendar for calendar in self.collections if calendar.url in selected]
         targets = {kind: picker.currentData() for kind, picker in self.targets.items()}
         url, user = self._identity()
-        account_id = fingerprint(url, user)
+        account_id = fingerprint(self.account.get("url"), self.account.get("user"))
+        includes_remote = bool(selected - {local_calendar.LOCAL.url})
         config = dict(self.account, selected=sorted(selected), targets=targets)
         disk_mode = self.window_.disk
         volume, player = disk_mode.volume, disk_mode.player
@@ -308,7 +491,9 @@ class ExtrasPage(Page):
         def work():
             with self.store.locked():
                 self.store.write(ACCOUNT, config)
-                client = DemoCalendar() if self.demo else Client(url, user, secret(account_id))
+                client = None
+                if includes_remote:
+                    client = DemoCalendar() if self.demo else Client(url, user, secret(account_id))
                 with self._player(volume, player) as (disk, serial):
                     return calendar_sync.sync(client, self.store, disk, serial, account_id, calendars, targets)
 

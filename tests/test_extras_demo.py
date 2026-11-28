@@ -30,10 +30,44 @@ def test_extras_on_demo_entry_point(monkeypatch, tmp_path):
         page = window.pages["extras"]
         assert page.isVisible()
         page.discover_button.click()
-        assert page.calendars.count() == 1
-        page.calendars.item(0).setCheckState(Qt.CheckState.Checked)
+        assert page.calendars.count() == 2
+        page.calendars.item(1).setCheckState(Qt.CheckState.Checked)
         page.calendar_sync.click()
         assert "同步 1 个日历" in page.status.text()
+
+        from astrapod_desktop.pages.extras import CalendarEditDialog, CalendarEntryDialog
+        ics = tmp_path / "demo.ics"
+        ics.write_bytes(b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Demo//EN\r\n"
+                        b"BEGIN:VEVENT\r\nUID:demo-local\r\nDTSTAMP:20261127T120000Z\r\n"
+                        b"DTSTART;VALUE=DATE:20261128\r\nSUMMARY:Demo event\r\n"
+                        b"END:VEVENT\r\nEND:VCALENDAR\r\n")
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileNames",
+                            lambda *_args, **_kwargs: ([str(ics)], ""))
+        page.import_ics.click()
+        assert page.calendars.currentRow() == 0
+
+        def choose_item():
+            page.findChild(CalendarEntryDialog).accept()
+            QtCore.QTimer.singleShot(0, save_event)
+
+        def save_event():
+            dialog = page.findChild(CalendarEditDialog)
+            dialog.editors["SUMMARY"].setText("Edited local event")
+            dialog.accept()
+
+        QtCore.QTimer.singleShot(0, choose_item)
+        page.edit_ics.click()
+        exported = tmp_path / "export.ics"
+        monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                            lambda *_args, **_kwargs: (str(exported), ""))
+        page.export_ics.click()
+        assert b"SUMMARY:Edited local event" in exported.read_bytes()
+        page.calendars.item(1).setCheckState(Qt.CheckState.Unchecked)
+        page.calendars.item(0).setCheckState(Qt.CheckState.Checked)
+        page.url.setText("invalid.example")
+        page.calendar_sync.click()
+        local = page.store.root.parent / "player/Calendars/AstraPod-Local.ics"
+        assert b"SUMMARY:Edited local event" in local.read_bytes()
 
         vcf = tmp_path / "demo.vcf"
         vcf.write_bytes(b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Demo Contact\r\nN:Contact;Demo;;;\r\n"

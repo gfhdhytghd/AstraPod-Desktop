@@ -8,16 +8,25 @@ from icalendar import Calendar, Event, Todo
 from .caldav import KINDS
 
 
-def parse(data):
+def _parse(data, *, multiple):
+    if isinstance(data, bytes):
+        data = data.removeprefix(b"\xef\xbb\xbf")
+    else:
+        data = data.removeprefix("\ufeff")
     try:
-        calendar = Calendar.from_ical(data)
+        calendars = Calendar.from_ical(data, multiple=multiple)
     except (ValueError, TypeError, UnicodeError):
         raise ValueError("无法读取 iCalendar 文件。") from None
-    if not isinstance(calendar, Calendar):
+    calendars = calendars if multiple else [calendars]
+    if not calendars or any(not isinstance(calendar, Calendar) for calendar in calendars):
         raise ValueError("iCalendar 文件缺少 VCALENDAR。")
-    if any(component.errors for component in calendar.walk()):
+    if any(component.errors for calendar in calendars for component in calendar.walk()):
         raise ValueError("iCalendar 文件包含无效的属性。")
-    return calendar
+    return calendars
+
+
+def parse(data):
+    return _parse(data, multiple=False)[0]
 
 
 def pack(components, timezones=(), template=None):
@@ -37,14 +46,22 @@ def timezones_for(calendar, components):
     for component in components:
         for child in component.walk():
             for _, value in child.property_items(recursive=False):
-                tzid = getattr(value, "params", {}).get("TZID")
-                if tzid:
-                    used.add(str(tzid))
+                for entry in value if isinstance(value, list) else (value,):
+                    tzid = getattr(entry, "params", {}).get("TZID")
+                    if tzid:
+                        used.add(str(tzid))
     return [zone for zone in calendar.walk("VTIMEZONE") if str(zone.get("TZID")) in used]
 
 
 def split(data):
-    calendar = parse(data)
+    return _split(parse(data))
+
+
+def split_many(data):
+    return [_split(calendar) for calendar in _parse(data, multiple=True)]
+
+
+def _split(calendar):
     groups = {}
     for component in calendar.subcomponents:
         if component.name not in KINDS:
